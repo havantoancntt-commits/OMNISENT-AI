@@ -116,6 +116,22 @@ function tickerKey(symbol: string, marketType: MarketType, exchange?: string): s
   return `${symbol.toUpperCase()}|${marketType}|${(exchange ?? '').toUpperCase()}`;
 }
 
+export function safeDisposeWebSocket(ws: WebSocket): void {
+  try {
+    ws.removeAllListeners();
+    // Re-attach error listener after removeAllListeners() so terminate() during CONNECTING
+    // ("WebSocket was closed before the connection was established") cannot crash Node.js.
+    ws.on('error', () => {
+      // ignore teardown errors
+    });
+    if (ws.readyState !== WebSocket.CLOSED) {
+      ws.terminate();
+    }
+  } catch {
+    // ignore
+  }
+}
+
 export class MarketFeedManager {
   private tickers: MarketTicker[] = [];
   private dynamicConfigs: UniversePairConfig[] = [];
@@ -406,12 +422,7 @@ export class MarketFeedManager {
       return;
     }
     if (existing) {
-      try {
-        existing.removeAllListeners();
-        existing.terminate();
-      } catch {
-        // ignore
-      }
+      safeDisposeWebSocket(existing);
       this.wsSockets.delete(streamKey);
     }
     this.clearStreamTimers(streamKey);
@@ -507,12 +518,7 @@ export class MarketFeedManager {
       return;
     }
     if (existing) {
-      try {
-        existing.removeAllListeners();
-        existing.terminate();
-      } catch {
-        // ignore
-      }
+      safeDisposeWebSocket(existing);
       this.wsSockets.delete(streamKey);
     }
     this.clearStreamTimers(streamKey);
@@ -613,12 +619,7 @@ export class MarketFeedManager {
       return;
     }
     if (existing) {
-      try {
-        existing.removeAllListeners();
-        existing.terminate();
-      } catch {
-        // ignore
-      }
+      safeDisposeWebSocket(existing);
       this.wsSockets.delete(streamKey);
     }
     this.clearStreamTimers(streamKey);

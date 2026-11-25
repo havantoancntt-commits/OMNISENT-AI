@@ -278,6 +278,9 @@ export default function App() {
       if (closedByEffect) return;
       try {
         ws = new WebSocket(wsUrl);
+        ws.onerror = () => {
+          // handled on close
+        };
         ws.onopen = () => {
           wsConnected = true;
           everOpened = true;
@@ -400,7 +403,23 @@ export default function App() {
       if (wsSyncTimerRef.current !== null) {
         window.clearTimeout(wsSyncTimerRef.current);
       }
-      ws?.close();
+      if (ws) {
+        const closingSocket = ws;
+        closingSocket.onmessage = null;
+        closingSocket.onclose = null;
+        closingSocket.onerror = null;
+        if (closingSocket.readyState === WebSocket.OPEN) {
+          closingSocket.close();
+        } else if (closingSocket.readyState === WebSocket.CONNECTING) {
+          closingSocket.onopen = () => {
+            try {
+              closingSocket.close();
+            } catch {
+              // ignore
+            }
+          };
+        }
+      }
     };
   }, [fetchAllState]);
 

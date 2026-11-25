@@ -3483,6 +3483,27 @@ test('Real-time Price Feed Guard validates ticks, classifies freshness, stitches
   assert.equal(health.freshness, 'REALTIME');
 });
 
+test('safeDisposeWebSocket absorbs CONNECTING termination errors without unhandled EventEmitter crash', async () => {
+  const net = await import('node:net');
+  const { default: WsClient } = await import('ws');
+  const { safeDisposeWebSocket } = await import('../../server/marketFeed.ts');
+
+  // Create a local TCP server that holds connection pending handshake so WebSocket stays in CONNECTING state
+  const tcpServer = net.createServer(() => {});
+  await new Promise<void>((resolve) => tcpServer.listen(0, '127.0.0.1', resolve));
+  const address = tcpServer.address();
+  assert.ok(address && typeof address === 'object');
+
+  const ws = new WsClient(`ws://127.0.0.1:${address.port}/stream`);
+  assert.equal(ws.readyState, WsClient.CONNECTING);
+
+  safeDisposeWebSocket(ws);
+
+  await new Promise((r) => setTimeout(r, 80));
+  await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
+});
+
+
 
 
 

@@ -3471,7 +3471,14 @@ async function startServer() {
   const server = http.createServer(app);
   const wss = new WebSocketServer({ noServer: true });
 
+  wss.on('error', () => {
+    // non-fatal WebSocketServer error
+  });
+
   server.on('upgrade', (req, socket, head) => {
+    socket.on('error', () => {
+      // ignore aborted upgrade sockets
+    });
     try {
       const reqUrl = new URL(req.url || '/', 'http://localhost');
       if (reqUrl.pathname === '/ws') {
@@ -3516,21 +3523,30 @@ async function startServer() {
   autoExecRuntime.broadcastAutoStatus = broadcastTick;
 
   wss.on('connection', (ws) => {
+    ws.on('error', () => {
+      // ignore abrupt client socket disconnect errors
+    });
     const { portfolio, positions, latestPnlPoint } = syncPortfolioAndPositions();
-    ws.send(
-      JSON.stringify({
-        type: 'TELEMETRY_UPDATE',
-        tickers: marketFeed.getTickers(),
-        portfolio,
-        positions,
-        pnlPoint: latestPnlPoint,
-        tradingMode: getTradingMode(),
-        liveFeedActive: marketFeed.isLiveFeedActive(),
-        autoExecutionStatus: buildAutoExecutionStatus(),
-        stateRevision: getStateRevision(),
-        serverUtc: new Date().toISOString(),
-      }),
-    );
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.send(
+          JSON.stringify({
+            type: 'TELEMETRY_UPDATE',
+            tickers: marketFeed.getTickers(),
+            portfolio,
+            positions,
+            pnlPoint: latestPnlPoint,
+            tradingMode: getTradingMode(),
+            liveFeedActive: marketFeed.isLiveFeedActive(),
+            autoExecutionStatus: buildAutoExecutionStatus(),
+            stateRevision: getStateRevision(),
+            serverUtc: new Date().toISOString(),
+          }),
+        );
+      } catch {
+        // ignore closed client socket
+      }
+    }
   });
 
   // Fast 1s sub-second WebSocket price & SL/TP lifecycle tick fanout when real-time exchange frames arrive
