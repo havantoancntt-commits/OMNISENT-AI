@@ -3600,7 +3600,20 @@ async function startServer() {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(process.cwd(), 'dist');
-    app.use(express.static(distDir));
+    app.use(
+      express.static(distDir, {
+        setHeaders(res, filePath) {
+          const base = path.basename(filePath);
+          if (base === 'sw.js') {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Service-Worker-Allowed', '/');
+          } else if (base === 'manifest.webmanifest') {
+            res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+            res.setHeader('Cache-Control', 'public, max-age=3600');
+          }
+        },
+      }),
+    );
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });

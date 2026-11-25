@@ -48,7 +48,12 @@ import { CoinSearchModal } from './components/CoinSearchModal';
 import { CommandCenter } from './components/CommandCenter';
 import { ExchangeSecurityHub } from './components/ExchangeSecurityHub';
 import { MarketScanner } from './components/MarketScanner';
-import { OfflineIndicator, PWAInstallControl } from './components/PWAControls';
+import {
+  OfflineIndicator,
+  PWAInstallControl,
+  PWAInstallModal,
+  PWASmartBanner,
+} from './components/PWAControls';
 import { PortfolioRisk } from './components/PortfolioRisk';
 import { QuantLab } from './components/QuantLab';
 import {
@@ -933,6 +938,7 @@ export default function App() {
 
         {/* Active Main Content */}
         <main className="min-w-0 flex-1">
+          <PWASmartBanner />
           {actionError && (
             <div
               role="alert"
@@ -1250,7 +1256,10 @@ export default function App() {
                 </div>
               </div>
 
-              <PWAInstallControl variant="drawer" />
+              <PWAInstallControl
+                variant="drawer"
+                onActionStart={() => setMobileMenuOpen(false)}
+              />
             </div>
           </div>
         </div>
@@ -1315,6 +1324,7 @@ export default function App() {
         onClose={() => setSearchModalOpen(false)}
         onSelectPair={handleSelectRemotePair}
       />
+      <PWAInstallModal />
       <OfflineIndicator />
     </div>
   );

@@ -42,9 +42,12 @@ import { TRANSLATIONS, resolveLocale, translate } from '../i18n/translations.ts'
 import {
   PWA_MANIFEST_META,
   computePWAUiState,
+  detectDisplayMode,
   detectPWAPlatform,
   getRecommendedGuideTab,
   isRunningStandalone,
+  shouldShowMobileInstallBanner,
+  validateManifestPayload,
 } from '../pwa/pwaHelpers.ts';
 import {
   DEFAULT_AUTO_EXECUTION_CONFIG,
@@ -2179,6 +2182,70 @@ test('25. PWA Helpers: platform detection, standalone suppression, and manifest 
   assert.equal(iosGuideUi.shouldShowInstallEntry, true);
   assert.equal(iosGuideUi.primaryAction, 'guide-modal');
   assert.equal(iosGuideUi.recommendedGuideTab, 'ios');
+
+  // Display mode detection & WCO/extra standalone support
+  assert.equal(detectDisplayMode({ wco: true }), 'window-controls-overlay');
+  assert.equal(detectDisplayMode({ standalone: true }), 'standalone');
+  assert.equal(detectDisplayMode({ referrer: 'android-app://com.omnisent.twa' }), 'standalone');
+  assert.equal(detectDisplayMode({ fullscreen: true }), 'fullscreen');
+  assert.equal(detectDisplayMode({ minimalUi: true }), 'minimal-ui');
+  assert.equal(detectDisplayMode({}), 'browser');
+  assert.equal(isRunningStandalone(false, false, true), true);
+
+  // Mobile smart banner suppression rules
+  assert.equal(
+    shouldShowMobileInstallBanner({ isInstalled: false, dismissed: false, isEmbeddedIframe: false }),
+    true,
+  );
+  assert.equal(
+    shouldShowMobileInstallBanner({ isInstalled: true, dismissed: false, isEmbeddedIframe: false }),
+    false,
+  );
+  assert.equal(
+    shouldShowMobileInstallBanner({ isInstalled: false, dismissed: true, isEmbeddedIframe: false }),
+    false,
+  );
+  assert.equal(
+    shouldShowMobileInstallBanner({ isInstalled: false, dismissed: false, isEmbeddedIframe: true }),
+    false,
+  );
+
+  // Manifest payload validation (valid & malformed)
+  const validManifestAudit = validateManifestPayload({
+    id: '/',
+    name: 'OMNISENT AI — Autonomous Trading Intelligence',
+    short_name: 'OMNISENT AI',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    icons: [
+      { src: '/pwa-192x192.png', sizes: '192x192', type: 'image/png', purpose: 'any' },
+      { src: '/pwa-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'any' },
+      { src: '/pwa-maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+    ],
+    shortcuts: [{ name: 'Command', url: '/?tab=command' }],
+  });
+  assert.equal(validManifestAudit.valid, true);
+  assert.equal(validManifestAudit.has192, true);
+  assert.equal(validManifestAudit.has512, true);
+  assert.equal(validManifestAudit.hasMaskable, true);
+  assert.equal(validManifestAudit.shortcutCount, 1);
+  assert.deepEqual(validManifestAudit.issues, []);
+
+  const badManifestAudit = validateManifestPayload({
+    id: '',
+    name: '',
+    short_name: 'WAY_TOO_LONG_SHORT_NAME',
+    start_url: '/home',
+    scope: '/app',
+    display: 'browser',
+    icons: [{ src: '/pwa.png', sizes: '512x512', type: 'image/png', purpose: 'any maskable' }],
+  });
+  assert.equal(badManifestAudit.valid, false);
+  assert.ok(badManifestAudit.issues.includes('SHORT_NAME_TOO_LONG'));
+  assert.ok(badManifestAudit.issues.includes('INVALID_START_URL'));
+  assert.ok(badManifestAudit.issues.includes('COMBINED_ANY_MASKABLE'));
+  assert.ok(badManifestAudit.issues.includes('MISSING_192_PNG'));
 });
 
 test('26. Autonomous 9-Gate Auto-Execution Engine: clamping, HTF/Hurst/Correlation/Cooldown/Kelly gates', () => {

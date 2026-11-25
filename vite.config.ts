@@ -11,16 +11,13 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'autoUpdate',
-        includeAssets: [
-          'icon.svg',
-          'apple-touch-icon.png',
-          'pwa-192x192.png',
-          'pwa-512x512.png',
-          'pwa-maskable-512x512.png',
-        ],
+        registerType: 'prompt',
+        includeManifestIcons: false,
+        includeAssets: [],
         manifest: {
           id: '/',
+          lang: 'vi',
+          dir: 'ltr',
           name: 'OMNISENT AI — Autonomous Trading Intelligence',
           short_name: 'OMNISENT AI',
           description:
@@ -32,6 +29,11 @@ export default defineConfig(() => {
           orientation: 'any',
           start_url: '/',
           scope: '/',
+          prefer_related_applications: false,
+          handle_links: 'preferred',
+          launch_handler: {
+            client_mode: ['focus-existing', 'auto'],
+          },
           categories: ['finance', 'productivity'],
           icons: [
             {
@@ -82,6 +84,8 @@ export default defineConfig(() => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
+          globIgnores: ['assets/aistudio/**'],
+          cleanupOutdatedCaches: true,
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           navigateFallbackDenylist: [/^\/api\//, /^\/ws/],
           runtimeCaching: [
