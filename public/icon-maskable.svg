@@ -1,0 +1,58 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <defs>
+    <radialGradient id="bgGlowM" cx="50%" cy="46%" r="58%">
+      <stop offset="0%" stop-color="#102540" />
+      <stop offset="60%" stop-color="#091220" />
+      <stop offset="100%" stop-color="#070B12" />
+    </radialGradient>
+    <linearGradient id="cyanEmeraldM" x1="120" y1="110" x2="392" y2="402" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="52%" stop-color="#06B6D4" />
+      <stop offset="100%" stop-color="#10B981" />
+    </linearGradient>
+    <linearGradient id="innerPrismM" x1="176" y1="140" x2="336" y2="372" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0E2940" />
+      <stop offset="100%" stop-color="#081423" />
+    </linearGradient>
+  </defs>
+
+  <!-- Full-bleed solid canvas for maskable adaptive icon shapes (no rounded corners / transparency) -->
+  <rect width="512" height="512" fill="url(#bgGlowM)" />
+
+  <!-- Centered safely within 74% safe zone (well inside Android 80% safe circle) -->
+  <g transform="translate(256 256) scale(0.74) translate(-256 -256)">
+    <circle cx="256" cy="256" r="184" stroke="#06B6D4" stroke-opacity="0.22" stroke-width="4" stroke-dasharray="14 10" />
+    <circle cx="256" cy="256" r="144" stroke="#38BDF8" stroke-opacity="0.32" stroke-width="3" />
+
+    <path d="M256 44V84M256 428V468M44 256H84M428 256H468" stroke="#06B6D4" stroke-opacity="0.5" stroke-width="6" stroke-linecap="round" />
+
+    <polygon
+      points="256,82 379,133 430,256 379,379 256,430 133,379 82,256 133,133"
+      fill="url(#innerPrismM)"
+      fill-opacity="0.92"
+      stroke="url(#cyanEmeraldM)"
+      stroke-width="11"
+      stroke-linejoin="round"
+    />
+
+    <polygon
+      points="256,128 346,218 256,384 166,218"
+      fill="#07101C"
+      stroke="#38BDF8"
+      stroke-opacity="0.6"
+      stroke-width="4.5"
+      stroke-linejoin="round"
+    />
+
+    <rect x="196" y="216" width="22" height="72" rx="6" fill="#06B6D4" />
+    <rect x="245" y="176" width="22" height="128" rx="6" fill="url(#cyanEmeraldM)" />
+    <rect x="294" y="200" width="22" height="92" rx="6" fill="#10B981" />
+
+    <line x1="207" y1="194" x2="207" y2="306" stroke="#38BDF8" stroke-width="4.5" stroke-linecap="round" />
+    <line x1="256" y1="154" x2="256" y2="328" stroke="#E0F2FE" stroke-width="4.5" stroke-linecap="round" />
+    <line x1="305" y1="180" x2="305" y2="314" stroke="#34D399" stroke-width="4.5" stroke-linecap="round" />
+
+    <circle cx="256" cy="128" r="11" fill="#38BDF8" />
+    <circle cx="256" cy="384" r="10" fill="#10B981" />
+  </g>
+</svg>

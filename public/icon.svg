@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" fill="none">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="42%" r="60%">
+      <stop offset="0%" stop-color="#0F223A" />
+      <stop offset="55%" stop-color="#09111E" />
+      <stop offset="100%" stop-color="#070B12" />
+    </radialGradient>
+    <linearGradient id="cyanEmerald" x1="96" y1="88" x2="416" y2="424" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38BDF8" />
+      <stop offset="52%" stop-color="#06B6D4" />
+      <stop offset="100%" stop-color="#10B981" />
+    </linearGradient>
+    <linearGradient id="innerPrism" x1="176" y1="140" x2="336" y2="372" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#0E2940" />
+      <stop offset="100%" stop-color="#081423" />
+    </linearGradient>
+  </defs>
+
+  <!-- Solid Institutional Obsidian Canvas -->
+  <rect width="512" height="512" rx="112" fill="#070B12" />
+  <rect x="8" y="8" width="496" height="496" rx="104" fill="url(#bgGlow)" stroke="#162840" stroke-width="4" />
+
+  <!-- Outer Quantitative Telemetry Ring -->
+  <circle cx="256" cy="256" r="184" stroke="#06B6D4" stroke-opacity="0.18" stroke-width="3" stroke-dasharray="14 10" />
+  <circle cx="256" cy="256" r="144" stroke="#38BDF8" stroke-opacity="0.28" stroke-width="2.5" />
+
+  <!-- Precision Cardinal Crosshairs -->
+  <path d="M256 44V84M256 428V468M44 256H84M428 256H468" stroke="#06B6D4" stroke-opacity="0.45" stroke-width="5" stroke-linecap="round" />
+
+  <!-- Octagonal Sovereign Shield Frame -->
+  <polygon
+    points="256,82 379,133 430,256 379,379 256,430 133,379 82,256 133,133"
+    fill="url(#innerPrism)"
+    fill-opacity="0.88"
+    stroke="url(#cyanEmerald)"
+    stroke-width="10"
+    stroke-linejoin="round"
+  />
+
+  <!-- Inner Neural Lattice Diamond -->
+  <polygon
+    points="256,128 346,218 256,384 166,218"
+    fill="#07101C"
+    stroke="#38BDF8"
+    stroke-opacity="0.55"
+    stroke-width="4"
+    stroke-linejoin="round"
+  />
+
+  <!-- 3 Algorithmic Momentum Pillars (Left / Center / Right) -->
+  <rect x="196" y="216" width="22" height="72" rx="6" fill="#06B6D4" />
+  <rect x="245" y="176" width="22" height="128" rx="6" fill="url(#cyanEmerald)" />
+  <rect x="294" y="200" width="22" height="92" rx="6" fill="#10B981" />
+
+  <!-- Upper & Lower Wick Precision Lines -->
+  <line x1="207" y1="194" x2="207" y2="306" stroke="#38BDF8" stroke-width="4" stroke-linecap="round" />
+  <line x1="256" y1="154" x2="256" y2="328" stroke="#E0F2FE" stroke-width="4" stroke-linecap="round" />
+  <line x1="305" y1="180" x2="305" y2="314" stroke="#34D399" stroke-width="4" stroke-linecap="round" />
+
+  <!-- Sovereign Apex Node -->
+  <circle cx="256" cy="128" r="10" fill="#38BDF8" />
+  <circle cx="256" cy="384" r="9" fill="#10B981" />
+</svg>

@@ -1,0 +1,1535 @@
+PROJECT: OMNISENT AI TRADING COMMAND CENTER
+
+ULTIMATE MULTI-AGENT AUTONOMOUS SPOT & FUTURES TRADING PLATFORM
+
+Hãy đóng vai một đội ngũ chuyên gia cấp cao bao gồm AI Architect, Quantitative Researcher, Senior Full-stack Engineer, Algorithmic Trading Engineer, Risk Management Officer, Cybersecurity Engineer và UX/UI Designer.
+
+Nhiệm vụ của bạn là thiết kế và xây dựng một nền tảng AI giao dịch tiền điện tử đa tác nhân (Multi-Agent AI Trading System) chuyên nghiệp, hiện đại, thông minh, có khả năng phân tích, giám sát, ra quyết định và tự động thực hiện giao dịch Spot và Futures trên nhiều sàn giao dịch, với kiến trúc có khả năng mở rộng.
+
+Tên hệ thống:
+
+OMNISENT AI — AUTONOMOUS TRADING INTELLIGENCE
+
+Mục tiêu: xây dựng một hệ thống giao dịch tự động A–Z, hoạt động dựa trên dữ liệu thực, không bịa dữ liệu, có thể đánh giá hàng nghìn cơ hội giao dịch, phối hợp nhiều AI Agent độc lập, kiểm soát rủi ro chặt chẽ, tối ưu chiến lược theo dữ liệu và tự động hóa toàn bộ quy trình giao dịch khi người dùng cho phép.
+
+---
+
+I. YÊU CẦU CỐT LÕI
+
+1. Hỗ trợ giao dịch Spot và Futures.
+2. Cho phép lựa chọn nhiều sàn giao dịch tiền điện tử hàng đầu.
+3. Cho phép tìm kiếm, lọc và giao dịch mọi đồng coin/token có thị trường giao dịch hợp lệ trên các sàn được kết nối.
+4. Hỗ trợ Long, Short, Hedge, Spot, Margin và Futures tùy theo API, sản phẩm, quyền truy cập và chính sách của từng sàn.
+5. Hỗ trợ giao dịch tự động, bán tự động và giao dịch thủ công.
+6. Phân tích thị trường 24/7.
+7. Dữ liệu thị trường thời gian thực thông qua API và WebSocket.
+8. Không được tự bịa giá, khối lượng, chỉ báo, tin tức, dữ liệu on-chain, số dư, lịch sử giao dịch hoặc kết quả giao dịch.
+9. Tất cả quyết định giao dịch phải có dữ liệu, lý do, tín hiệu, mức độ rủi ro và lịch sử kiểm chứng.
+10. Hệ thống phải có cơ chế tự ngắt khi dữ liệu không đáng tin cậy, API lỗi, biến động bất thường hoặc vượt giới hạn rủi ro.
+11. Hỗ trợ Paper Trading trước khi kích hoạt giao dịch bằng tiền thật.
+12. Có khả năng mở rộng hàng trăm Agent chuyên biệt.
+13. Thiết kế theo tiêu chuẩn ứng dụng SaaS chuyên nghiệp.
+14. Ưu tiên bảo mật, hiệu suất, khả năng mở rộng, tính minh bạch và khả năng phục hồi.
+15. Không quảng cáo tỷ lệ thắng giả tạo. Tỷ lệ thắng, lợi nhuận, drawdown và các chỉ số phải được tính toán từ dữ liệu thực hoặc dữ liệu mô phỏng có ghi rõ nguồn.
+
+---
+
+II. HỆ THỐNG AI MULTI-AGENT
+
+Xây dựng kiến trúc AI nhiều tác nhân, có một AI điều phối trung tâm và các Agent chuyên biệt.
+
+1. MASTER AI ORCHESTRATOR
+
+Vai trò:
+
+- Điều phối tất cả Agent.
+- Chia nhiệm vụ phân tích.
+- Tổng hợp dữ liệu.
+- Kiểm tra sự đồng thuận.
+- Phát hiện xung đột giữa các Agent.
+- Đánh giá cơ hội giao dịch.
+- Quyết định có cho phép hệ thống đề xuất giao dịch hay không.
+- Chuyển quyết định qua Risk Manager.
+- Theo dõi trạng thái của từng giao dịch.
+- Ghi nhật ký quyết định.
+- Phát hiện Agent hoạt động bất thường.
+- Không được tự vượt qua Risk Manager.
+- Không được tự bỏ qua các giới hạn giao dịch.
+
+2. MARKET DATA AGENT
+
+Thu thập:
+
+- Giá hiện tại.
+- Giá Bid/Ask.
+- Order book.
+- Volume.
+- Open Interest.
+- Funding Rate.
+- Liquidation data.
+- Taker Buy/Sell.
+- Market depth.
+- Spread.
+- OHLCV.
+- Dữ liệu giao dịch.
+- Volatility.
+- Exchange market status.
+- Symbol trading status.
+- Trading fees.
+- Tick size.
+- Lot size.
+- Minimum order.
+- Maximum order.
+- Contract specifications.
+
+Nguồn dữ liệu:
+
+- Exchange API.
+- Exchange WebSocket.
+- Các nguồn dữ liệu thị trường được xác thực.
+
+Mỗi dữ liệu phải có:
+
+- Nguồn.
+- Timestamp.
+- Thời gian cập nhật.
+- Trạng thái xác thực.
+- Độ trễ.
+- Tính toàn vẹn.
+- Trạng thái dữ liệu.
+
+Nếu dữ liệu không cập nhật hoặc không xác thực được, không được sử dụng dữ liệu đó để kích hoạt giao dịch.
+
+3. DATA INTEGRITY AGENT
+
+Kiểm tra:
+
+- Giá bất thường.
+- Dữ liệu bị thiếu.
+- Dữ liệu sai định dạng.
+- Dữ liệu trùng lặp.
+- Dữ liệu lỗi timestamp.
+- WebSocket bị ngắt.
+- API bị giới hạn.
+- Dữ liệu stale.
+- Chênh lệch giá bất thường giữa các nguồn.
+- Dữ liệu thị trường có dấu hiệu bị thao túng.
+- Tính nhất quán của OHLCV.
+- Độ tin cậy của dữ liệu đầu vào.
+
+Nếu không thể xác thực:
+
+- Đánh dấu dữ liệu UNKNOWN.
+- Không tự thay thế bằng giá tưởng tượng.
+- Không tự suy đoán giá hiện tại.
+- Không kích hoạt giao dịch mới.
+- Báo lỗi rõ ràng.
+- Ghi log.
+- Chờ dữ liệu hợp lệ.
+
+4. MARKET REGIME AGENT
+
+Phân loại trạng thái thị trường:
+
+- Strong Bull Market.
+- Bull Market.
+- Weak Bull Market.
+- Sideways.
+- High Volatility.
+- Low Volatility.
+- Bear Market.
+- Strong Bear Market.
+- Panic Market.
+- Trend Reversal.
+- Breakout.
+- Fake Breakout.
+- Liquidity Crisis.
+- Unknown Regime.
+
+Phân tích:
+
+- BTC market regime.
+- ETH market regime.
+- Altcoin market regime.
+- Dominance.
+- Volatility.
+- Liquidity.
+- Correlation.
+- Risk appetite.
+- Trend persistence.
+
+Không bắt buộc phải giao dịch.
+
+Nếu thị trường không phù hợp, có thể quyết định NO TRADE.
+
+5. TECHNICAL ANALYSIS AGENT
+
+Phân tích nhiều khung thời gian:
+
+- 1m.
+- 3m.
+- 5m.
+- 15m.
+- 30m.
+- 1h.
+- 2h.
+- 4h.
+- 6h.
+- 12h.
+- 1D.
+- 1W.
+
+Phân tích:
+
+- EMA.
+- SMA.
+- VWAP.
+- RSI.
+- MACD.
+- ADX.
+- ATR.
+- Bollinger Bands.
+- Supertrend.
+- Ichimoku.
+- Fibonacci.
+- Pivot Points.
+- Volume Profile.
+- Price Action.
+- Support.
+- Resistance.
+- Trendline.
+- Breakout.
+- Breakdown.
+- Pullback.
+- Reversal.
+- Divergence.
+- Candlestick patterns.
+- Market structure.
+- Higher High.
+- Higher Low.
+- Lower High.
+- Lower Low.
+- Liquidity sweeps.
+- Fair Value Gap.
+- Order Block.
+- Imbalance.
+
+Mọi chỉ báo phải được tính từ dữ liệu OHLCV thực.
+
+6. ORDER BOOK & LIQUIDITY AGENT
+
+Phân tích:
+
+- Order book imbalance.
+- Bid/Ask liquidity.
+- Depth.
+- Spread.
+- Liquidity concentration.
+- Large orders.
+- Order flow.
+- Aggressive buying.
+- Aggressive selling.
+- Slippage estimation.
+- Liquidity zones.
+- Liquidity gaps.
+- Potential liquidation zones.
+
+Không khẳng định một lệnh lớn là hành vi thao túng nếu không có bằng chứng.
+
+7. QUANT AI AGENT
+
+Tạo và kiểm tra chiến lược định lượng:
+
+- Statistical Arbitrage.
+- Momentum.
+- Mean Reversion.
+- Trend Following.
+- Breakout.
+- Volatility Trading.
+- Cross-Exchange Spread.
+- Funding Rate Strategy.
+- Basis Strategy.
+- Market Neutral.
+- Risk-adjusted portfolio strategies.
+
+Yêu cầu:
+
+- Không sử dụng dữ liệu tương lai.
+- Không look-ahead bias.
+- Không survivorship bias.
+- Không tối ưu quá mức.
+- Không bỏ qua phí.
+- Không bỏ qua slippage.
+- Không bỏ qua funding.
+- Không bỏ qua latency.
+- Không bỏ qua thanh khoản.
+
+8. FUNDAMENTAL & TOKEN RESEARCH AGENT
+
+Phân tích:
+
+- Tokenomics.
+- Circulating Supply.
+- Total Supply.
+- Max Supply.
+- Market Cap.
+- Fully Diluted Valuation.
+- Token Unlocks.
+- Vesting.
+- Ecosystem.
+- Development activity.
+- Project risks.
+- Exchange listing risks.
+- Protocol risks.
+- Governance.
+- Network activity.
+- Adoption.
+- Major developments.
+
+Phải phân biệt dữ liệu xác thực, dữ liệu ước tính và dữ liệu chưa xác minh.
+
+9. ON-CHAIN INTELLIGENCE AGENT
+
+Nếu có nguồn dữ liệu hợp lệ:
+
+- Whale transactions.
+- Exchange inflows.
+- Exchange outflows.
+- Wallet concentration.
+- Network activity.
+- Active addresses.
+- Transaction volume.
+- Large transfers.
+- Stablecoin flows.
+- On-chain liquidity.
+
+Không được suy diễn danh tính chủ ví nếu không có dữ liệu đáng tin cậy.
+
+10. NEWS & SENTIMENT AGENT
+
+Theo dõi:
+
+- Tin tức crypto.
+- Chính sách.
+- Regulatory news.
+- ETF.
+- Institutional flows.
+- Exchange news.
+- Token news.
+- Security incidents.
+- Hacks.
+- Macro news.
+- Fed.
+- Inflation.
+- Interest rates.
+- Geopolitical risks.
+
+Phân tích:
+
+- Sentiment.
+- News credibility.
+- News freshness.
+- Impact.
+- Risk.
+- Event volatility.
+
+Phải hiển thị nguồn tin, thời gian và trạng thái xác minh.
+
+Không tạo ra tin tức giả.
+
+11. AI STRATEGY GENERATION AGENT
+
+Tạo các phương án chiến lược:
+
+- Long setup.
+- Short setup.
+- Spot accumulation.
+- Spot swing.
+- Scalping.
+- Intraday.
+- Swing trading.
+- Trend following.
+- Breakout trading.
+- Mean reversion.
+- Market neutral.
+- No-trade.
+
+Mỗi chiến lược phải có:
+
+- Tên chiến lược.
+- Coin.
+- Exchange.
+- Trading mode.
+- Direction.
+- Entry.
+- Stop Loss.
+- Take Profit.
+- Risk/Reward.
+- Position sizing.
+- Time horizon.
+- Conditions.
+- Invalidation.
+- Confidence score.
+- Expected fees.
+- Estimated slippage.
+- Data sources.
+- Timestamp.
+- Strategy version.
+
+Confidence score không được coi là xác suất thắng nếu chưa được hiệu chuẩn bằng dữ liệu thực.
+
+12. AI STRATEGY VALIDATION AGENT
+
+Kiểm tra:
+
+- Backtest.
+- Out-of-sample.
+- Walk-forward.
+- Monte Carlo.
+- Paper trading.
+- Historical drawdown.
+- Win rate.
+- Profit factor.
+- Sharpe.
+- Sortino.
+- Expectancy.
+- Risk/Reward.
+- Average loss.
+- Average win.
+- Max consecutive losses.
+- Exposure.
+- Fees.
+- Slippage.
+- Funding cost.
+
+Không cho phép chiến lược được triển khai bằng tiền thật chỉ dựa trên kết quả backtest.
+
+13. RISK MANAGEMENT AGENT
+
+Đây là Agent ưu tiên cao nhất trong quá trình cho phép giao dịch.
+
+Kiểm tra:
+
+- Total account risk.
+- Per-trade risk.
+- Daily loss limit.
+- Weekly loss limit.
+- Maximum drawdown.
+- Maximum leverage.
+- Maximum exposure.
+- Maximum open positions.
+- Correlated positions.
+- Concentration risk.
+- Liquidation risk.
+- Volatility risk.
+- Liquidity risk.
+- Funding risk.
+- Exchange risk.
+- Portfolio risk.
+- Position size.
+- Stop loss.
+- Risk/Reward.
+
+Các cấu hình mặc định phải thận trọng và có thể điều chỉnh.
+
+Ví dụ cấu hình ban đầu cho chế độ thử nghiệm:
+
+- Risk per trade: 0.25% tài khoản.
+- Maximum risk per trade: 0.5% tài khoản.
+- Daily loss limit: 1.5%.
+- Weekly loss limit: 4%.
+- Maximum drawdown trigger: 8%.
+- Default leverage: 1x.
+- Maximum leverage: 3x.
+- Maximum open positions: 3.
+- Minimum risk/reward target: 1.5.
+- Không tăng vị thế thua lỗ bằng cách martingale.
+- Không sử dụng unlimited leverage.
+- Không tự động tăng rủi ro sau chuỗi thắng.
+
+Các thông số trên chỉ là cấu hình thử nghiệm, không phải mức rủi ro tối ưu hoặc an toàn cho mọi tài khoản.
+
+Risk Manager có quyền:
+
+- APPROVE.
+- REJECT.
+- REDUCE POSITION.
+- PAUSE.
+- CLOSE POSITION.
+- LOCK SYSTEM.
+
+Nếu Risk Manager từ chối, hệ thống không được thực hiện lệnh mới.
+
+14. EXECUTION AGENT
+
+Thực hiện lệnh trên sàn khi người dùng bật chế độ giao dịch thật và cấu hình hợp lệ.
+
+Hỗ trợ:
+
+- Market Order.
+- Limit Order.
+- Stop Order.
+- Stop Loss.
+- Take Profit.
+- Reduce Only.
+- Post Only.
+- Trailing Stop nếu sàn hỗ trợ.
+- OCO nếu sàn hỗ trợ.
+- Partial Fill.
+- Order Retry.
+- Order Cancellation.
+- Order Reconciliation.
+
+Kiểm tra trước khi đặt lệnh:
+
+- Exchange.
+- Symbol.
+- Position mode.
+- Margin mode.
+- Leverage.
+- Available balance.
+- Order size.
+- Price.
+- Stop loss.
+- Trading fees.
+- Slippage.
+- Risk limits.
+- Exchange rules.
+
+Không được gửi lệnh nếu thông số không hợp lệ.
+
+Không được lặp lệnh vô hạn khi API gặp lỗi.
+
+Mỗi lệnh phải có idempotency protection hoặc cơ chế chống gửi lệnh trùng.
+
+15. PORTFOLIO MANAGEMENT AGENT
+
+Theo dõi:
+
+- Total equity.
+- Available balance.
+- Unrealized PnL.
+- Realized PnL.
+- Spot holdings.
+- Futures positions.
+- Margin.
+- Leverage.
+- Exposure.
+- Fees.
+- Funding.
+- Drawdown.
+- Risk allocation.
+- Portfolio correlation.
+
+Đề xuất:
+
+- Allocation.
+- Diversification.
+- Exposure reduction.
+- Risk reduction.
+- Hedging.
+- Rebalancing.
+
+Không tự tăng mức rủi ro để bù lỗ.
+
+16. POSITION MONITORING AGENT
+
+Theo dõi vị thế 24/7.
+
+- Entry.
+- Stop Loss.
+- Take Profit.
+- Liquidation price.
+- PnL.
+- Position size.
+- Margin.
+- Leverage.
+- Funding.
+- Volatility.
+- Risk status.
+
+Nếu điều kiện rủi ro thay đổi:
+
+- Cảnh báo.
+- Đề xuất giảm vị thế.
+- Đề xuất đóng vị thế.
+- Thực hiện hành động đã được người dùng cho phép.
+- Không tự bỏ qua stop loss.
+
+17. EXIT STRATEGY AGENT
+
+Đánh giá:
+
+- Stop loss.
+- Take profit.
+- Trailing stop.
+- Partial exit.
+- Trend reversal.
+- Volatility expansion.
+- Liquidity deterioration.
+- News risk.
+- Risk limit.
+
+Mục tiêu:
+
+- Bảo vệ vốn.
+- Giảm tổn thất.
+- Hạn chế drawdown.
+- Tối ưu quản trị vị thế.
+
+Không được bảo đảm lợi nhuận.
+
+18. AI PERFORMANCE AGENT
+
+Phân tích hiệu suất:
+
+- Win rate.
+- Profit factor.
+- Expectancy.
+- ROI.
+- Net profit.
+- Gross profit.
+- Gross loss.
+- Drawdown.
+- Sharpe.
+- Sortino.
+- Average trade.
+- Average win.
+- Average loss.
+- Winning streak.
+- Losing streak.
+- Performance by coin.
+- Performance by strategy.
+- Performance by timeframe.
+- Performance by exchange.
+- Performance by market regime.
+
+Đánh giá các chiến lược đang hoạt động.
+
+Phát hiện chiến lược suy giảm.
+
+Không tự sửa chiến lược và kích hoạt giao dịch thật nếu chưa qua kiểm định.
+
+19. CYBERSECURITY AGENT
+
+Bảo vệ:
+
+- API keys.
+- Secrets.
+- Authentication.
+- User sessions.
+- Database.
+- Trading endpoints.
+- Webhooks.
+- Audit logs.
+
+Yêu cầu:
+
+- Không lưu API keys trong frontend.
+- Không lưu API keys trong public repository.
+- Không đưa secrets vào prompt.
+- Không hiển thị secrets trong logs.
+- Encrypt secrets.
+- Use backend secret manager.
+- Restrict API permissions.
+- Không cấp quyền withdrawal.
+- Không cấp quyền transfer nếu không cần.
+- IP whitelist nếu sàn hỗ trợ.
+- User authentication.
+- MFA.
+- Session management.
+- Rate limiting.
+- Protection against replay attacks.
+- Input validation.
+- CSRF protection.
+- SQL injection protection.
+- Security monitoring.
+- Audit trail.
+
+---
+
+III. EXCHANGE CONNECTOR SYSTEM
+
+Thiết kế Exchange Connector Framework dạng module.
+
+Cho phép người dùng lựa chọn sàn giao dịch từ danh sách có thể mở rộng.
+
+Ưu tiên các sàn phổ biến và có API được hỗ trợ, ví dụ:
+
+- Binance.
+- Bybit.
+- OKX.
+- Kraken.
+- Coinbase Advanced.
+- Bitget.
+- KuCoin.
+- Gate.io.
+- MEXC.
+- HTX.
+- Deribit.
+- Các sàn khác có API tương thích.
+
+Không giả định tất cả sàn đều hỗ trợ cùng sản phẩm hoặc chức năng.
+
+Từng sàn phải được xác minh:
+
+- API status.
+- Market availability.
+- Spot availability.
+- Futures availability.
+- Contract type.
+- WebSocket.
+- Rate limits.
+- Authentication.
+- Trading permissions.
+- Order types.
+- Fees.
+- Trading rules.
+
+Xây dựng Exchange Registry:
+
+- Exchange name.
+- Exchange ID.
+- Connection status.
+- API status.
+- Supported markets.
+- Spot.
+- Futures.
+- Perpetual.
+- Delivery.
+- Margin.
+- WebSocket status.
+- API latency.
+- Last sync.
+- Data health.
+
+Người dùng có thể:
+
+- Thêm sàn.
+- Kết nối sàn.
+- Ngắt kết nối.
+- Cấu hình API.
+- Chọn sản phẩm giao dịch.
+- Chọn chiến lược.
+- Chọn sàn.
+- Chọn coin.
+- Chọn mức rủi ro.
+- Chọn chế độ giao dịch.
+
+---
+
+IV. UNIVERSAL COIN & MARKET SCANNER
+
+Xây dựng hệ thống quét thị trường toàn diện.
+
+Cho phép tìm kiếm:
+
+- Tất cả coin.
+- Tất cả token.
+- Tất cả cặp Spot.
+- Tất cả cặp Futures.
+- USDT pairs.
+- USDC pairs.
+- BTC pairs.
+- ETH pairs.
+- Các cặp khác tùy sàn.
+
+Các bộ lọc:
+
+- Market Cap.
+- Volume.
+- Volatility.
+- Spread.
+- Liquidity.
+- Funding Rate.
+- Open Interest.
+- Price change.
+- RSI.
+- Trend.
+- Momentum.
+- Breakout.
+- Risk score.
+- Exchange.
+- Market type.
+
+Không đưa các cặp không đủ thanh khoản vào danh sách giao dịch tự động.
+
+Phát hiện:
+
+- Low liquidity.
+- Abnormal volatility.
+- Abnormal spread.
+- Suspicious volume.
+- Token risk.
+- Trading halt.
+- Delisting risk.
+- Exchange-specific risk.
+
+---
+
+V. AI TRADING SIGNAL ENGINE
+
+Tạo một hệ thống đánh giá tín hiệu giao dịch.
+
+Mỗi tín hiệu phải có:
+
+- Signal ID.
+- Coin.
+- Exchange.
+- Market.
+- Direction.
+- Entry range.
+- Stop loss.
+- Take profit levels.
+- Position size.
+- Leverage.
+- Risk.
+- Reward.
+- Risk/Reward.
+- Time horizon.
+- Market regime.
+- Technical score.
+- Quant score.
+- Liquidity score.
+- Fundamental score.
+- Sentiment score.
+- Data quality score.
+- Risk score.
+- Confidence score.
+- Strategy name.
+- Reasoning summary.
+- Source data.
+- Timestamp.
+- Signal expiration.
+- Validation status.
+
+Signal states:
+
+- DETECTED.
+- ANALYZING.
+- VALIDATING.
+- APPROVED.
+- REJECTED.
+- EXECUTING.
+- OPEN.
+- PARTIALLY FILLED.
+- CLOSED.
+- EXPIRED.
+- FAILED.
+
+Không biến điểm tổng hợp thành xác suất thắng nếu chưa được kiểm định và hiệu chuẩn.
+
+---
+
+VI. MULTI-AGENT DECISION ENGINE
+
+Mỗi cơ hội giao dịch phải đi qua quy trình:
+
+1. Market Data Agent thu thập dữ liệu.
+2. Data Integrity Agent xác thực.
+3. Market Regime Agent phân loại.
+4. Technical Agent phân tích.
+5. Liquidity Agent phân tích.
+6. Quant Agent đánh giá.
+7. Fundamental Agent đánh giá.
+8. On-chain Agent đánh giá.
+9. News Agent đánh giá.
+10. Strategy Agent đề xuất.
+11. Strategy Validation Agent kiểm tra.
+12. Risk Management Agent phê duyệt hoặc từ chối.
+13. Execution Agent thực hiện nếu được cấp quyền.
+14. Position Monitoring Agent theo dõi.
+15. Exit Strategy Agent quản lý thoát lệnh.
+16. Performance Agent đánh giá.
+17. Audit Agent ghi nhật ký.
+
+Nếu Agent đưa ra kết luận mâu thuẫn:
+
+- Phân tích sự khác biệt.
+- Đánh giá nguồn dữ liệu.
+- Đánh giá độ tin cậy.
+- Giảm mức độ tin cậy.
+- Không giao dịch nếu xung đột nghiêm trọng.
+
+Không sử dụng cơ chế biểu quyết đơn giản để vượt qua giới hạn Risk Manager.
+
+---
+
+VII. AUTONOMOUS TRADING MODES
+
+Mode 1: ANALYSIS ONLY
+
+- Không đặt lệnh.
+- Phân tích thị trường.
+- Tạo tín hiệu.
+- Theo dõi cơ hội.
+- Hiển thị chiến lược.
+
+Mode 2: PAPER TRADING
+
+- Mô phỏng giao dịch.
+- Dữ liệu thị trường thực.
+- Mô phỏng phí.
+- Mô phỏng slippage.
+- Mô phỏng funding.
+- Không sử dụng tiền thật.
+- Ghi nhật ký.
+
+Mode 3: SEMI-AUTOMATIC
+
+- AI phân tích.
+- AI đề xuất lệnh.
+- AI tính toán rủi ro.
+- Người dùng phê duyệt.
+- Execution Agent thực hiện.
+
+Mode 4: FULL AUTOMATIC
+
+- AI phân tích.
+- AI lựa chọn chiến lược đã được phê duyệt.
+- AI tính position size.
+- AI kiểm tra risk.
+- AI tự đặt lệnh.
+- AI tự quản lý vị thế.
+- AI tự đóng lệnh theo quy tắc.
+- AI theo dõi 24/7.
+
+Full Automatic chỉ hoạt động khi:
+
+- API được kết nối.
+- Trading permission được cấp.
+- Risk configuration hợp lệ.
+- Data integrity hợp lệ.
+- User đã bật chế độ tự động.
+- System health đạt tiêu chuẩn.
+- Trading limits chưa bị vi phạm.
+
+Mode 5: EMERGENCY STOP
+
+- Ngừng đặt lệnh mới.
+- Hủy các lệnh chờ theo chính sách được cấu hình.
+- Theo dõi các vị thế đang mở.
+- Đề xuất hoặc thực hiện giảm rủi ro theo cấu hình khẩn cấp.
+- Không tự động đóng tất cả vị thế một cách thiếu kiểm soát.
+- Thông báo người dùng.
+- Ghi nhật ký.
+
+---
+
+VIII. SMART RISK ENGINE
+
+Thiết kế Risk Engine độc lập với AI model.
+
+Risk Engine phải hoạt động bằng quy tắc xác định, không phụ thuộc vào AI tạo nội dung.
+
+Tính toán:
+
+- Position size.
+- Risk per trade.
+- Stop loss.
+- Maximum exposure.
+- Leverage.
+- Margin.
+- Liquidation risk.
+- Correlation.
+- Daily loss.
+- Drawdown.
+- Fees.
+- Slippage.
+- Funding.
+
+Position size phải được tính từ:
+
+- Account equity.
+- Risk percentage.
+- Entry.
+- Stop loss distance.
+- Contract multiplier.
+- Fees.
+- Slippage.
+- Market rules.
+
+Không được tự ý tăng vị thế khi dữ liệu không hợp lệ.
+
+---
+
+IX. BACKTESTING & QUANT LAB
+
+Xây dựng phòng thí nghiệm chiến lược.
+
+Chức năng:
+
+- Strategy builder.
+- Historical data.
+- Backtest.
+- Walk-forward.
+- Out-of-sample.
+- Monte Carlo.
+- Parameter optimization.
+- Strategy comparison.
+- Portfolio simulation.
+- Benchmark.
+- Fee simulation.
+- Slippage simulation.
+- Funding simulation.
+- Risk analytics.
+
+Hiển thị:
+
+- Equity curve.
+- Drawdown curve.
+- Win rate.
+- Profit factor.
+- Expectancy.
+- Sharpe.
+- Sortino.
+- Max drawdown.
+- Total trades.
+- Average holding time.
+- Average win.
+- Average loss.
+- Risk/Reward.
+- Performance by regime.
+
+Không được hiển thị backtest như lợi nhuận thực.
+
+---
+
+X. AI DASHBOARD
+
+Thiết kế giao diện futuristic institutional-grade trading dashboard.
+
+Phong cách:
+
+- Dark mode.
+- High-end professional.
+- Cyber intelligence.
+- Modern fintech.
+- Minimalist.
+- Holographic accents.
+- Glassmorphism.
+- Responsive.
+- Mobile first.
+- Desktop optimized.
+- Real-time animation nhưng không gây mất tập trung.
+- Không sử dụng animation làm chậm hệ thống.
+
+Dashboard gồm:
+
+1. Command Center.
+2. Global Market Overview.
+3. Live Market Scanner.
+4. AI Agent Control Center.
+5. Multi-Exchange Hub.
+6. Spot Trading.
+7. Futures Trading.
+8. AI Signals.
+9. Portfolio.
+10. Positions.
+11. Orders.
+12. Risk Management.
+13. Quant Lab.
+14. Backtesting.
+15. Paper Trading.
+16. Strategy Builder.
+17. Market News.
+18. On-chain Intelligence.
+19. Performance Analytics.
+20. System Health.
+21. Data Integrity.
+22. Audit Logs.
+23. API Security.
+24. Automation Settings.
+25. Emergency Stop.
+
+---
+
+XI. COMMAND CENTER
+
+Hiển thị realtime:
+
+- BTC.
+- ETH.
+- Market Cap.
+- Market sentiment.
+- BTC dominance.
+- Total volume.
+- Funding rates.
+- Open interest.
+- Liquidations.
+- Market regime.
+- AI system status.
+- Data health.
+- Agent status.
+- Connected exchanges.
+- Portfolio equity.
+- Available balance.
+- PnL.
+- Drawdown.
+- Active positions.
+- Pending orders.
+- Active strategies.
+- AI opportunities.
+- Risk alerts.
+
+Chỉ hiển thị dữ liệu có nguồn và timestamp.
+
+---
+
+XII. AI AGENT CONTROL CENTER
+
+Hiển thị từng Agent:
+
+- Agent name.
+- Status.
+- Current task.
+- Data source.
+- Last activity.
+- Latency.
+- Health.
+- Errors.
+- Output.
+- Reliability.
+- Version.
+
+Status:
+
+- ONLINE.
+- OFFLINE.
+- BUSY.
+- ERROR.
+- DEGRADED.
+- WAITING.
+- DISABLED.
+
+Cho phép:
+
+- Start.
+- Stop.
+- Restart.
+- Enable.
+- Disable.
+- Inspect.
+- View logs.
+
+Không cho Agent quyền vượt qua giới hạn hệ thống.
+
+---
+
+XIII. REAL-TIME DATA ARCHITECTURE
+
+Thiết kế kiến trúc dữ liệu:
+
+Exchange APIs
+→ WebSocket
+→ Data Ingestion
+→ Data Validation
+→ Normalization
+→ Market Data Storage
+→ Feature Engine
+→ Agent Analysis
+→ Strategy Engine
+→ Risk Engine
+→ Execution Engine
+→ Portfolio Monitoring
+→ Dashboard.
+
+Yêu cầu:
+
+- WebSocket ưu tiên cho dữ liệu realtime.
+- REST API dùng để bổ sung, đối soát và khôi phục.
+- Timestamp UTC.
+- Source timestamp.
+- Received timestamp.
+- Data freshness.
+- API latency.
+- Retry strategy.
+- Rate limit management.
+- Circuit breakers.
+- Data reconciliation.
+- Error handling.
+- Event logging.
+- Monitoring.
+
+Không sử dụng dữ liệu cũ như dữ liệu realtime.
+
+---
+
+XIV. BACKEND ARCHITECTURE
+
+Thiết kế backend có khả năng mở rộng.
+
+Ưu tiên:
+
+- TypeScript.
+- Node.js.
+- Python cho Quant và AI analysis.
+- FastAPI.
+- WebSocket.
+- Redis.
+- PostgreSQL.
+- TimescaleDB nếu phù hợp.
+- Message Queue.
+- Docker.
+- Modular services.
+- Secure API.
+- Observability.
+
+Các service:
+
+- Authentication Service.
+- Exchange Connector Service.
+- Market Data Service.
+- Data Validation Service.
+- AI Orchestrator.
+- Agent Service.
+- Strategy Service.
+- Risk Service.
+- Execution Service.
+- Portfolio Service.
+- Notification Service.
+- Audit Service.
+- Analytics Service.
+- Backtest Service.
+
+Không xây dựng kiến trúc monolithic thiếu khả năng mở rộng nếu hệ thống cần nhiều Agent và nhiều sàn.
+
+---
+
+XV. DATABASE DESIGN
+
+Thiết kế database chuyên nghiệp.
+
+Các bảng:
+
+- users.
+- user_settings.
+- exchange_connections.
+- exchange_registry.
+- markets.
+- symbols.
+- market_data.
+- order_books.
+- trades.
+- candles.
+- indicators.
+- agent_registry.
+- agent_runs.
+- agent_logs.
+- strategies.
+- strategy_versions.
+- signals.
+- risk_checks.
+- portfolios.
+- portfolio_snapshots.
+- positions.
+- orders.
+- fills.
+- transactions.
+- funding_records.
+- backtests.
+- backtest_results.
+- paper_trading.
+- performance_metrics.
+- alerts.
+- notifications.
+- system_health.
+- audit_logs.
+
+Thiết kế index, partitioning, retention và backup.
+
+---
+
+XVI. AI MODEL ARCHITECTURE
+
+Thiết kế AI model layer có thể thay thế linh hoạt.
+
+Hỗ trợ:
+
+- Gemini.
+- Các AI model tương thích API.
+- Local AI models nếu triển khai phù hợp.
+
+AI model không được trực tiếp truy cập API key của sàn.
+
+AI model chỉ tạo phân tích và đề xuất.
+
+Các hành động giao dịch phải thông qua:
+
+Strategy Engine
+→ Risk Engine
+→ Execution Engine.
+
+AI output phải được kiểm tra bằng schema và validation.
+
+Không cho phép AI tạo lệnh tùy ý ngoài schema.
+
+---
+
+XVII. SYSTEM HEALTH & RELIABILITY
+
+Theo dõi:
+
+- Server.
+- Database.
+- WebSocket.
+- Exchange API.
+- AI model.
+- Latency.
+- Memory.
+- CPU.
+- Network.
+- Error rate.
+- Agent health.
+- Execution health.
+- Data integrity.
+
+Nếu một thành phần không đạt yêu cầu:
+
+- Giảm chức năng.
+- Dừng giao dịch mới.
+- Báo lỗi.
+- Retry có giới hạn.
+- Recovery.
+- Ghi nhật ký.
+
+---
+
+XVIII. NOTIFICATION SYSTEM
+
+Thông báo:
+
+- Telegram.
+- Email.
+- In-app notifications.
+- Push notifications nếu triển khai.
+
+Các cảnh báo:
+
+- Entry.
+- Exit.
+- Stop loss.
+- Take profit.
+- Risk warning.
+- Daily loss.
+- Drawdown.
+- API disconnect.
+- Data stale.
+- Exchange error.
+- Liquidation risk.
+- Position anomaly.
+- System failure.
+- Agent failure.
+- Emergency stop.
+
+Không gửi dữ liệu nhạy cảm qua kênh thông báo.
+
+---
+
+XIX. USER SETTINGS
+
+Cho phép người dùng tùy chỉnh:
+
+- Exchanges.
+- Coins.
+- Spot.
+- Futures.
+- Strategy.
+- Timeframe.
+- Risk.
+- Leverage.
+- Position sizing.
+- Stop loss.
+- Take profit.
+- Daily loss limit.
+- Maximum drawdown.
+- Maximum positions.
+- Trading mode.
+- AI model.
+- Agent configuration.
+- Notifications.
+- Trading schedule.
+- Automation.
+
+---
+
+XX. DEVELOPMENT REQUIREMENTS
+
+Hãy xây dựng ứng dụng thực tế, không chỉ tạo giao diện mockup.
+
+Yêu cầu:
+
+- Frontend hoàn chỉnh.
+- Backend.
+- Database.
+- Authentication.
+- API integration.
+- WebSocket.
+- Exchange connectors.
+- AI Agents.
+- Risk Engine.
+- Execution Engine.
+- Paper Trading.
+- Backtesting.
+- Dashboard.
+- Monitoring.
+- Security.
+- Deployment.
+
+Nếu chưa có API key:
+
+- Sử dụng dữ liệu demo có nhãn DEMO.
+- Không giả mạo dữ liệu realtime.
+- Không hiển thị demo như dữ liệu thật.
+
+Nếu chưa triển khai được một chức năng:
+
+- Ghi rõ chức năng chưa hoàn thành.
+- Ghi rõ nguyên nhân.
+- Không giả lập chức năng đã triển khai.
+- Không tự tuyên bố ứng dụng đã hoạt động thực tế.
+
+---
+
+XXI. DEPLOYMENT
+
+Thiết kế hướng dẫn triển khai:
+
+- Google AI Studio.
+- GitHub.
+- Cloud Run hoặc nền tảng backend phù hợp.
+- Database.
+- Redis.
+- Secret Manager.
+- Domain.
+- SSL.
+- Monitoring.
+- CI/CD.
+- Backup.
+- Recovery.
+
+Tối ưu cho:
+
+- Android.
+- Mobile browser.
+- Desktop.
+- Tablet.
+
+---
+
+XXII. IMPLEMENTATION ROADMAP
+
+Giai đoạn 1:
+
+Xây dựng giao diện và Market Data Dashboard.
+
+Giai đoạn 2:
+
+Xây dựng Exchange Connector.
+
+Giai đoạn 3:
+
+Xây dựng Data Integrity Engine.
+
+Giai đoạn 4:
+
+Xây dựng Multi-Agent AI.
+
+Giai đoạn 5:
+
+Xây dựng Strategy Engine.
+
+Giai đoạn 6:
+
+Xây dựng Risk Engine.
+
+Giai đoạn 7:
+
+Xây dựng Paper Trading.
+
+Giai đoạn 8:
+
+Xây dựng Backtesting.
+
+Giai đoạn 9:
+
+Xây dựng Execution Engine.
+
+Giai đoạn 10:
+
+Xây dựng Portfolio Monitoring.
+
+Giai đoạn 11:
+
+Xây dựng Autonomous Trading.
+
+Giai đoạn 12:
+
+Xây dựng Monitoring, Security, Recovery và Optimization.
+
+---
+
+XXIII. ACCEPTANCE TESTS
+
+Trước khi công bố hệ thống hoạt động, phải kiểm tra:
+
+- API connectivity.
+- WebSocket connectivity.
+- Data accuracy.
+- Timestamp.
+- Data freshness.
+- Exchange rules.
+- Symbol validation.
+- Order validation.
+- Position sizing.
+- Risk limits.
+- Stop loss.
+- Take profit.
+- Order reconciliation.
+- Duplicate order protection.
+- API failure.
+- Network failure.
+- Agent failure.
+- AI failure.
+- Database failure.
+- Emergency stop.
+- Secrets protection.
+- Paper trading.
+- Backtesting.
+- Recovery.
+- Audit trail.
+
+Không được đánh dấu PASS nếu chưa thực sự chạy kiểm thử.
+
+---
+
+XXIV. FINAL DESIGN OBJECTIVE
+
+Hãy xây dựng OMNISENT AI thành một hệ thống Multi-Agent Trading Intelligence chuyên nghiệp, có kiến trúc mạnh, dữ liệu realtime có kiểm chứng, khả năng phân tích thị trường toàn diện, tự động hóa Spot và Futures, chiến lược định lượng, quản trị rủi ro độc lập, bảo mật cấp cao, giao diện hiện đại, khả năng mở rộng và triển khai thực tế.
+
+Ưu tiên tuyệt đối:
+
+1. DATA ACCURACY.
+2. CAPITAL PRESERVATION.
+3. RISK CONTROL.
+4. SECURITY.
+5. TRANSPARENCY.
+6. EXECUTION RELIABILITY.
+7. REAL-TIME MONITORING.
+8. TESTABILITY.
+9. SCALABILITY.
+10. PERFORMANCE.
+
+Không được tự bịa dữ liệu.
+
+Không được tự bịa chức năng đã triển khai.
+
+Không được tuyên bố tỷ lệ thắng, lợi nhuận hoặc độ chính xác không có bằng chứng.
+
+Không được bỏ qua Risk Engine.
+
+Không được giao quyền rút tiền cho hệ thống giao dịch.
+
+Hãy bắt đầu thiết kế kiến trúc tổng thể, tạo ứng dụng, xây dựng các module theo thứ tự ưu tiên, tạo mã nguồn hoàn chỉnh, hướng dẫn cấu hình API, kiểm thử và triển khai thực tế từng bước.
+
+Nếu toàn bộ hệ thống không thể hoàn thành trong một lần, hãy chia thành các module có thể triển khai độc lập, giữ nguyên kiến trúc tổng thể và tiếp tục hoàn thiện cho đến khi hệ thống có thể vận hành thực tế.

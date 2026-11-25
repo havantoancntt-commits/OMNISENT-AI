@@ -1,0 +1,6 @@
+{
+  "name": "OMNISENT AI — Autonomous Trading Intelligence",
+  "description": "Multi-Agent Spot & Futures Trading Command Center with deterministic Risk Engine, 3D Neural Topology Workspace, Quant Backtesting Lab, and Multi-Exchange Hub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
