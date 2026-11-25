@@ -1,0 +1,5 @@
+.data
+.aistudio
+dev-dist
+.playwright-cli
+node_modules

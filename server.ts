@@ -117,8 +117,28 @@ import type {
 dotenv.config();
 initDatabase();
 
-const app = express();
+export const app = express();
 app.use(express.json({ limit: '1mb' }));
+
+let coldWarmupPromise: Promise<void> | null = null;
+async function ensureServerWarm(): Promise<void> {
+  if (!process.env.VERCEL && !process.env.VERCEL_ENV) return;
+  if (!coldWarmupPromise) {
+    coldWarmupPromise = (async () => {
+      try {
+        await marketFeed.refreshFeed();
+      } catch {
+        // Non-fatal in cold-start serverless fallback
+      }
+    })();
+  }
+  await coldWarmupPromise;
+}
+
+app.use('/api', async (_req, _res, next) => {
+  await ensureServerWarm();
+  next();
+});
 
 // Helper to recompute portfolio equity, mark-to-market positions, and record real PnL snapshots
 function syncPortfolioAndPositions(options?: {
@@ -3526,7 +3546,12 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Failed to start OMNISENT AI server:', err);
-  process.exit(1);
-});
+const isVercelRuntime = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+if (!isVercelRuntime && !process.env.OMNISENT_SKIP_LISTEN) {
+  startServer().catch((err) => {
+    console.error('Failed to start OMNISENT AI server:', err);
+    process.exit(1);
+  });
+}
+
+export default app;

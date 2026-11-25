@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -28,11 +29,32 @@ import type {
   TradingSignal,
 } from '../src/engine/types.ts';
 
-const DATA_DIR = path.resolve(process.cwd(), '.data');
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+function resolveWritableDataDir(): string {
+  if (process.env.OMNISENT_DATA_DIR) {
+    const customDir = path.resolve(process.env.OMNISENT_DATA_DIR);
+    fs.mkdirSync(customDir, { recursive: true });
+    return customDir;
+  }
+  const preferredDir = path.resolve(process.cwd(), '.data');
+  if (!process.env.VERCEL && !process.env.VERCEL_ENV) {
+    try {
+      if (!fs.existsSync(preferredDir)) {
+        fs.mkdirSync(preferredDir, { recursive: true });
+      }
+      fs.accessSync(preferredDir, fs.constants.W_OK);
+      return preferredDir;
+    } catch {
+      // Fall through to OS temp dir if workspace cwd is read-only
+    }
+  }
+  const tmpDir = path.join(os.tmpdir(), 'omnisent-data');
+  if (!fs.existsSync(tmpDir)) {
+    fs.mkdirSync(tmpDir, { recursive: true });
+  }
+  return tmpDir;
 }
 
+const DATA_DIR = resolveWritableDataDir();
 const DB_PATH = path.join(DATA_DIR, 'omnisent.db');
 export const db = new DatabaseSync(DB_PATH);
 

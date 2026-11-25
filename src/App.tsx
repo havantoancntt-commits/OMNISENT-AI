@@ -218,7 +218,7 @@ export default function App() {
     }
   }, []);
 
-  // Bootstrap initial state & WebSocket telemetry stream
+  // Bootstrap initial state & WebSocket telemetry stream (with clean HTTP fallback on serverless hosts)
   useEffect(() => {
     fetchAllState();
 
@@ -226,6 +226,10 @@ export default function App() {
     const wsUrl = `${proto}//${window.location.host}/ws`;
     let ws: WebSocket | null = null;
     let closedByEffect = false;
+    let wsConnected = false;
+    let everOpened = false;
+    let failedHandshakes = 0;
+    let reconnectTimer: number | null = null;
     let initializedFromWs = false;
     let prevPosCount = 0;
     let prevAutoTradesCount = 0;
@@ -243,9 +247,21 @@ export default function App() {
       }, 220);
     };
 
+    const pollTimer = window.setInterval(() => {
+      if (!wsConnected && !closedByEffect) {
+        void fetchAllState();
+      }
+    }, 8000);
+
     const connect = () => {
+      if (closedByEffect) return;
       try {
         ws = new WebSocket(wsUrl);
+        ws.onopen = () => {
+          wsConnected = true;
+          everOpened = true;
+          failedHandshakes = 0;
+        };
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data);
@@ -306,18 +322,27 @@ export default function App() {
           }
         };
         ws.onclose = () => {
-          if (!closedByEffect) {
-            setTimeout(connect, 4000);
+          wsConnected = false;
+          if (!everOpened) {
+            failedHandshakes += 1;
+          }
+          // Stop spamming WS reconnects if host doesn't support WS upgrades (e.g. serverless); HTTP pollTimer continues smoothly
+          if (!closedByEffect && (everOpened || failedHandshakes < 2)) {
+            reconnectTimer = window.setTimeout(connect, 4000);
           }
         };
       } catch {
-        // Fallback polling handled if WS fails
+        wsConnected = false;
       }
     };
     connect();
 
     return () => {
       closedByEffect = true;
+      window.clearInterval(pollTimer);
+      if (reconnectTimer !== null) {
+        window.clearTimeout(reconnectTimer);
+      }
       if (wsSyncTimerRef.current !== null) {
         window.clearTimeout(wsSyncTimerRef.current);
       }
