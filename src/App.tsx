@@ -251,7 +251,23 @@ export default function App() {
       if (!wsConnected && !closedByEffect) {
         void fetchAllState();
       }
-    }, 8000);
+    }, 10_000);
+
+    const fastTickerTimer = window.setInterval(async () => {
+      if (!wsConnected && !closedByEffect) {
+        try {
+          const res = await fetch('/api/market/tickers');
+          if (res.ok) {
+            const mkt = await res.json();
+            if (Array.isArray(mkt.tickers)) setTickers(mkt.tickers);
+            if (typeof mkt.liveFeedActive === 'boolean') setLiveFeedActive(mkt.liveFeedActive);
+            if (mkt.serverUtc) setServerUtc(mkt.serverUtc);
+          }
+        } catch {
+          // non-fatal
+        }
+      }
+    }, 3000);
 
     const connect = () => {
       if (closedByEffect) return;
@@ -265,6 +281,38 @@ export default function App() {
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data);
+            if (msg.type === 'PRICE_TICK_UPDATE') {
+              if (Array.isArray(msg.tickers)) setTickers(msg.tickers);
+              if (msg.portfolio) setPortfolio(msg.portfolio);
+              if (Array.isArray(msg.positions)) setPositions(msg.positions);
+              if (msg.pnlPoint) {
+                setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
+              }
+              if (typeof msg.liveFeedActive === 'boolean') setLiveFeedActive(msg.liveFeedActive);
+              if (msg.serverUtc) setServerUtc(msg.serverUtc);
+
+              const nextPosCount = Array.isArray(msg.positions) ? msg.positions.length : prevPosCount;
+              const nextRevision =
+                typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision;
+              const pnlPt = msg.pnlPoint as PnlHistoryPoint | null | undefined;
+              const eventTag = pnlPt?.eventTag;
+              const eventTs = pnlPt?.timestampMs ?? 0;
+              const isTradeEvent =
+                Boolean(eventTag && ['ORDER_FILLED', 'AUTO_SL_TP', 'POSITION_CLOSED', 'EMERGENCY_STOP'].includes(eventTag)) &&
+                eventTs !== prevEventTs;
+
+              if (
+                nextPosCount !== prevPosCount ||
+                isTradeEvent ||
+                (nextRevision !== null && prevStateRevision !== null && nextRevision !== prevStateRevision)
+              ) {
+                prevPosCount = nextPosCount;
+                prevEventTs = eventTs;
+                prevStateRevision = nextRevision;
+                scheduleFullRefresh();
+              }
+              return;
+            }
             if (msg.type === 'TELEMETRY_UPDATE') {
               if (Array.isArray(msg.tickers)) setTickers(msg.tickers);
               if (msg.portfolio) setPortfolio(msg.portfolio);
@@ -340,6 +388,7 @@ export default function App() {
     return () => {
       closedByEffect = true;
       window.clearInterval(pollTimer);
+      window.clearInterval(fastTickerTimer);
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }

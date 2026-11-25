@@ -17,6 +17,13 @@ import {
   optimizeSlTpWithLiquidationRadar,
 } from './liquidationRadar.ts';
 import {
+  classifyFeedFreshness,
+  computeCrossVenueBasisBps,
+  computeFeedHealthMetrics,
+  mergeLiveTickIntoCandles,
+  validateLiveQuoteTick,
+} from './priceFeedGuard.ts';
+import {
   createInitialAgentRegistry,
   runMultiAgentDecisionPipeline,
 } from './multiAgentPipeline.ts';
@@ -3297,6 +3304,116 @@ test('Liquidation Cluster Radar estimates crowd leverage pools, optimizes Zero-S
     pepeSignal.quantIntel.liquidationRadar.recommendedLongTp >
       pepeSignal.quantIntel.liquidationRadar.markPrice,
   );
+});
+
+test('Real-time Price Feed Guard validates ticks, classifies freshness, stitches live candles, and computes cross-venue basis', () => {
+  const nowMs = Date.UTC(2026, 10, 25, 8, 30, 0);
+
+  // 1) Tick validation: valid tick, crossed book, toxic spread, outlier flash spike
+  const okTick = validateLiveQuoteTick({
+    lastPrice: 95_000,
+    bidPrice: 94_995,
+    askPrice: 95_005,
+    prevPrice: 94_950,
+    prevTimestampMs: nowMs - 800,
+    timestampMs: nowMs,
+  });
+  assert.equal(okTick.valid, true);
+  assert.ok(okTick.spreadBps > 0 && okTick.spreadBps < 2);
+
+  const crossedTick = validateLiveQuoteTick({
+    lastPrice: 95_000,
+    bidPrice: 95_100,
+    askPrice: 94_900,
+    timestampMs: nowMs,
+  });
+  assert.equal(crossedTick.valid, false);
+  assert.equal(crossedTick.reason, 'CROSSED_BOOK');
+
+  const toxicTick = validateLiveQuoteTick({
+    lastPrice: 95_000,
+    bidPrice: 91_000,
+    askPrice: 99_000,
+    timestampMs: nowMs,
+  });
+  assert.equal(toxicTick.valid, false);
+  assert.equal(toxicTick.reason, 'TOXIC_SPREAD');
+
+  const spikeTick = validateLiveQuoteTick({
+    lastPrice: 112_000, // +17.9% in 1s -> outlier glitch rejected
+    bidPrice: 111_990,
+    askPrice: 112_010,
+    prevPrice: 95_000,
+    prevTimestampMs: nowMs - 1000,
+    timestampMs: nowMs,
+  });
+  assert.equal(spikeTick.valid, false);
+  assert.equal(spikeTick.reason, 'OUTLIER_SPIKE');
+
+  // 2) Feed freshness classification tiers
+  assert.equal(classifyFeedFreshness(nowMs - 900, nowMs).tier, 'REALTIME');
+  assert.equal(classifyFeedFreshness(nowMs - 5_000, nowMs).tier, 'LIVE');
+  assert.equal(classifyFeedFreshness(nowMs - 18_000, nowMs).tier, 'AGING');
+  assert.equal(classifyFeedFreshness(nowMs - 45_000, nowMs).tier, 'STALE');
+  assert.equal(classifyFeedFreshness(0, nowMs).tier, 'UNAVAILABLE');
+
+  // 3) Live candle tip stitching (in-bucket high/low/close update & new-bucket bar roll without mutating original)
+  const bucket0 = Math.floor(nowMs / 3600_000) * 3600_000;
+  const baseCandles: Candle[] = [
+    { timestamp: bucket0 - 3600_000, open: 94_000, high: 94_500, low: 93_800, close: 94_200, volume: 120 },
+    { timestamp: bucket0, open: 94_200, high: 94_900, low: 94_100, close: 94_800, volume: 85 },
+  ];
+  const sameBucket = mergeLiveTickIntoCandles(baseCandles, 95_120, bucket0 + 600_000, '1h');
+  assert.equal(sameBucket.length, 2);
+  assert.equal(sameBucket[1].close, 95_120);
+  assert.equal(sameBucket[1].high, 95_120);
+  assert.equal(baseCandles[1].close, 94_800); // input untouched
+
+  const nextBucket = mergeLiveTickIntoCandles(baseCandles, 95_400, bucket0 + 3600_000 + 5000, '1h');
+  assert.equal(nextBucket.length, 2);
+  assert.equal(nextBucket[1].timestamp, bucket0 + 3600_000);
+  assert.equal(nextBucket[1].open, 94_800);
+  assert.equal(nextBucket[1].close, 95_400);
+
+  // 4) Cross-venue basis divergence & overall feed health metrics
+  const btcPerp = makeValidTicker({
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 95_095,
+    sourceLabel: 'Binance FAPI WS',
+    latencyMs: 38,
+    timestampUtc: nowMs - 600,
+  });
+  const btcSpot = makeValidTicker({
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'SPOT',
+    lastPrice: 95_000,
+    sourceLabel: 'Binance Spot WS',
+    latencyMs: 44,
+    timestampUtc: nowMs - 800,
+  });
+  const ethPerp = makeValidTicker({
+    symbol: 'ETH/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 3_400,
+    sourceLabel: 'Binance FAPI REST',
+    latencyMs: 140,
+    timestampUtc: nowMs - 4_000,
+  });
+
+  const basis = computeCrossVenueBasisBps([btcPerp, btcSpot, ethPerp], btcPerp);
+  assert.equal(basis.peerCount, 1);
+  assert.equal(basis.medianRefPrice, 95_000);
+  assert.equal(basis.basisBps, 10);
+
+  const health = computeFeedHealthMetrics([btcPerp, btcSpot, ethPerp], nowMs);
+  assert.equal(health.liveCount, 3);
+  assert.equal(health.realtimeWsCount, 2);
+  assert.equal(health.medianLatencyMs, 44);
+  assert.equal(health.freshness, 'REALTIME');
 });
 
 

@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowUpRight,
   Cpu,
@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import { formatAssetPrice } from '../engine/symbolSearch';
 import { isSameTickerSelection } from '../engine/pairSelection';
+import { computeFeedHealthMetrics } from '../engine/priceFeedGuard';
 import type {
   AgentState,
   AutoExecutionConfig,
@@ -117,6 +118,30 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const activeSignal = selectedSignal;
   const latestAnySignal = signals[0] ?? null;
 
+  const feedHealth = useMemo(() => computeFeedHealthMetrics(tickers), [tickers]);
+  const prevPricesRef = useRef<Record<string, number>>({});
+  const [tickDirs, setTickDirs] = useState<Record<string, 'UP' | 'DOWN' | 'FLAT'>>({});
+
+  useEffect(() => {
+    const nextDirs: Record<string, 'UP' | 'DOWN' | 'FLAT'> = {};
+    let changed = false;
+    for (const tk of tickers) {
+      if (!(tk.lastPrice > 0)) continue;
+      const key = `${tk.symbol}|${tk.marketType}|${tk.exchange}`;
+      const prev = prevPricesRef.current[key];
+      if (prev !== undefined && prev !== tk.lastPrice) {
+        nextDirs[key] = tk.lastPrice > prev ? 'UP' : 'DOWN';
+        changed = true;
+      } else {
+        nextDirs[key] = 'FLAT';
+      }
+      prevPricesRef.current[key] = tk.lastPrice;
+    }
+    if (changed) {
+      setTickDirs(nextDirs);
+    }
+  }, [tickers]);
+
   return (
     <div className="space-y-6">
       {/* Global KPI Strip */}
@@ -176,14 +201,16 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           <div className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
             <p className="truncate text-xs text-slate-400">{t('cmd.kpi.dataFeed')}</p>
             <p
-              className={`mt-1.5 font-display text-base font-semibold whitespace-nowrap sm:text-xl ${
+              className={`mt-1.5 truncate font-display text-base font-semibold sm:text-xl ${
                 liveFeedActive ? 'text-emerald-400' : 'text-amber-400'
               }`}
             >
               {liveFeedActive ? t('cmd.kpi.liveExchange') : t('cmd.kpi.offline')}
             </p>
             <p className="mt-1 truncate font-mono text-[11px] tabular-nums text-slate-400">
-              UTC {serverUtc ? serverUtc.slice(11, 19) : '--:--:--'}
+              {feedHealth.realtimeWsCount > 0
+                ? `${t(`feed.tier.${feedHealth.freshness}`)} · WS ${feedHealth.realtimeWsCount}/${feedHealth.liveCount} · ${t('feed.latencyLabel', { ms: feedHealth.medianLatencyMs })}`
+                : `${t(`feed.tier.${feedHealth.freshness}`)} · UTC ${serverUtc ? serverUtc.slice(11, 19) : '--:--:--'}`}
             </p>
           </div>
         </div>
@@ -248,6 +275,8 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
               {pulseTickers.map((item) => {
                 const up = item.change24hPct >= 0;
                 const isActive = isSameTickerSelection(item, selectedTicker);
+                const pairKey = `${item.symbol}|${item.marketType}|${item.exchange}`;
+                const tDir = tickDirs[pairKey] ?? 'FLAT';
                 return (
                   <button
                     key={`${item.symbol}-${item.marketType}-${item.exchange}`}
@@ -276,10 +305,19 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                       <p className="mt-0.5 text-[11px] text-slate-500">
                         {item.regime} · RSI{' '}
                         <span className="font-mono tabular-nums">{item.rsi14 ?? '--'}</span>
+                        {item.sourceLabel.includes('WS') ? ' · WS' : ''}
                       </p>
                     </div>
                     <div className="text-right">
-                      <p className="font-mono text-sm font-semibold tabular-nums text-slate-100">
+                      <p
+                        className={`font-mono text-sm font-semibold tabular-nums transition-colors duration-200 ${
+                          tDir === 'UP'
+                            ? 'text-emerald-300'
+                            : tDir === 'DOWN'
+                              ? 'text-rose-300'
+                              : 'text-slate-100'
+                        }`}
+                      >
                         {formatAssetPrice(item.lastPrice)}
                       </p>
                       <p

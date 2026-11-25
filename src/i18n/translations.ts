@@ -874,6 +874,15 @@ const vi = {
   'liqRadar.side.LONG_LIQ': 'LONG LIQ',
   'liqRadar.side.SHORT_LIQ': 'SHORT LIQ',
   'liqRadar.cmdLine': 'Radar LiQ Risk {risk}/100 · LongLiq {longPx} · ShortLiq {shortPx}',
+
+  // Real-time Price Feed Telemetry
+  'feed.tier.REALTIME': 'REAL-TIME',
+  'feed.tier.LIVE': 'LIVE',
+  'feed.tier.AGING': 'AGING',
+  'feed.tier.STALE': 'STALE',
+  'feed.tier.UNAVAILABLE': 'OFFLINE',
+  'feed.basisLabel': 'Basis {bps} bps',
+  'feed.latencyLabel': '{ms}ms',
 } as const;
 
 const en: Record<keyof typeof vi, string> = {
@@ -1738,6 +1747,15 @@ const en: Record<keyof typeof vi, string> = {
   'liqRadar.side.LONG_LIQ': 'LONG LIQ',
   'liqRadar.side.SHORT_LIQ': 'SHORT LIQ',
   'liqRadar.cmdLine': 'LiQ Radar Risk {risk}/100 · LongLiq {longPx} · ShortLiq {shortPx}',
+
+  // Real-time Price Feed Telemetry
+  'feed.tier.REALTIME': 'REAL-TIME',
+  'feed.tier.LIVE': 'LIVE',
+  'feed.tier.AGING': 'AGING',
+  'feed.tier.STALE': 'STALE',
+  'feed.tier.UNAVAILABLE': 'OFFLINE',
+  'feed.basisLabel': 'Basis {bps} bps',
+  'feed.latencyLabel': '{ms}ms',
 };
 
 export type TranslationKey = keyof typeof vi;

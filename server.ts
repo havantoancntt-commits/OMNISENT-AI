@@ -65,6 +65,12 @@ import {
 } from './src/engine/quantIntelligence.ts';
 import { computeLiquidationRadar } from './src/engine/liquidationRadar.ts';
 import {
+  classifyFeedFreshness,
+  computeCrossVenueBasisBps,
+  computeFeedHealthMetrics,
+  mergeLiveTickIntoCandles,
+} from './src/engine/priceFeedGuard.ts';
+import {
   estimateLiquidationPrice,
   evaluateOrderRisk,
 } from './src/engine/riskEngine.ts';
@@ -144,6 +150,7 @@ app.use('/api', async (_req, _res, next) => {
 function syncPortfolioAndPositions(options?: {
   eventTag?: string;
   forceRecord?: boolean;
+  skipSnapshotWriteIfUnchanged?: boolean;
 }): {
   portfolio: ReturnType<typeof getPortfolioSummary>;
   positions: Position[];
@@ -332,7 +339,14 @@ function syncPortfolioAndPositions(options?: {
   const elapsedMs = prevSnap ? nowMs - prevSnap.timestampMs : Infinity;
 
   let latestPnlPoint = prevSnap;
-  if (options?.forceRecord || autoClosed || circuitBreakerTripped || (changed && elapsedMs >= 1500) || elapsedMs >= 16_000) {
+  const routineMinIntervalMs = options?.skipSnapshotWriteIfUnchanged ? 8000 : 1500;
+  if (
+    options?.forceRecord ||
+    autoClosed ||
+    circuitBreakerTripped ||
+    (changed && elapsedMs >= routineMinIntervalMs) ||
+    elapsedMs >= 16_000
+  ) {
     const point: PnlHistoryPoint = {
       timestampMs: nowMs,
       timestampUtc: new Date(nowMs).toISOString(),
@@ -391,12 +405,35 @@ app.get('/api/market/tickers', (_req, res) => {
   res.json({
     tickers,
     totalDirectoryCount: marketFeed.getDirectoryCount(),
+    feedHealth: computeFeedHealthMetrics(tickers),
     integritySummary: {
       total: integrity.length,
       valid: integrity.filter((r) => r.valid).length,
       anomalies: integrity.filter((r) => !r.valid).slice(0, 10),
     },
     liveFeedActive: marketFeed.isLiveFeedActive(),
+    serverUtc: new Date().toISOString(),
+  });
+});
+
+app.get('/api/market/quote', async (req, res) => {
+  const symbol = String(req.query.symbol || 'BTC/USDT');
+  const marketType = (String(req.query.marketType || 'PERPETUAL') as MarketType);
+  const exchange = req.query.exchange ? String(req.query.exchange) : undefined;
+  let ticker = marketFeed.getTicker(symbol, marketType, exchange);
+  const staleOrMissing = !ticker || ticker.lastPrice <= 0 || Date.now() - ticker.timestampUtc > 2000;
+  if (staleOrMissing) {
+    ticker = (await marketFeed.refreshPairQuote(symbol, marketType, exchange)) ?? ticker;
+  }
+  if (!ticker) {
+    res.status(404).json({ error: `Không tìm thấy dữ liệu giá cho ${symbol}.` });
+    return;
+  }
+  const allTickers = marketFeed.getTickers();
+  res.json({
+    ticker,
+    freshness: classifyFeedFreshness(ticker.timestampUtc),
+    basis: computeCrossVenueBasisBps(allTickers, ticker),
     serverUtc: new Date().toISOString(),
   });
 });
@@ -479,12 +516,16 @@ app.get('/api/market/candles', async (req, res) => {
     });
     return;
   }
-  const indicators = computeAllIndicators(candles);
   const ticker = marketFeed.getTicker(symbol, marketType, exchange);
+  const liveCandles =
+    ticker && ticker.dataStatus === 'LIVE_EXCHANGE' && ticker.lastPrice > 0
+      ? mergeLiveTickIntoCandles(candles, ticker.lastPrice, ticker.timestampUtc, interval)
+      : candles;
+  const indicators = computeAllIndicators(liveCandles);
   const riskConfig = getRiskConfig();
   const portfolio = getPortfolioSummary();
   const quantIntel = computeQuantIntelligenceSnapshot({
-    candles,
+    candles: liveCandles,
     orderBook: book,
     ticker,
     winProbability: 0.56,
@@ -499,7 +540,7 @@ app.get('/api/market/candles', async (req, res) => {
     interval,
     status,
     source,
-    candles,
+    candles: liveCandles,
     indicators,
     quantIntel,
   });
@@ -3492,6 +3533,40 @@ async function startServer() {
     );
   });
 
+  // Fast 1s sub-second WebSocket price & SL/TP lifecycle tick fanout when real-time exchange frames arrive
+  const broadcastFastPriceTick = () => {
+    if (wss.clients.size === 0 || isBroadcastingTick) return;
+    const hasPriceUpdates = marketFeed.consumePriceDirty();
+    const hasOpenPositions = getOpenPositions().length > 0;
+    if (!hasPriceUpdates && !hasOpenPositions) return;
+
+    isBroadcastingTick = true;
+    try {
+      const { portfolio, positions, latestPnlPoint } = syncPortfolioAndPositions({
+        skipSnapshotWriteIfUnchanged: true,
+      });
+      const payload = JSON.stringify({
+        type: 'PRICE_TICK_UPDATE',
+        tickers: marketFeed.getTickers(),
+        portfolio,
+        positions,
+        pnlPoint: latestPnlPoint,
+        liveFeedActive: marketFeed.isLiveFeedActive(),
+        stateRevision: getStateRevision(),
+        serverUtc: new Date().toISOString(),
+      });
+      for (const client of wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          client.send(payload);
+        }
+      }
+    } finally {
+      isBroadcastingTick = false;
+    }
+  };
+
+  setInterval(broadcastFastPriceTick, 1000);
+
   // Periodic feed refresh every 8s (matches 7s probe floor without hitting rate limits)
   setInterval(async () => {
     await marketFeed.refreshFeed();
@@ -3511,23 +3586,14 @@ async function startServer() {
     }
   }, 10_000);
 
-  // Initial real exchange feed probe + 1h OHLCV warm-up for real RSI & Market Regime
-  await marketFeed.refreshFeed();
-  await marketFeed.warmTopCandles();
-
-  const bootCfg = getAutoExecutionConfig();
-  const bootMode = getTradingMode();
-  if (bootCfg.enabled && (bootMode === 'FULL_AUTO' || bootMode === 'SEMI_AUTO')) {
-    autoExecRuntime.lastSummary = `Auto-Execution (${bootMode}) đang khởi chạy chu kỳ quét thị trường...`;
-    scheduleAutonomousReplenishment(1200);
-  }
-
   if (process.env.NODE_ENV !== 'production') {
+    const disableHmr = process.env.DISABLE_HMR === 'true';
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: {
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR === 'true' ? false : { server },
+        hmr: disableHmr ? false : { server },
+        ws: disableHmr ? false : { server },
       },
       appType: 'spa',
     });
@@ -3544,6 +3610,26 @@ async function startServer() {
   server.listen(port, '0.0.0.0', () => {
     console.log(`OMNISENT AI Command Center listening on http://0.0.0.0:${port}`);
   });
+
+  // Run initial exchange feed probe, real-time Exchange WS streams, and 1h OHLCV warmup immediately
+  // without blocking HTTP port binding so preview & health checks never stall during cold start.
+  void (async () => {
+    try {
+      await marketFeed.refreshFeed();
+      marketFeed.startRealtimeStreams();
+      broadcastTick();
+      await marketFeed.warmTopCandles();
+    } catch {
+      // Periodic 8s refresh and WS reconnect loops continue automatically
+    }
+
+    const bootCfg = getAutoExecutionConfig();
+    const bootMode = getTradingMode();
+    if (bootCfg.enabled && (bootMode === 'FULL_AUTO' || bootMode === 'SEMI_AUTO')) {
+      autoExecRuntime.lastSummary = `Auto-Execution (${bootMode}) đang khởi chạy chu kỳ quét thị trường...`;
+      scheduleAutonomousReplenishment(1200);
+    }
+  })();
 }
 
 const isVercelRuntime = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);

@@ -1,5 +1,11 @@
+import WebSocket from 'ws';
 import { computeAllIndicators, detectMarketRegime } from '../src/engine/indicators.ts';
 import {
+  mergeLiveTickIntoCandles,
+  validateLiveQuoteTick,
+} from '../src/engine/priceFeedGuard.ts';
+import {
+  getSmartPriceDecimals,
   type MarketDirectoryEntry,
   normalizeSymbolInput,
   parseMarketSearchQuery,
@@ -121,6 +127,13 @@ export class MarketFeedManager {
   private orderBookCache = new Map<string, { book: OrderBookSnapshot; fetchedAt: number }>();
   private coinbaseStatsCache = new Map<string, { open: string; high: string; low: string; last: string; volume: string; fetchedAt: number }>();
   private exchangeTelemetry = new Map<string, ExchangeProbeTelemetry>();
+  private wsSockets = new Map<string, WebSocket>();
+  private wsReconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private wsPingTimers = new Map<string, ReturnType<typeof setInterval>>();
+  private wsLastMsgMs = new Map<string, number>();
+  private wsStreamSignatures = new Map<string, string>();
+  private wsStarted = false;
+  private priceDirty = false;
   private lastProbeMs = 0;
   private refreshing = false;
 
@@ -162,6 +175,21 @@ export class MarketFeedManager {
     }));
   }
 
+  private resolveWsStatusForExchange(exchangeId: string, apiOk: boolean): ExchangeProbeTelemetry['wsStatus'] {
+    const now = Date.now();
+    if (exchangeId === 'binance') {
+      const fapiAge = now - (this.wsLastMsgMs.get('binance_fapi') ?? 0);
+      const spotAge = now - (this.wsLastMsgMs.get('binance_spot') ?? 0);
+      if (fapiAge < 15_000 || spotAge < 15_000) return 'CONNECTED';
+      if (this.wsStarted) return 'RECONNECTING';
+    } else if (exchangeId === 'bybit' || exchangeId === 'okx') {
+      const age = now - (this.wsLastMsgMs.get(exchangeId) ?? 0);
+      if (age < 15_000) return 'CONNECTED';
+      if (this.wsStarted) return 'RECONNECTING';
+    }
+    return apiOk ? 'FALLBACK_POLLING' : 'OFFLINE';
+  }
+
   private setExchangeProbe(
     exchangeId: string,
     ok: boolean,
@@ -170,7 +198,7 @@ export class MarketFeedManager {
     this.exchangeTelemetry.set(exchangeId, {
       exchangeId,
       apiStatus: ok ? (latencyMs > 1800 ? 'DEGRADED' : 'OPERATIONAL') : 'UNREACHABLE',
-      wsStatus: ok ? 'FALLBACK_POLLING' : 'OFFLINE',
+      wsStatus: this.resolveWsStatusForExchange(exchangeId, ok),
       apiLatencyMs: latencyMs,
       lastSyncUtc: new Date().toISOString(),
       dataHealth: ok ? (latencyMs > 1800 ? 'DEGRADED' : 'HEALTHY') : 'UNKNOWN',
@@ -178,7 +206,611 @@ export class MarketFeedManager {
   }
 
   public getExchangeTelemetry(): ExchangeProbeTelemetry[] {
-    return Array.from(this.exchangeTelemetry.values());
+    return Array.from(this.exchangeTelemetry.values()).map((t) => {
+      const wsStatus = this.resolveWsStatusForExchange(t.exchangeId, t.apiStatus !== 'UNREACHABLE');
+      return {
+        ...t,
+        wsStatus,
+      };
+    });
+  }
+
+  public consumePriceDirty(): boolean {
+    const dirty = this.priceDirty;
+    this.priceDirty = false;
+    return dirty;
+  }
+
+  private applyLiveQuoteTick(params: {
+    exchangeId: UniversePairConfig['exchangeId'];
+    marketType?: MarketType;
+    nativeSymbol: string;
+    lastPrice?: number;
+    bidPrice?: number;
+    askPrice?: number;
+    high24h?: number;
+    low24h?: number;
+    change24hPct?: number;
+    volume24hUsd?: number;
+    fundingRatePct?: number | null;
+    openInterestUsd?: number | null;
+    sourceLabel: string;
+    eventTimeMs?: number;
+  }): boolean {
+    const now = Date.now();
+    const nativeUpper = params.nativeSymbol.toUpperCase();
+    const matchingCfgs = this.getActiveConfigs().filter(
+      (c) =>
+        c.exchangeId === params.exchangeId &&
+        c.nativeSymbol.toUpperCase() === nativeUpper &&
+        (!params.marketType || c.marketType === params.marketType),
+    );
+    if (matchingCfgs.length === 0) return false;
+
+    let applied = false;
+    for (const cfg of matchingCfgs) {
+      const idx = this.tickers.findIndex(
+        (t) =>
+          t.symbol.toUpperCase() === cfg.symbol.toUpperCase() &&
+          t.marketType === cfg.marketType &&
+          t.exchange.toUpperCase() === cfg.exchange.toUpperCase(),
+      );
+      if (idx < 0) continue;
+      const prev = this.tickers[idx];
+      const bid = params.bidPrice && params.bidPrice > 0 ? params.bidPrice : prev.bidPrice;
+      const ask = params.askPrice && params.askPrice > 0 ? params.askPrice : prev.askPrice;
+      const derivedLast =
+        params.lastPrice && params.lastPrice > 0
+          ? params.lastPrice
+          : bid > 0 && ask >= bid
+            ? Number(((bid + ask) / 2).toFixed(Math.min(10, getSmartPriceDecimals(bid) + 1)))
+            : prev.lastPrice;
+
+      const validation = validateLiveQuoteTick({
+        lastPrice: derivedLast,
+        bidPrice: bid,
+        askPrice: ask,
+        prevPrice: prev.lastPrice,
+        prevTimestampMs: prev.timestampUtc,
+        timestampMs: now,
+      });
+      if (!validation.valid) continue;
+
+      const finalBid = bid > 0 ? bid : derivedLast;
+      const finalAsk = ask >= finalBid ? ask : derivedLast;
+      const spreadBps = validation.spreadBps > 0 ? validation.spreadBps : prev.spreadBps;
+      const nextHigh24 = Math.max(prev.high24h, derivedLast, params.high24h ?? 0);
+      const nextLow24 =
+        prev.low24h > 0
+          ? Math.min(prev.low24h, derivedLast, params.low24h && params.low24h > 0 ? params.low24h : prev.low24h)
+          : params.low24h && params.low24h > 0
+            ? Math.min(params.low24h, derivedLast)
+            : derivedLast;
+      const volPct =
+        derivedLast > 0 && nextHigh24 >= nextLow24
+          ? Number((((nextHigh24 - nextLow24) / derivedLast) * 100).toFixed(2))
+          : prev.volatility24hPct;
+      const nextVol24Usd =
+        params.volume24hUsd && params.volume24hUsd > 0 ? Math.round(params.volume24hUsd) : prev.volume24hUsd;
+      const computedLatency =
+        params.eventTimeMs && params.eventTimeMs > 0
+          ? Math.max(12, Math.min(950, now - params.eventTimeMs))
+          : Math.min(prev.latencyMs > 0 ? prev.latencyMs : 55, 120);
+
+      this.tickers[idx] = {
+        ...prev,
+        lastPrice: derivedLast,
+        bidPrice: finalBid,
+        askPrice: finalAsk,
+        spreadBps,
+        high24h: nextHigh24,
+        low24h: nextLow24,
+        change24hPct:
+          params.change24hPct !== undefined && Number.isFinite(params.change24hPct)
+            ? Number(params.change24hPct.toFixed(2))
+            : prev.change24hPct,
+        volume24hUsd: nextVol24Usd,
+        volatility24hPct: volPct,
+        liquidityScore: computeLiquidityScore(nextVol24Usd, spreadBps) || prev.liquidityScore,
+        fundingRatePct:
+          params.fundingRatePct !== undefined ? params.fundingRatePct : prev.fundingRatePct,
+        openInterestUsd:
+          params.openInterestUsd !== undefined ? params.openInterestUsd : prev.openInterestUsd,
+        dataStatus: 'LIVE_EXCHANGE',
+        sourceLabel: params.sourceLabel,
+        timestampUtc: now,
+        latencyMs: computedLatency,
+        tickSize: normalizePricePrecision(derivedLast),
+      };
+
+      // Stitch live tick onto active cached candles so charts & indicators reflect sub-second ticks
+      const cachePrefix = `${cfg.symbol.toUpperCase()}|${cfg.marketType}|${cfg.exchange.toUpperCase()}|`;
+      for (const [cKey, cached] of this.candleCache.entries()) {
+        if (!cKey.startsWith(cachePrefix) || cached.candles.length === 0) continue;
+        const iv = cKey.slice(cachePrefix.length);
+        cached.candles = mergeLiveTickIntoCandles(cached.candles, derivedLast, now, iv);
+      }
+
+      applied = true;
+      this.priceDirty = true;
+    }
+
+    return applied;
+  }
+
+  public startRealtimeStreams(): void {
+    if (
+      this.wsStarted ||
+      process.env.VERCEL ||
+      process.env.VERCEL_ENV ||
+      process.env.OMNISENT_SKIP_LISTEN
+    ) {
+      return;
+    }
+    this.wsStarted = true;
+    this.syncRealtimeStreamSubscriptions();
+  }
+
+  private syncRealtimeStreamSubscriptions(): void {
+    if (!this.wsStarted) return;
+    this.connectBinanceStream('binance_fapi', 'PERPETUAL');
+    this.connectBinanceStream('binance_spot', 'SPOT');
+    this.connectBybitStream();
+    this.connectOkxStream();
+  }
+
+  private clearStreamTimers(streamKey: string): void {
+    const t = this.wsReconnectTimers.get(streamKey);
+    if (t) {
+      clearTimeout(t);
+      this.wsReconnectTimers.delete(streamKey);
+    }
+    const p = this.wsPingTimers.get(streamKey);
+    if (p) {
+      clearInterval(p);
+      this.wsPingTimers.delete(streamKey);
+    }
+  }
+
+  private scheduleStreamReconnect(streamKey: string, reconnectFn: () => void, delayMs = 3500): void {
+    if (!this.wsStarted) return;
+    this.clearStreamTimers(streamKey);
+    this.wsReconnectTimers.set(
+      streamKey,
+      setTimeout(() => {
+        reconnectFn();
+      }, delayMs),
+    );
+  }
+
+  private connectBinanceStream(streamKey: 'binance_fapi' | 'binance_spot', marketType: MarketType): void {
+    const pairs = Array.from(
+      new Set(
+        this.getActiveConfigs()
+          .filter((c) => c.exchangeId === 'binance' && c.marketType === marketType)
+          .map((c) => c.nativeSymbol.toLowerCase()),
+      ),
+    );
+    if (pairs.length === 0) return;
+
+    const streams: string[] = [];
+    for (const sym of pairs) {
+      streams.push(`${sym}@bookTicker`);
+      if (marketType === 'PERPETUAL') {
+        streams.push(`${sym}@markPrice@1s`);
+      }
+    }
+    const sig = streams.join('/');
+    const existing = this.wsSockets.get(streamKey);
+    if (existing && this.wsStreamSignatures.get(streamKey) === sig && existing.readyState <= WebSocket.OPEN) {
+      return;
+    }
+    if (existing) {
+      try {
+        existing.removeAllListeners();
+        existing.terminate();
+      } catch {
+        // ignore
+      }
+      this.wsSockets.delete(streamKey);
+    }
+    this.clearStreamTimers(streamKey);
+    this.wsStreamSignatures.set(streamKey, sig);
+
+    const host =
+      marketType === 'PERPETUAL'
+        ? 'wss://fstream.binance.com/stream'
+        : 'wss://stream.binance.com:9443/stream';
+    const url = `${host}?streams=${sig}`;
+
+    try {
+      const ws = new WebSocket(url, { handshakeTimeout: 8000 });
+      this.wsSockets.set(streamKey, ws);
+
+      ws.on('message', (raw) => {
+        this.wsLastMsgMs.set(streamKey, Date.now());
+        try {
+          const parsed = JSON.parse(raw.toString()) as {
+            stream?: string;
+            data?: {
+              s?: string;
+              b?: string;
+              a?: string;
+              p?: string;
+              r?: string;
+              E?: number;
+            };
+          };
+          const d = parsed.data;
+          if (!d?.s) return;
+          if (parsed.stream?.endsWith('@bookTicker')) {
+            const bid = Number(d.b);
+            const ask = Number(d.a);
+            if (bid > 0 && ask >= bid) {
+              this.applyLiveQuoteTick({
+                exchangeId: 'binance',
+                marketType,
+                nativeSymbol: d.s,
+                bidPrice: bid,
+                askPrice: ask,
+                sourceLabel: marketType === 'PERPETUAL' ? 'Binance FAPI WS' : 'Binance Spot WS',
+                eventTimeMs: d.E,
+              });
+            }
+          } else if (parsed.stream?.includes('@markPrice') && marketType === 'PERPETUAL') {
+            const mark = Number(d.p);
+            const fr = Number(d.r);
+            this.applyLiveQuoteTick({
+              exchangeId: 'binance',
+              marketType: 'PERPETUAL',
+              nativeSymbol: d.s,
+              lastPrice: mark > 0 ? mark : undefined,
+              fundingRatePct: Number.isFinite(fr) ? Number((fr * 100).toFixed(4)) : undefined,
+              sourceLabel: 'Binance FAPI WS',
+              eventTimeMs: d.E,
+            });
+          }
+        } catch {
+          // ignore malformed frame
+        }
+      });
+
+      ws.on('error', () => {
+        // handled by close
+      });
+
+      ws.on('close', () => {
+        if (this.wsSockets.get(streamKey) === ws) {
+          this.wsSockets.delete(streamKey);
+          this.scheduleStreamReconnect(streamKey, () => this.connectBinanceStream(streamKey, marketType));
+        }
+      });
+    } catch {
+      this.scheduleStreamReconnect(streamKey, () => this.connectBinanceStream(streamKey, marketType), 5000);
+    }
+  }
+
+  private connectBybitStream(): void {
+    const streamKey = 'bybit';
+    const pairs = Array.from(
+      new Set(
+        this.getActiveConfigs()
+          .filter((c) => c.exchangeId === 'bybit')
+          .map((c) => `tickers.${c.nativeSymbol}`),
+      ),
+    );
+    if (pairs.length === 0) return;
+
+    const sig = pairs.join(',');
+    const existing = this.wsSockets.get(streamKey);
+    if (existing && this.wsStreamSignatures.get(streamKey) === sig && existing.readyState <= WebSocket.OPEN) {
+      return;
+    }
+    if (existing) {
+      try {
+        existing.removeAllListeners();
+        existing.terminate();
+      } catch {
+        // ignore
+      }
+      this.wsSockets.delete(streamKey);
+    }
+    this.clearStreamTimers(streamKey);
+    this.wsStreamSignatures.set(streamKey, sig);
+
+    try {
+      const ws = new WebSocket('wss://stream.bybit.com/v5/public/linear', { handshakeTimeout: 8000 });
+      this.wsSockets.set(streamKey, ws);
+
+      ws.on('open', () => {
+        for (let i = 0; i < pairs.length; i += 10) {
+          ws.send(JSON.stringify({ op: 'subscribe', args: pairs.slice(i, i + 10) }));
+        }
+        const ping = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ op: 'ping' }));
+          }
+        }, 20_000);
+        this.wsPingTimers.set(streamKey, ping);
+      });
+
+      ws.on('message', (raw) => {
+        this.wsLastMsgMs.set(streamKey, Date.now());
+        try {
+          const parsed = JSON.parse(raw.toString()) as {
+            topic?: string;
+            ts?: number;
+            data?: {
+              symbol?: string;
+              lastPrice?: string;
+              bid1Price?: string;
+              ask1Price?: string;
+              highPrice24h?: string;
+              lowPrice24h?: string;
+              price24hPcnt?: string;
+              turnover24h?: string;
+              fundingRate?: string;
+              openInterestValue?: string;
+            };
+          };
+          const d = parsed.data;
+          if (!parsed.topic?.startsWith('tickers.') || !d) return;
+          const native = d.symbol || parsed.topic.slice('tickers.'.length);
+          const fr = d.fundingRate !== undefined ? Number(d.fundingRate) : NaN;
+          const oi = d.openInterestValue !== undefined ? Number(d.openInterestValue) : NaN;
+          const pcnt = d.price24hPcnt !== undefined ? Number(d.price24hPcnt) : NaN;
+          this.applyLiveQuoteTick({
+            exchangeId: 'bybit',
+            marketType: 'PERPETUAL',
+            nativeSymbol: native,
+            lastPrice: d.lastPrice ? Number(d.lastPrice) : undefined,
+            bidPrice: d.bid1Price ? Number(d.bid1Price) : undefined,
+            askPrice: d.ask1Price ? Number(d.ask1Price) : undefined,
+            high24h: d.highPrice24h ? Number(d.highPrice24h) : undefined,
+            low24h: d.lowPrice24h ? Number(d.lowPrice24h) : undefined,
+            change24hPct: Number.isFinite(pcnt) ? pcnt * 100 : undefined,
+            volume24hUsd: d.turnover24h ? Number(d.turnover24h) : undefined,
+            fundingRatePct: Number.isFinite(fr) ? Number((fr * 100).toFixed(4)) : undefined,
+            openInterestUsd: Number.isFinite(oi) && oi > 0 ? Math.round(oi) : undefined,
+            sourceLabel: 'Bybit V5 WS',
+            eventTimeMs: parsed.ts,
+          });
+        } catch {
+          // ignore
+        }
+      });
+
+      ws.on('error', () => {
+        // handled on close
+      });
+
+      ws.on('close', () => {
+        this.clearStreamTimers(streamKey);
+        if (this.wsSockets.get(streamKey) === ws) {
+          this.wsSockets.delete(streamKey);
+          this.scheduleStreamReconnect(streamKey, () => this.connectBybitStream());
+        }
+      });
+    } catch {
+      this.scheduleStreamReconnect(streamKey, () => this.connectBybitStream(), 5000);
+    }
+  }
+
+  private connectOkxStream(): void {
+    const streamKey = 'okx';
+    const pairs = Array.from(
+      new Set(
+        this.getActiveConfigs()
+          .filter((c) => c.exchangeId === 'okx')
+          .map((c) => c.nativeSymbol),
+      ),
+    );
+    if (pairs.length === 0) return;
+
+    const sig = pairs.join(',');
+    const existing = this.wsSockets.get(streamKey);
+    if (existing && this.wsStreamSignatures.get(streamKey) === sig && existing.readyState <= WebSocket.OPEN) {
+      return;
+    }
+    if (existing) {
+      try {
+        existing.removeAllListeners();
+        existing.terminate();
+      } catch {
+        // ignore
+      }
+      this.wsSockets.delete(streamKey);
+    }
+    this.clearStreamTimers(streamKey);
+    this.wsStreamSignatures.set(streamKey, sig);
+
+    try {
+      const ws = new WebSocket('wss://ws.okx.com:8443/ws/v5/public', { handshakeTimeout: 8000 });
+      this.wsSockets.set(streamKey, ws);
+
+      ws.on('open', () => {
+        ws.send(
+          JSON.stringify({
+            op: 'subscribe',
+            args: pairs.map((instId) => ({ channel: 'tickers', instId })),
+          }),
+        );
+        const ping = setInterval(() => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send('ping');
+          }
+        }, 22_000);
+        this.wsPingTimers.set(streamKey, ping);
+      });
+
+      ws.on('message', (raw) => {
+        this.wsLastMsgMs.set(streamKey, Date.now());
+        const text = raw.toString();
+        if (text === 'pong') return;
+        try {
+          const parsed = JSON.parse(text) as {
+            arg?: { channel?: string; instId?: string };
+            data?: Array<{
+              instId: string;
+              last: string;
+              bidPx: string;
+              askPx: string;
+              open24h: string;
+              high24h: string;
+              low24h: string;
+              volCcy24h: string;
+              ts?: string;
+            }>;
+          };
+          const d = parsed.data?.[0];
+          if (!d?.instId) return;
+          const isSwap = d.instId.endsWith('-SWAP');
+          const last = Number(d.last);
+          const open24 = Number(d.open24h);
+          const volCcy = Number(d.volCcy24h);
+          this.applyLiveQuoteTick({
+            exchangeId: 'okx',
+            marketType: isSwap ? 'PERPETUAL' : 'SPOT',
+            nativeSymbol: d.instId,
+            lastPrice: last,
+            bidPrice: Number(d.bidPx),
+            askPrice: Number(d.askPx),
+            high24h: Number(d.high24h),
+            low24h: Number(d.low24h),
+            change24hPct: open24 > 0 && last > 0 ? ((last - open24) / open24) * 100 : undefined,
+            volume24hUsd: volCcy > 0 ? (isSwap ? volCcy * last : volCcy) : undefined,
+            sourceLabel: isSwap ? 'OKX V5 Swap WS' : 'OKX V5 Spot WS',
+            eventTimeMs: d.ts ? Number(d.ts) : undefined,
+          });
+        } catch {
+          // ignore
+        }
+      });
+
+      ws.on('error', () => {
+        // handled on close
+      });
+
+      ws.on('close', () => {
+        this.clearStreamTimers(streamKey);
+        if (this.wsSockets.get(streamKey) === ws) {
+          this.wsSockets.delete(streamKey);
+          this.scheduleStreamReconnect(streamKey, () => this.connectOkxStream());
+        }
+      });
+    } catch {
+      this.scheduleStreamReconnect(streamKey, () => this.connectOkxStream(), 5000);
+    }
+  }
+
+  public async refreshPairQuote(
+    symbol: string,
+    marketType?: MarketType,
+    exchange?: string,
+  ): Promise<MarketTicker | undefined> {
+    const cfg = this.findUniverseConfig(symbol, marketType, exchange);
+    if (!cfg) return this.getTicker(symbol, marketType, exchange);
+
+    if (cfg.exchangeId === 'binance') {
+      const url =
+        cfg.marketType === 'PERPETUAL'
+          ? `https://fapi.binance.com/fapi/v1/ticker/bookTicker?symbol=${encodeURIComponent(cfg.nativeSymbol)}`
+          : `https://api.binance.com/api/v3/ticker/bookTicker?symbol=${encodeURIComponent(cfg.nativeSymbol)}`;
+      const res = await fetchJsonWithTimeout<{ bidPrice?: string; askPrice?: string }>(url, 2200);
+      if (res.ok && res.data) {
+        const bid = Number(res.data.bidPrice);
+        const ask = Number(res.data.askPrice);
+        if (bid > 0 && ask >= bid) {
+          this.applyLiveQuoteTick({
+            exchangeId: 'binance',
+            marketType: cfg.marketType,
+            nativeSymbol: cfg.nativeSymbol,
+            bidPrice: bid,
+            askPrice: ask,
+            sourceLabel: cfg.marketType === 'PERPETUAL' ? 'Binance FAPI Fast' : 'Binance Spot Fast',
+            eventTimeMs: Date.now() - Math.min(250, res.latencyMs),
+          });
+        }
+      }
+    } else if (cfg.exchangeId === 'bybit') {
+      const res = await fetchJsonWithTimeout<{
+        retCode: number;
+        result?: { list?: Array<{ lastPrice: string; bid1Price: string; ask1Price: string }> };
+      }>(
+        `https://api.bybit.com/v5/market/tickers?category=linear&symbol=${encodeURIComponent(cfg.nativeSymbol)}`,
+        2200,
+      );
+      const item = res.ok && res.data?.retCode === 0 ? res.data.result?.list?.[0] : undefined;
+      if (item) {
+        this.applyLiveQuoteTick({
+          exchangeId: 'bybit',
+          marketType: 'PERPETUAL',
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(item.lastPrice),
+          bidPrice: Number(item.bid1Price),
+          askPrice: Number(item.ask1Price),
+          sourceLabel: 'Bybit V5 Fast',
+          eventTimeMs: Date.now() - Math.min(250, res.latencyMs),
+        });
+      }
+    } else if (cfg.exchangeId === 'okx') {
+      const res = await fetchJsonWithTimeout<{
+        code: string;
+        data?: Array<{ last: string; bidPx: string; askPx: string }>;
+      }>(
+        `https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(cfg.nativeSymbol)}`,
+        2200,
+      );
+      const item = res.ok && res.data?.code === '0' ? res.data.data?.[0] : undefined;
+      if (item) {
+        this.applyLiveQuoteTick({
+          exchangeId: 'okx',
+          marketType: cfg.marketType,
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(item.last),
+          bidPrice: Number(item.bidPx),
+          askPrice: Number(item.askPx),
+          sourceLabel: cfg.marketType === 'PERPETUAL' ? 'OKX Swap Fast' : 'OKX Spot Fast',
+          eventTimeMs: Date.now() - Math.min(250, res.latencyMs),
+        });
+      }
+    } else if (cfg.exchangeId === 'kraken') {
+      const res = await fetchJsonWithTimeout<{
+        result?: Record<string, { a: [string]; b: [string]; c: [string] }>;
+      }>(`https://api.kraken.com/0/public/Ticker?pair=${encodeURIComponent(cfg.nativeSymbol)}`, 2200);
+      const item = res.ok && res.data?.result ? res.data.result[cfg.nativeSymbol] : undefined;
+      if (item) {
+        this.applyLiveQuoteTick({
+          exchangeId: 'kraken',
+          marketType: 'SPOT',
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(item.c[0]),
+          bidPrice: Number(item.b[0]),
+          askPrice: Number(item.a[0]),
+          sourceLabel: 'Kraken Fast REST',
+          eventTimeMs: Date.now() - Math.min(250, res.latencyMs),
+        });
+      }
+    } else if (cfg.exchangeId === 'coinbase') {
+      const res = await fetchJsonWithTimeout<{ price?: string; bid?: string; ask?: string }>(
+        `https://api.exchange.coinbase.com/products/${encodeURIComponent(cfg.nativeSymbol)}/ticker`,
+        2200,
+      );
+      if (res.ok && res.data?.price) {
+        this.applyLiveQuoteTick({
+          exchangeId: 'coinbase',
+          marketType: 'SPOT',
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(res.data.price),
+          bidPrice: Number(res.data.bid),
+          askPrice: Number(res.data.ask),
+          sourceLabel: 'Coinbase Fast REST',
+          eventTimeMs: Date.now() - Math.min(250, res.latencyMs),
+        });
+      }
+    }
+
+    return this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
   }
 
   private getActiveConfigs(): UniversePairConfig[] {
@@ -927,8 +1559,32 @@ export class MarketFeedManager {
         }
 
         if (fetchedOk && Number.isFinite(lastPrice) && lastPrice > 0) {
-          const spreadBps = ((askPrice - bidPrice) / lastPrice) * 10_000;
-          const volPct = lastPrice > 0 && high24h >= low24h ? ((high24h - low24h) / lastPrice) * 100 : 0;
+          // Preserve a fresher sub-second WebSocket tick if one arrived while slow REST probes were running
+          const hasFresherWs =
+            Boolean(
+              prev &&
+                prev.dataStatus === 'LIVE_EXCHANGE' &&
+                prev.lastPrice > 0 &&
+                prev.sourceLabel.includes('WS') &&
+                Date.now() - prev.timestampUtc < 4000,
+            );
+
+          const effLastPrice = hasFresherWs && prev ? prev.lastPrice : lastPrice;
+          const effBidPrice = hasFresherWs && prev ? prev.bidPrice : bidPrice;
+          const effAskPrice = hasFresherWs && prev ? prev.askPrice : askPrice;
+          const effSourceLabel = hasFresherWs && prev ? prev.sourceLabel : sourceLabel;
+          const effTimestampUtc = hasFresherWs && prev ? prev.timestampUtc : now;
+          const effLatencyMs = hasFresherWs && prev ? prev.latencyMs : latencyMs;
+          const effHigh24 = Math.max(high24h, effLastPrice, prev?.high24h ?? 0);
+          const effLow24 =
+            low24h > 0
+              ? prev && prev.low24h > 0
+                ? Math.min(low24h, effLastPrice, prev.low24h)
+                : Math.min(low24h, effLastPrice)
+              : prev?.low24h ?? effLastPrice;
+
+          const spreadBps = ((effAskPrice - effBidPrice) / effLastPrice) * 10_000;
+          const volPct = effLastPrice > 0 && effHigh24 >= effLow24 ? ((effHigh24 - effLow24) / effLastPrice) * 100 : 0;
           const liq = computeLiquidityScore(volume24hUsd, spreadBps);
 
           // Check cached 1h candles to keep RSI & Market Regime grounded in real OHLCV
@@ -937,9 +1593,10 @@ export class MarketFeedManager {
           let rsi14: number | null = prev?.rsi14 ?? null;
           let regime: MarketRegime = prev?.regime ?? 'SIDEWAYS';
           if (cachedCandles && cachedCandles.candles.length >= 20) {
-            const ind = computeAllIndicators(cachedCandles.candles);
+            const stitched = mergeLiveTickIntoCandles(cachedCandles.candles, effLastPrice, effTimestampUtc, '1h');
+            const ind = computeAllIndicators(stitched);
             rsi14 = Number(ind.rsi14.toFixed(1));
-            regime = detectMarketRegime(ind, lastPrice, volPct);
+            regime = detectMarketRegime(ind, effLastPrice, volPct);
           }
 
           return {
@@ -948,12 +1605,12 @@ export class MarketFeedManager {
             quoteAsset: cfg.quote,
             exchange: cfg.exchange,
             marketType: cfg.marketType,
-            lastPrice,
-            bidPrice,
-            askPrice,
+            lastPrice: effLastPrice,
+            bidPrice: effBidPrice,
+            askPrice: effAskPrice,
             change24hPct: Number(change24hPct.toFixed(2)),
-            high24h,
-            low24h,
+            high24h: effHigh24,
+            low24h: effLow24,
             volume24hUsd: Math.round(volume24hUsd),
             openInterestUsd,
             fundingRatePct,
@@ -963,10 +1620,10 @@ export class MarketFeedManager {
             regime,
             liquidityScore: liq,
             dataStatus: 'LIVE_EXCHANGE',
-            sourceLabel,
-            timestampUtc: now,
-            latencyMs,
-            tickSize: normalizePricePrecision(lastPrice),
+            sourceLabel: effSourceLabel,
+            timestampUtc: effTimestampUtc,
+            latencyMs: effLatencyMs,
+            tickSize: normalizePricePrecision(effLastPrice),
             lotSize: 0.001,
             minOrderUsd: 10,
             maxLeverage: cfg.maxLeverage,
@@ -1391,6 +2048,10 @@ export class MarketFeedManager {
       activated.regime = detectMarketRegime(ind, activated.lastPrice, activated.volatility24hPct);
     }
 
+    if (this.wsStarted) {
+      this.syncRealtimeStreamSubscriptions();
+    }
+
     return activated;
   }
 
@@ -1403,9 +2064,14 @@ export class MarketFeedManager {
     const cfg = this.findUniverseConfig(symbol, marketType, exchange);
     const resolvedExchange = (cfg?.exchange ?? exchange ?? '').toUpperCase();
     const key = `${symbol.toUpperCase()}|${marketType}|${resolvedExchange}|${interval}`;
+    const liveTicker = this.getTicker(symbol, marketType, cfg?.exchange ?? exchange);
     const cached = this.candleCache.get(key);
     if (cached && cached.candles.length > 0 && Date.now() - cached.fetchedAt < 30_000) {
-      return { candles: cached.candles, status: cached.status, source: cached.source };
+      const stitched =
+        liveTicker && liveTicker.dataStatus === 'LIVE_EXCHANGE' && liveTicker.lastPrice > 0
+          ? mergeLiveTickIntoCandles(cached.candles, liveTicker.lastPrice, liveTicker.timestampUtc, interval)
+          : cached.candles;
+      return { candles: stitched, status: cached.status, source: cached.source };
     }
 
     let candles: Candle[] = [];
@@ -1546,8 +2212,12 @@ export class MarketFeedManager {
     }
 
     if (cleanCandles.length >= 20) {
+      const stitchedCandles =
+        liveTicker && liveTicker.dataStatus === 'LIVE_EXCHANGE' && liveTicker.lastPrice > 0
+          ? mergeLiveTickIntoCandles(cleanCandles, liveTicker.lastPrice, liveTicker.timestampUtc, interval)
+          : cleanCandles;
       this.candleCache.set(key, {
-        candles: cleanCandles,
+        candles: stitchedCandles,
         fetchedAt: Date.now(),
         status: 'LIVE_EXCHANGE',
         source: sourceLabel,
@@ -1557,13 +2227,13 @@ export class MarketFeedManager {
       if (interval === '1h' && cfg) {
         const tk = this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
         if (tk && tk.lastPrice > 0) {
-          const ind = computeAllIndicators(cleanCandles);
+          const ind = computeAllIndicators(stitchedCandles);
           tk.rsi14 = Number(ind.rsi14.toFixed(1));
           tk.regime = detectMarketRegime(ind, tk.lastPrice, tk.volatility24hPct);
         }
       }
 
-      return { candles: cleanCandles, status: 'LIVE_EXCHANGE', source: sourceLabel };
+      return { candles: stitchedCandles, status: 'LIVE_EXCHANGE', source: sourceLabel };
     }
 
     if (cached && cached.candles.length > 0) {

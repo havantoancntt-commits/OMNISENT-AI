@@ -6,6 +6,7 @@ import { useI18n } from '../i18n/I18nContext';
 interface CandlestickChartProps {
   candles: Candle[];
   indicators: TechnicalIndicators | null;
+  livePrice?: number;
   entryPrice?: number;
   stopLoss?: number;
   takeProfit?: number;
@@ -16,6 +17,7 @@ interface CandlestickChartProps {
 export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   candles,
   indicators,
+  livePrice,
   entryPrice,
   stopLoss,
   takeProfit,
@@ -48,6 +50,10 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
   if (entryPrice && entryPrice > 0) {
     lows.push(entryPrice);
     highs.push(entryPrice);
+  }
+  if (livePrice && livePrice > 0) {
+    lows.push(livePrice);
+    highs.push(livePrice);
   }
 
   const rawMin = Math.min(...lows);
@@ -280,6 +286,53 @@ export const CandlestickChart: React.FC<CandlestickChartProps> = ({
             </text>
           </g>
         )}
+
+        {/* Real-time Live Mark Price Line & Right-Axis Pill */}
+        {livePrice && livePrice > 0 && (() => {
+          const ly = toY(livePrice);
+          const lastBar = visible[visible.length - 1];
+          const isBull = lastBar ? livePrice >= lastBar.open : true;
+          const accent = isBull ? '#34d399' : '#fb7185';
+          const bgFill = isBull ? '#064e3b' : '#4c0519';
+          const markLabel =
+            livePrice >= 1000
+              ? livePrice.toLocaleString('en-US', { maximumFractionDigits: 2 })
+              : livePrice.toFixed(gridDecimals);
+          return (
+            <g>
+              <line
+                x1={padLeft}
+                y1={ly}
+                x2={width - padRight}
+                y2={ly}
+                stroke={accent}
+                strokeWidth="1"
+                strokeDasharray="2 2"
+                opacity="0.9"
+              />
+              <rect
+                x={width - padRight + 2}
+                y={ly - 8}
+                width={padRight - 4}
+                height="16"
+                rx="3"
+                fill={bgFill}
+                stroke={accent}
+                strokeWidth="0.8"
+              />
+              <text
+                x={width - padRight + 6}
+                y={ly + 3.5}
+                fill="#f8fafc"
+                fontSize="9.5"
+                fontWeight="600"
+                fontFamily="JetBrains Mono, monospace"
+              >
+                {markLabel}
+              </text>
+            </g>
+          );
+        })()}
       </svg>
     </div>
   );

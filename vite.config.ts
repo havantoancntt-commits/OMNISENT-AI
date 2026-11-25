@@ -133,6 +133,18 @@ export default defineConfig(() => {
           }
         },
       },
+      {
+        name: 'disable-hmr-client-ws',
+        apply: 'serve' as const,
+        transform(code: string, id: string) {
+          if (process.env.DISABLE_HMR !== 'true') return;
+          if (!id.replace(/\\/g, '/').endsWith('/vite/dist/client/client.mjs')) return;
+          return code.replace(
+            'const transport = normalizeModuleRunnerTransport((() => {',
+            'const transport = normalizeModuleRunnerTransport({ async connect() {}, async disconnect() {}, send() {} }); const _disabledWsTransport = normalizeModuleRunnerTransport((() => {',
+          );
+        },
+      },
     ],
     resolve: {
       alias: {
@@ -143,6 +155,7 @@ export default defineConfig(() => {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modify—file watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
+      ws: process.env.DISABLE_HMR === 'true' ? (false as const) : undefined,
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
     },

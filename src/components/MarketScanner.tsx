@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
@@ -17,6 +17,11 @@ import {
   type MarketDirectoryEntry,
 } from '../engine/symbolSearch';
 import { isSameTickerSelection } from '../engine/pairSelection';
+import {
+  classifyFeedFreshness,
+  computeCrossVenueBasisBps,
+  mergeLiveTickIntoCandles,
+} from '../engine/priceFeedGuard';
 import type {
   Candle,
   FullMarketOpportunity,
@@ -107,6 +112,45 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
   const [orderFeedback, setOrderFeedback] = useState<{ ok: boolean; text: string } | null>(null);
 
   const active = selectedTicker ?? tickers[0] ?? null;
+  const prevPriceRef = useRef<{ key: string; price: number }>({ key: '', price: 0 });
+  const [tickDir, setTickDir] = useState<'UP' | 'DOWN' | 'FLAT'>('FLAT');
+
+  useEffect(() => {
+    if (!active || !(active.lastPrice > 0)) {
+      setTickDir('FLAT');
+      return;
+    }
+    const pairKey = `${active.symbol}|${active.marketType}|${active.exchange}`;
+    if (prevPriceRef.current.key !== pairKey) {
+      prevPriceRef.current = { key: pairKey, price: active.lastPrice };
+      setTickDir('FLAT');
+      return;
+    }
+    if (active.lastPrice > prevPriceRef.current.price) {
+      setTickDir('UP');
+    } else if (active.lastPrice < prevPriceRef.current.price) {
+      setTickDir('DOWN');
+    }
+    prevPriceRef.current.price = active.lastPrice;
+  }, [active?.symbol, active?.marketType, active?.exchange, active?.lastPrice]);
+
+  const liveCandles = useMemo(() => {
+    if (!active || !(active.lastPrice > 0) || active.dataStatus !== 'LIVE_EXCHANGE') {
+      return candles;
+    }
+    return mergeLiveTickIntoCandles(candles, active.lastPrice, active.timestampUtc, interval);
+  }, [candles, active?.lastPrice, active?.timestampUtc, active?.dataStatus, interval]);
+
+  const activeFreshness = useMemo(
+    () => (active ? classifyFeedFreshness(active.timestampUtc) : { ageMs: Infinity, tier: 'UNAVAILABLE' as const }),
+    [active?.timestampUtc, active?.lastPrice],
+  );
+
+  const activeBasis = useMemo(
+    () => (active ? computeCrossVenueBasisBps(tickers, active) : { medianRefPrice: 0, basisBps: 0, peerCount: 0 }),
+    [tickers, active],
+  );
+
   const matchedSignal =
     active && latestSignal && isSameTickerSelection(active, latestSignal)
       ? latestSignal
@@ -749,26 +793,58 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
             <div className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div>
-                  <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2.5">
                     <h2 className="font-display text-xl font-bold text-slate-50">
                       {active.symbol}
                     </h2>
+                    <span
+                      className={`font-mono text-lg font-bold tabular-nums transition-colors duration-200 ${
+                        tickDir === 'UP'
+                          ? 'text-emerald-400'
+                          : tickDir === 'DOWN'
+                            ? 'text-rose-400'
+                            : 'text-slate-100'
+                      }`}
+                    >
+                      {formatAssetPrice(active.lastPrice)}
+                    </span>
                     <span className="text-xs text-slate-400">
                       {active.exchange} · {active.marketType} ·{' '}
                       <span
-                        className={
-                          active.dataStatus === 'LIVE_EXCHANGE'
+                        className={`font-mono ${
+                          activeFreshness.tier === 'REALTIME' || activeFreshness.tier === 'LIVE'
                             ? 'text-emerald-400'
-                            : 'text-amber-400'
-                        }
+                            : activeFreshness.tier === 'AGING'
+                              ? 'text-amber-400'
+                              : 'text-rose-400'
+                        }`}
                       >
-                        {active.dataStatus === 'LIVE_EXCHANGE' ? 'LIVE' : active.dataStatus}
+                        {t(`feed.tier.${activeFreshness.tier}`)}
                       </span>
                     </span>
                   </div>
                   <p className="mt-0.5 text-xs text-slate-400">
-                    {candleSource || active.sourceLabel} · Spread{' '}
+                    {active.sourceLabel.includes('WS') ? active.sourceLabel : (candleSource || active.sourceLabel)}
+                    {' · '}
+                    <span className="font-mono tabular-nums">
+                      {t('feed.latencyLabel', { ms: active.latencyMs })}
+                    </span>
+                    {' · '}Spread{' '}
                     <span className="font-mono tabular-nums">{active.spreadBps.toFixed(2)} bps</span>
+                    {activeBasis.peerCount > 0 && (
+                      <>
+                        {' · '}
+                        <span
+                          className={`font-mono tabular-nums ${
+                            Math.abs(activeBasis.basisBps) >= 12 ? 'text-amber-300' : 'text-slate-300'
+                          }`}
+                        >
+                          {t('feed.basisLabel', {
+                            bps: `${activeBasis.basisBps >= 0 ? '+' : ''}${activeBasis.basisBps.toFixed(1)}`,
+                          })}
+                        </span>
+                      </>
+                    )}
                     {active.fundingRatePct !== null && (
                       <>
                         {' · '}Funding{' '}
@@ -815,8 +891,9 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
 
               <div className="mt-4">
                 <CandlestickChart
-                  candles={candles}
+                  candles={liveCandles}
                   indicators={indicators}
+                  livePrice={active.lastPrice}
                   entryPrice={chartEntryPrice}
                   stopLoss={chartStopLoss}
                   takeProfit={chartTakeProfit}
