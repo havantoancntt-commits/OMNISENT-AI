@@ -49,6 +49,12 @@ import { CoinSearchModal } from './components/CoinSearchModal';
 import { CommandCenter } from './components/CommandCenter';
 import { ExchangeSecurityHub } from './components/ExchangeSecurityHub';
 import { MarketScanner } from './components/MarketScanner';
+import { usePWA } from './pwa/PWAContext';
+import {
+  PWA_DATA_SNAPSHOT_STORAGE_KEY,
+  parseTelemetrySnapshot,
+  serializeTelemetrySnapshot,
+} from './pwa/pwaHelpers';
 import {
   OfflineIndicator,
   PWAInstallControl,
@@ -132,19 +138,41 @@ export default function App() {
     icon: item.icon,
   }));
 
-  const [tickers, setTickers] = useState<MarketTicker[]>([]);
+  const { registerDataSyncHandler, reportDataSync, broadcastSyncEvent } = usePWA();
+  const [cachedHydration] = useState(() => {
+    if (typeof window === 'undefined') return null;
+    try {
+      return parseTelemetrySnapshot(window.localStorage.getItem(PWA_DATA_SNAPSHOT_STORAGE_KEY));
+    } catch {
+      return null;
+    }
+  });
+
+  const [tickers, setTickers] = useState<MarketTicker[]>(() =>
+    cachedHydration ? (cachedHydration.tickers as MarketTicker[]) : [],
+  );
   const [selectedSymbol, setSelectedSymbol] = useState<string>('BTC/USDT');
   const [selectedMarketType, setSelectedMarketType] = useState<MarketType>('PERPETUAL');
   const [selectedExchange, setSelectedExchange] = useState<string>('Binance');
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot | null>(null);
 
-  const [portfolio, setPortfolio] = useState<PortfolioSummary>(INITIAL_PORTFOLIO);
-  const [positions, setPositions] = useState<Position[]>([]);
+  const [portfolio, setPortfolio] = useState<PortfolioSummary>(() =>
+    cachedHydration
+      ? (cachedHydration.portfolio as unknown as PortfolioSummary)
+      : INITIAL_PORTFOLIO,
+  );
+  const [positions, setPositions] = useState<Position[]>(() =>
+    cachedHydration ? (cachedHydration.positions as Position[]) : [],
+  );
   const [pnlHistory, setPnlHistory] = useState<PnlHistoryPoint[]>([]);
   const [orders, setOrders] = useState<OrderRecord[]>([]);
   const [riskConfig, setRiskConfig] = useState<RiskConfig>(DEFAULT_RISK_CONFIG);
   const [correlationGuard, setCorrelationGuard] = useState<PortfolioCorrelationGuard | null>(null);
-  const [tradingMode, setTradingMode] = useState<TradingMode>('FULL_AUTO');
+  const [tradingMode, setTradingMode] = useState<TradingMode>(() =>
+    cachedHydration?.tradingMode
+      ? (cachedHydration.tradingMode as TradingMode)
+      : 'FULL_AUTO',
+  );
 
   const [agents, setAgents] = useState<AgentState[]>([]);
   const [agentLogs, setAgentLogs] = useState<AgentLogEntry[]>([]);
@@ -153,7 +181,7 @@ export default function App() {
   const [auditLogs, setAuditLogs] = useState<AuditLogEntry[]>([]);
 
   const [liveFeedActive, setLiveFeedActive] = useState(false);
-  const [serverUtc, setServerUtc] = useState('');
+  const [serverUtc, setServerUtc] = useState(() => cachedHydration?.serverUtc ?? '');
   const [pipelineLoading, setPipelineLoading] = useState(false);
   const [smartRunMode, setSmartRunMode] = useState<SmartRunMode>('ANALYZE_SINGLE');
   const [includeGeminiOnRun, setIncludeGeminiOnRun] = useState(false);
@@ -167,32 +195,82 @@ export default function App() {
   );
   const [actionError, setActionError] = useState<string | null>(null);
   const wsSyncTimerRef = useRef<number | null>(null);
+  const lastSnapshotPersistMsRef = useRef<number>(0);
+  const lastKnownRevisionRef = useRef<number | null>(null);
+
+  const persistTelemetrySnapshotThrottled = useCallback(
+    (meta: {
+      stateRevision?: number | null;
+      tradingMode: string;
+      serverUtc: string;
+      tickers: MarketTicker[];
+      portfolio: PortfolioSummary;
+      positions: Position[];
+    }) => {
+      if (typeof window === 'undefined' || meta.tickers.length === 0) return;
+      const now = Date.now();
+      if (now - lastSnapshotPersistMsRef.current < 2500) return;
+      lastSnapshotPersistMsRef.current = now;
+      try {
+        window.localStorage.setItem(
+          PWA_DATA_SNAPSHOT_STORAGE_KEY,
+          serializeTelemetrySnapshot({
+            nowMs: now,
+            stateRevision: meta.stateRevision ?? null,
+            tradingMode: meta.tradingMode,
+            serverUtc: meta.serverUtc,
+            tickers: meta.tickers,
+            portfolio: meta.portfolio as unknown as Record<string, unknown>,
+            positions: meta.positions,
+          }),
+        );
+      } catch {
+        // ignore storage quota errors
+      }
+    },
+    [],
+  );
 
   const fetchAllState = useCallback(async () => {
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     try {
+      const noStoreInit: RequestInit = { cache: 'no-store' };
       const [mktRes, portRes, agRes, sigRes, exRes, audRes, autoRes] = await Promise.all([
-        fetch('/api/market/tickers'),
-        fetch('/api/portfolio'),
-        fetch('/api/agents'),
-        fetch('/api/signals'),
-        fetch('/api/exchanges'),
-        fetch('/api/audit-logs'),
-        fetch('/api/auto-trade/status'),
+        fetch('/api/market/tickers', noStoreInit),
+        fetch('/api/portfolio', noStoreInit),
+        fetch('/api/agents', noStoreInit),
+        fetch('/api/signals', noStoreInit),
+        fetch('/api/exchanges', noStoreInit),
+        fetch('/api/audit-logs', noStoreInit),
+        fetch('/api/auto-trade/status', noStoreInit),
       ]);
+
+      let latestTickers: MarketTicker[] | null = null;
+      let latestPortfolio: PortfolioSummary | null = null;
+      let latestPositions: Position[] | null = null;
+      let latestMode: TradingMode | null = null;
+      let latestUtc = '';
 
       if (mktRes.ok) {
         const mkt = await mktRes.json();
-        setTickers(mkt.tickers ?? []);
+        const nextTickers: MarketTicker[] = Array.isArray(mkt.tickers) ? mkt.tickers : [];
+        latestTickers = nextTickers;
+        latestUtc = mkt.serverUtc ?? '';
+        setTickers(nextTickers);
         setLiveFeedActive(Boolean(mkt.liveFeedActive));
-        setServerUtc(mkt.serverUtc ?? '');
+        setServerUtc(latestUtc);
       }
       if (portRes.ok) {
         const pt = await portRes.json();
         if (pt.portfolio) {
+          latestPortfolio = pt.portfolio;
+          latestMode = pt.portfolio.mode;
           setPortfolio(pt.portfolio);
           setTradingMode(pt.portfolio.mode);
         }
-        setPositions(pt.positions ?? []);
+        const nextPositions: Position[] = Array.isArray(pt.positions) ? pt.positions : [];
+        latestPositions = nextPositions;
+        setPositions(nextPositions);
         if (Array.isArray(pt.pnlHistory)) setPnlHistory(pt.pnlHistory);
         setOrders(pt.orders ?? []);
         if (pt.riskConfig) setRiskConfig(pt.riskConfig);
@@ -219,14 +297,103 @@ export default function App() {
         const autoData = (await autoRes.json()) as AutoExecutionEngineStatus;
         setAutoExecutionStatus(autoData);
       }
-    } catch {
-      // Non-fatal retry on next tick
-    }
-  }, []);
 
-  // Bootstrap initial state & WebSocket telemetry stream (with clean HTTP fallback on serverless hosts)
+      const latencyMs = Math.max(
+        1,
+        Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0),
+      );
+      if (mktRes.ok || portRes.ok) {
+        reportDataSync({
+          transport: 'HTTP_FAST',
+          syncedAtMs: Date.now(),
+          latencyMs,
+        });
+      }
+      if (latestTickers && latestPortfolio && latestPositions && latestMode) {
+        persistTelemetrySnapshotThrottled({
+          stateRevision: lastKnownRevisionRef.current,
+          tradingMode: latestMode,
+          serverUtc: latestUtc,
+          tickers: latestTickers,
+          portfolio: latestPortfolio,
+          positions: latestPositions,
+        });
+      }
+    } catch {
+      reportDataSync({
+        transport: navigator.onLine ? 'SYNCING' : 'OFFLINE_CACHED',
+      });
+    }
+  }, [persistTelemetrySnapshotThrottled, reportDataSync]);
+
+  const fetchFastBootstrap = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
+      reportDataSync({ transport: 'OFFLINE_CACHED' });
+      return;
+    }
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    try {
+      const res = await fetch('/api/sync/bootstrap', { cache: 'no-store' });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (Array.isArray(data.tickers)) setTickers(data.tickers);
+      if (typeof data.liveFeedActive === 'boolean') setLiveFeedActive(data.liveFeedActive);
+      if (data.serverUtc) setServerUtc(data.serverUtc);
+      if (data.portfolio) setPortfolio(data.portfolio);
+      if (Array.isArray(data.positions)) setPositions(data.positions);
+      if (data.tradingMode) setTradingMode(data.tradingMode);
+      if (data.autoExecutionStatus) {
+        setAutoExecutionStatus(data.autoExecutionStatus as AutoExecutionEngineStatus);
+      }
+
+      const latencyMs = Math.max(
+        1,
+        Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0),
+      );
+      reportDataSync({
+        transport: 'HTTP_FAST',
+        syncedAtMs: Date.now(),
+        latencyMs,
+      });
+
+      const nextRevision =
+        typeof data.stateRevision === 'number' ? data.stateRevision : lastKnownRevisionRef.current;
+      if (
+        nextRevision !== null &&
+        lastKnownRevisionRef.current !== null &&
+        nextRevision !== lastKnownRevisionRef.current
+      ) {
+        lastKnownRevisionRef.current = nextRevision;
+        void fetchAllState();
+      } else if (lastKnownRevisionRef.current === null && nextRevision !== null) {
+        lastKnownRevisionRef.current = nextRevision;
+      }
+
+      if (Array.isArray(data.tickers) && data.portfolio && Array.isArray(data.positions)) {
+        persistTelemetrySnapshotThrottled({
+          stateRevision: nextRevision,
+          tradingMode: String(data.tradingMode ?? data.portfolio.mode ?? 'FULL_AUTO'),
+          serverUtc: String(data.serverUtc ?? ''),
+          tickers: data.tickers as MarketTicker[],
+          portfolio: data.portfolio as PortfolioSummary,
+          positions: data.positions as Position[],
+        });
+      }
+    } catch {
+      reportDataSync({
+        transport: navigator.onLine ? 'SYNCING' : 'OFFLINE_CACHED',
+      });
+    }
+  }, [fetchAllState, persistTelemetrySnapshotThrottled, reportDataSync]);
+
+  // Register unified PWA Sync Now handler
   useEffect(() => {
-    fetchAllState();
+    return registerDataSyncHandler(fetchAllState);
+  }, [registerDataSyncHandler, fetchAllState]);
+
+  // Bootstrap initial state, WebSocket telemetry stream, fast HTTP fallback & PWA lifecycle resume sync
+  useEffect(() => {
+    void fetchAllState();
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${proto}//${window.location.host}/ws`;
@@ -253,30 +420,28 @@ export default function App() {
       }, 220);
     };
 
+    // Adaptive fallback polling when WS unavailable (paused when PWA is backgrounded to preserve battery)
+    const fastBootstrapTimer = window.setInterval(() => {
+      if (!wsConnected && !closedByEffect && document.visibilityState === 'visible') {
+        void fetchFastBootstrap();
+      }
+    }, 2000);
+
     const pollTimer = window.setInterval(() => {
-      if (!wsConnected && !closedByEffect) {
+      if (!wsConnected && !closedByEffect && document.visibilityState === 'visible') {
         void fetchAllState();
       }
-    }, 10_000);
-
-    const fastTickerTimer = window.setInterval(async () => {
-      if (!wsConnected && !closedByEffect) {
-        try {
-          const res = await fetch('/api/market/tickers');
-          if (res.ok) {
-            const mkt = await res.json();
-            if (Array.isArray(mkt.tickers)) setTickers(mkt.tickers);
-            if (typeof mkt.liveFeedActive === 'boolean') setLiveFeedActive(mkt.liveFeedActive);
-            if (mkt.serverUtc) setServerUtc(mkt.serverUtc);
-          }
-        } catch {
-          // non-fatal
-        }
-      }
-    }, 3000);
+    }, 15_000);
 
     const connect = () => {
       if (closedByEffect) return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        reportDataSync({ transport: 'OFFLINE_CACHED' });
+        return;
+      }
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
       try {
         ws = new WebSocket(wsUrl);
         ws.onerror = () => {
@@ -286,6 +451,7 @@ export default function App() {
           wsConnected = true;
           everOpened = true;
           failedHandshakes = 0;
+          reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
         };
         ws.onmessage = (ev) => {
           try {
@@ -299,10 +465,26 @@ export default function App() {
               }
               if (typeof msg.liveFeedActive === 'boolean') setLiveFeedActive(msg.liveFeedActive);
               if (msg.serverUtc) setServerUtc(msg.serverUtc);
+              reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
+
+              if (Array.isArray(msg.tickers) && msg.portfolio && Array.isArray(msg.positions)) {
+                persistTelemetrySnapshotThrottled({
+                  stateRevision:
+                    typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision,
+                  tradingMode: msg.portfolio.mode ?? 'FULL_AUTO',
+                  serverUtc: msg.serverUtc ?? '',
+                  tickers: msg.tickers as MarketTicker[],
+                  portfolio: msg.portfolio as PortfolioSummary,
+                  positions: msg.positions as Position[],
+                });
+              }
 
               const nextPosCount = Array.isArray(msg.positions) ? msg.positions.length : prevPosCount;
               const nextRevision =
                 typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision;
+              if (typeof nextRevision === 'number') {
+                lastKnownRevisionRef.current = nextRevision;
+              }
               const pnlPt = msg.pnlPoint as PnlHistoryPoint | null | undefined;
               const eventTag = pnlPt?.eventTag;
               const eventTs = pnlPt?.timestampMs ?? 0;
@@ -335,6 +517,7 @@ export default function App() {
                 setAutoExecutionStatus(msg.autoExecutionStatus as AutoExecutionEngineStatus);
               }
               if (msg.serverUtc) setServerUtc(msg.serverUtc);
+              reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
 
               const nextPosCount = Array.isArray(msg.positions) ? msg.positions.length : prevPosCount;
               const nextAutoCount =
@@ -351,6 +534,9 @@ export default function App() {
 
               const nextRevision =
                 typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision;
+              if (typeof nextRevision === 'number') {
+                lastKnownRevisionRef.current = nextRevision;
+              }
 
               if (!initializedFromWs) {
                 initializedFromWs = true;
@@ -383,9 +569,9 @@ export default function App() {
           if (!everOpened) {
             failedHandshakes += 1;
           }
-          // Stop spamming WS reconnects if host doesn't support WS upgrades (e.g. serverless); HTTP pollTimer continues smoothly
+          // Stop spamming WS reconnects if host doesn't support WS upgrades (e.g. serverless); fastBootstrapTimer continues smoothly
           if (!closedByEffect && (everOpened || failedHandshakes < 2)) {
-            reconnectTimer = window.setTimeout(connect, 4000);
+            reconnectTimer = window.setTimeout(connect, 3500);
           }
         };
       } catch {
@@ -394,10 +580,52 @@ export default function App() {
     };
     connect();
 
+    // Immediate PWA Resume / Network Recovery Synchronization
+    let lastResumeSyncMs = 0;
+    const handleResumeSync = () => {
+      if (closedByEffect) return;
+      if (document.visibilityState === 'hidden') return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        reportDataSync({ transport: 'OFFLINE_CACHED' });
+        return;
+      }
+      const now = Date.now();
+      if (now - lastResumeSyncMs < 1500) return;
+      lastResumeSyncMs = now;
+      void fetchFastBootstrap();
+      if (!wsConnected && (everOpened || failedHandshakes < 2)) {
+        connect();
+      }
+    };
+
+    const handleOnlineRecovery = () => {
+      failedHandshakes = 0;
+      void fetchAllState();
+      if (!wsConnected) {
+        connect();
+      }
+    };
+
+    const handleOffline = () => {
+      wsConnected = false;
+      reportDataSync({ transport: 'OFFLINE_CACHED' });
+    };
+
+    document.addEventListener('visibilitychange', handleResumeSync);
+    window.addEventListener('focus', handleResumeSync);
+    window.addEventListener('pageshow', handleResumeSync);
+    window.addEventListener('online', handleOnlineRecovery);
+    window.addEventListener('offline', handleOffline);
+
     return () => {
       closedByEffect = true;
       window.clearInterval(pollTimer);
-      window.clearInterval(fastTickerTimer);
+      window.clearInterval(fastBootstrapTimer);
+      document.removeEventListener('visibilitychange', handleResumeSync);
+      window.removeEventListener('focus', handleResumeSync);
+      window.removeEventListener('pageshow', handleResumeSync);
+      window.removeEventListener('online', handleOnlineRecovery);
+      window.removeEventListener('offline', handleOffline);
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
@@ -422,7 +650,7 @@ export default function App() {
         }
       }
     };
-  }, [fetchAllState]);
+  }, [fetchAllState, fetchFastBootstrap, persistTelemetrySnapshotThrottled, reportDataSync]);
 
   // Fetch Order Book for exact selected (symbol, marketType, exchange)
   useEffect(() => {
@@ -560,6 +788,7 @@ export default function App() {
           });
         }
         await fetchAllState();
+        broadcastSyncEvent('DATA_MUTATED');
       } else {
         setActionError(data.error || t('app.error.actionFailed'));
       }
@@ -590,6 +819,7 @@ export default function App() {
         setLastRunSummary(null);
         setSmartOpportunities([]);
         await fetchAllState();
+        broadcastSyncEvent('DATA_MUTATED');
       } else {
         setActionError(data.error || t('app.error.actionFailed'));
       }
@@ -615,6 +845,7 @@ export default function App() {
         return;
       }
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
     } catch {
       setActionError(t('app.error.actionFailed'));
     }
@@ -631,6 +862,7 @@ export default function App() {
         return { ok: false, error: errMsg };
       }
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return {
         ok: true,
         closedNetPnlUsd: data.closedNetPnlUsd,
@@ -659,6 +891,7 @@ export default function App() {
         return { ok: false, error: data.error || t('app.error.updateSlTpFailed') };
       }
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
     } catch {
       return { ok: false, error: t('app.error.updateSlTpNetwork') };
@@ -682,6 +915,7 @@ export default function App() {
         setAutoExecutionStatus(data.autoExecutionStatus as AutoExecutionEngineStatus);
       }
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return true;
     } catch {
       setActionError(t('app.error.actionFailed'));
@@ -703,6 +937,7 @@ export default function App() {
         return;
       }
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
     } catch {
       setActionError(t('app.error.actionFailed'));
     }
@@ -719,6 +954,7 @@ export default function App() {
       }
       setEmergencyConfirmOpen(false);
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
     } catch {
       setActionError(t('app.error.actionFailed'));
     }
@@ -739,6 +975,7 @@ export default function App() {
       }
       setAutoExecutionStatus(data as AutoExecutionEngineStatus);
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
     } catch {
       return { ok: false, error: t('auto.err.updateFailed') };
@@ -754,6 +991,7 @@ export default function App() {
       }
       if (data.status) setAutoExecutionStatus(data.status as AutoExecutionEngineStatus);
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
     } catch {
       return { ok: false, error: t('auto.err.actionFailed') };
@@ -773,6 +1011,7 @@ export default function App() {
       }
       if (data.status) setAutoExecutionStatus(data.status as AutoExecutionEngineStatus);
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
     } catch {
       return { ok: false, error: t('auto.err.actionFailed') };
@@ -792,6 +1031,7 @@ export default function App() {
       }
       if (data.status) setAutoExecutionStatus(data.status as AutoExecutionEngineStatus);
       await fetchAllState();
+      broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
     } catch {
       return { ok: false, error: t('auto.err.actionFailed') };

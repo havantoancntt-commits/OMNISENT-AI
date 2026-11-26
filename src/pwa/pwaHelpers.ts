@@ -209,3 +209,99 @@ export function validateManifestPayload(raw: unknown): PWAManifestAudit {
     issues,
   };
 }
+
+export type PWADataSyncTransport = 'WS_LIVE' | 'HTTP_FAST' | 'OFFLINE_CACHED' | 'SYNCING';
+
+export const PWA_DATA_SNAPSHOT_STORAGE_KEY = 'omnisent_pwa_snapshot_v1';
+export const PWA_DATA_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface PWATelemetrySnapshotPayload {
+  v: 1;
+  savedAtMs: number;
+  stateRevision: number | null;
+  tradingMode: string;
+  serverUtc: string;
+  tickers: unknown[];
+  portfolio: Record<string, unknown>;
+  positions: unknown[];
+}
+
+export function shouldRunCooldownSync(
+  lastSyncMs: number,
+  nowMs: number,
+  cooldownMs: number,
+): boolean {
+  if (!Number.isFinite(lastSyncMs) || lastSyncMs <= 0) return true;
+  if (!Number.isFinite(nowMs) || !Number.isFinite(cooldownMs) || cooldownMs <= 0) return true;
+  return nowMs - lastSyncMs >= cooldownMs;
+}
+
+export function shouldAutoReloadOnSwControlChange(
+  hadControllerBefore: boolean,
+  alreadyReloadedInSession = false,
+): boolean {
+  return Boolean(hadControllerBefore && !alreadyReloadedInSession);
+}
+
+export function serializeTelemetrySnapshot(input: {
+  nowMs?: number;
+  stateRevision?: number | null;
+  tradingMode: string;
+  serverUtc: string;
+  tickers: unknown[];
+  portfolio: Record<string, unknown>;
+  positions: unknown[];
+}): string {
+  const payload: PWATelemetrySnapshotPayload = {
+    v: 1,
+    savedAtMs: input.nowMs ?? Date.now(),
+    stateRevision: typeof input.stateRevision === 'number' ? input.stateRevision : null,
+    tradingMode: input.tradingMode,
+    serverUtc: input.serverUtc,
+    tickers: Array.isArray(input.tickers) ? input.tickers.slice(0, 60) : [],
+    portfolio: input.portfolio,
+    positions: Array.isArray(input.positions) ? input.positions.slice(0, 50) : [],
+  };
+  return JSON.stringify(payload);
+}
+
+export function parseTelemetrySnapshot(
+  raw: string | null | undefined,
+  nowMs = Date.now(),
+  maxAgeMs = PWA_DATA_SNAPSHOT_MAX_AGE_MS,
+): PWATelemetrySnapshotPayload | null {
+  if (!raw || typeof raw !== 'string') return null;
+  try {
+    const parsed = JSON.parse(raw) as Partial<PWATelemetrySnapshotPayload>;
+    if (
+      !parsed ||
+      typeof parsed !== 'object' ||
+      parsed.v !== 1 ||
+      typeof parsed.savedAtMs !== 'number' ||
+      !Number.isFinite(parsed.savedAtMs) ||
+      typeof parsed.tradingMode !== 'string' ||
+      !Array.isArray(parsed.tickers) ||
+      !parsed.portfolio ||
+      typeof parsed.portfolio !== 'object' ||
+      !Array.isArray(parsed.positions)
+    ) {
+      return null;
+    }
+    if (nowMs - parsed.savedAtMs > maxAgeMs || parsed.savedAtMs > nowMs + 60_000) {
+      return null;
+    }
+    return {
+      v: 1,
+      savedAtMs: parsed.savedAtMs,
+      stateRevision: typeof parsed.stateRevision === 'number' ? parsed.stateRevision : null,
+      tradingMode: parsed.tradingMode,
+      serverUtc: typeof parsed.serverUtc === 'string' ? parsed.serverUtc : '',
+      tickers: parsed.tickers,
+      portfolio: parsed.portfolio as Record<string, unknown>,
+      positions: parsed.positions,
+    };
+  } catch {
+    return null;
+  }
+}
+

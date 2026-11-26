@@ -288,7 +288,10 @@ async function ensureServerWarm(): Promise<void> {
   await coldWarmupPromise;
 }
 
-app.use('/api', async (_req, _res, next) => {
+app.use('/api', async (_req, res, next) => {
+  res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
   await ensureServerWarm();
   next();
 });
@@ -517,6 +520,25 @@ app.get('/api/health', (_req, res) => {
     adminAuthEnabled: Boolean(process.env.OMNISENT_ADMIN_TOKEN?.trim()),
     database: getDatabaseDiagnostics(),
     timestampUtc: new Date().toISOString(),
+  });
+});
+
+app.get('/api/sync/bootstrap', (_req, res) => {
+  const tickers = marketFeed.getTickers();
+  const { portfolio, positions } = syncPortfolioAndPositions({
+    skipSnapshotWriteIfUnchanged: true,
+  });
+  res.json({
+    stateRevision: getStateRevision(),
+    tradingMode: getTradingMode(),
+    liveFeedActive: marketFeed.isLiveFeedActive(),
+    feedHealth: computeFeedHealthMetrics(tickers),
+    tickers,
+    totalDirectoryCount: marketFeed.getDirectoryCount(),
+    portfolio,
+    positions,
+    autoExecutionStatus: buildAutoExecutionStatus(),
+    serverUtc: new Date().toISOString(),
   });
 });
 
@@ -2234,7 +2256,11 @@ app.post('/api/run/smart', async (req, res) => {
   const agents = getAgents();
   const { portfolio, positions } = syncPortfolioAndPositions();
 
-  const allTickers = marketFeed.getTickers();
+  let allTickers = marketFeed.getTickers();
+  if (allTickers.every((t) => t.lastPrice <= 0)) {
+    await marketFeed.refreshFeed().catch(() => {});
+    allTickers = marketFeed.getTickers();
+  }
   let effectiveMode = currentMode;
   if (runMode === 'ANALYZE_AND_PAPER_EXECUTE' && currentMode === 'ANALYSIS_ONLY') {
     setTradingMode('PAPER');
@@ -2305,24 +2331,51 @@ app.post('/api/run/smart', async (req, res) => {
     }
   } else {
     const requestedExchange = req.body?.exchange ? String(req.body.exchange) : undefined;
-    const matched =
-      (requestedSymbol
-        ? (marketFeed.getTicker(requestedSymbol, requestedMarket, requestedExchange) ??
-          (await marketFeed.activatePair(requestedSymbol, requestedMarket, requestedExchange)))
-        : undefined) ?? allTickers[0];
-    if (!matched) {
+    const liveTickers = allTickers.filter((t) => t.lastPrice > 0 && t.dataStatus === 'LIVE_EXCHANGE');
+    const primaryMatch = requestedSymbol
+      ? (marketFeed.getTicker(requestedSymbol, requestedMarket, requestedExchange) ??
+        (await marketFeed.activatePair(requestedSymbol, requestedMarket, requestedExchange)))
+      : undefined;
+
+    const candidateList: MarketTicker[] = [];
+    const seenKeys = new Set<string>();
+    const pushCandidate = (t?: MarketTicker | null) => {
+      if (!t || t.lastPrice <= 0) return;
+      const k = `${t.symbol}|${t.marketType}|${t.exchange}`;
+      if (seenKeys.has(k)) return;
+      seenKeys.add(k);
+      candidateList.push(t);
+    };
+
+    pushCandidate(primaryMatch);
+    if (requestedSymbol) {
+      for (const alt of liveTickers.filter(
+        (t) => t.symbol.toUpperCase() === requestedSymbol.toUpperCase(),
+      )) {
+        pushCandidate(alt);
+      }
+    }
+    for (const live of [...liveTickers].sort((a, b) => b.volume24hUsd - a.volume24hUsd).slice(0, 6)) {
+      pushCandidate(live);
+    }
+
+    if (candidateList.length === 0 && !primaryMatch && allTickers.length === 0) {
       res.status(404).json({ error: 'Không tìm thấy thị trường khả dụng để chạy.' });
       return;
     }
 
-    const [{ candles }, htfRes, orderBook] = await Promise.all([
-      marketFeed.getCandles(matched.symbol, matched.marketType, '1h', matched.exchange),
-      marketFeed.getCandles(matched.symbol, matched.marketType, '4h', matched.exchange).catch(() => ({ candles: [] })),
-      marketFeed.getOrderBook(matched.symbol, matched.marketType, matched.exchange),
-    ]);
-    if (candles.length > 0) {
+    for (const candidate of candidateList) {
+      const [{ candles }, htfRes, orderBook] = await Promise.all([
+        marketFeed.getCandles(candidate.symbol, candidate.marketType, '1h', candidate.exchange),
+        marketFeed
+          .getCandles(candidate.symbol, candidate.marketType, '4h', candidate.exchange)
+          .catch(() => ({ candles: [] })),
+        marketFeed.getOrderBook(candidate.symbol, candidate.marketType, candidate.exchange),
+      ]);
+      if (candles.length === 0) continue;
+
       const sig = runMultiAgentDecisionPipeline({
-        ticker: matched,
+        ticker: candidate,
         candles,
         htfCandles: htfRes.candles,
         orderBook,
@@ -2339,23 +2392,22 @@ app.post('/api/run/smart', async (req, res) => {
         },
         agents,
       });
+      const score = Number((sig.confidenceScore * 2 + (sig.expectedValueR ?? 0) * 40).toFixed(1));
       evaluated = [
         {
-          ticker: matched,
+          ticker: candidate,
           signal: sig,
-          opportunityScore: Number(
-            (sig.confidenceScore * 2 + (sig.expectedValueR ?? 0) * 40).toFixed(1),
-          ),
+          opportunityScore: score,
         },
       ];
       opportunities = [
         {
           rank: 1,
-          symbol: matched.symbol,
-          exchange: matched.exchange,
-          marketType: matched.marketType,
-          lastPrice: matched.lastPrice,
-          change24hPct: matched.change24hPct,
+          symbol: candidate.symbol,
+          exchange: candidate.exchange,
+          marketType: candidate.marketType,
+          lastPrice: candidate.lastPrice,
+          change24hPct: candidate.change24hPct,
           direction: sig.direction,
           state: sig.state,
           confidenceScore: sig.confidenceScore,
@@ -2363,10 +2415,11 @@ app.post('/api/run/smart', async (req, res) => {
           htfAlignment: sig.htfAlignment ?? 'NEUTRAL',
           riskReward: sig.riskReward,
           expectedValueR: sig.expectedValueR ?? 0,
-          opportunityScore: evaluated[0].opportunityScore,
+          opportunityScore: score,
           reasoningSummary: sig.reasoningSummary,
         },
       ];
+      break;
     }
   }
 

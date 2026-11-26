@@ -46,6 +46,10 @@ import {
   detectPWAPlatform,
   getRecommendedGuideTab,
   isRunningStandalone,
+  parseTelemetrySnapshot,
+  serializeTelemetrySnapshot,
+  shouldAutoReloadOnSwControlChange,
+  shouldRunCooldownSync,
   shouldShowMobileInstallBanner,
   validateManifestPayload,
 } from '../pwa/pwaHelpers.ts';
@@ -3640,6 +3644,43 @@ test('riskEngine deterministically rejects stale market data older than 30s when
   assert.equal(staleRes.approved, false);
   assert.ok(staleRes.reasons.some((r) => r.includes('30s')));
 });
+
+test('PWA telemetry snapshot helpers validate expiry, corruption, cooldown gating, and single SW controller reload', () => {
+  const nowMs = Date.UTC(2026, 10, 26, 8, 30, 0);
+
+  const raw = serializeTelemetrySnapshot({
+    nowMs,
+    stateRevision: 42,
+    tradingMode: 'FULL_AUTO',
+    serverUtc: '2026-11-26T08:30:00.000Z',
+    tickers: [makeValidTicker()],
+    portfolio: { totalEquityUsd: 100_250, realizedPnlUsd: 250 },
+    positions: [],
+  });
+
+  const parsed = parseTelemetrySnapshot(raw, nowMs + 5_000, 60_000);
+  assert.ok(parsed);
+  assert.equal(parsed.stateRevision, 42);
+  assert.equal(parsed.tradingMode, 'FULL_AUTO');
+  assert.equal(parsed.tickers.length, 1);
+
+  // Expired snapshot returns null
+  assert.equal(parseTelemetrySnapshot(raw, nowMs + 120_000, 60_000), null);
+  // Corrupted / invalid JSON returns null
+  assert.equal(parseTelemetrySnapshot('{bad json', nowMs, 60_000), null);
+  assert.equal(parseTelemetrySnapshot(JSON.stringify({ v: 2 }), nowMs, 60_000), null);
+
+  // Cooldown gating
+  assert.equal(shouldRunCooldownSync(0, nowMs, 20_000), true);
+  assert.equal(shouldRunCooldownSync(nowMs - 5_000, nowMs, 20_000), false);
+  assert.equal(shouldRunCooldownSync(nowMs - 20_000, nowMs, 20_000), true);
+
+  // Single-reload SW guard
+  assert.equal(shouldAutoReloadOnSwControlChange(false, false), false);
+  assert.equal(shouldAutoReloadOnSwControlChange(true, false), true);
+  assert.equal(shouldAutoReloadOnSwControlChange(true, true), false);
+});
+
 
 
 

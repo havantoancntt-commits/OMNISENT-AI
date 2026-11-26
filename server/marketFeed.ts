@@ -2192,6 +2192,96 @@ export class MarketFeedManager {
       }
     }
 
+    // Authentic Cross-Venue Fallback: if the primary exchange endpoint timed out or is regionally blocked (e.g. HTTP 451),
+    // try live OKX / Bybit / Coinbase klines for the exact same normalized asset before reporting unavailable.
+    if (candles.length < 20) {
+      const [rawBase, rawQuote = 'USDT'] = symbol.toUpperCase().split('/');
+      const base = rawBase.trim();
+      const quote = rawQuote.trim() || 'USDT';
+
+      if (candles.length < 20 && cfg?.exchangeId !== 'okx') {
+        const okxBar =
+          interval === '15m' ? '15m' : interval === '4h' ? '4H' : interval === '1d' ? '1D' : '1H';
+        const okxInstId =
+          marketType === 'PERPETUAL' ? `${base}-${quote}-SWAP` : `${base}-${quote}`;
+        const res = await fetchJsonWithTimeout<{
+          code: string;
+          data?: Array<[string, string, string, string, string, string]>;
+        }>(
+          `https://www.okx.com/api/v5/market/candles?instId=${encodeURIComponent(okxInstId)}&bar=${okxBar}&limit=160`,
+          3500,
+        );
+        if (res.ok && res.data?.code === '0' && Array.isArray(res.data.data) && res.data.data.length >= 20) {
+          candles = [...res.data.data]
+            .reverse()
+            .map((k) => ({
+              timestamp: Number(k[0]),
+              open: Number(k[1]),
+              high: Number(k[2]),
+              low: Number(k[3]),
+              close: Number(k[4]),
+              volume: Number(k[5]),
+            }));
+          sourceLabel = `${cfg?.exchange ?? 'Exchange'} · OKX Cross-Venue Fallback`;
+        }
+      }
+
+      if (candles.length < 20 && cfg?.exchangeId !== 'bybit') {
+        const bybitIv =
+          interval === '15m' ? '15' : interval === '4h' ? '240' : interval === '1d' ? 'D' : '60';
+        const bybitCategory = marketType === 'PERPETUAL' ? 'linear' : 'spot';
+        const res = await fetchJsonWithTimeout<{
+          retCode: number;
+          result?: { list?: Array<[string, string, string, string, string, string]> };
+        }>(
+          `https://api.bybit.com/v5/market/kline?category=${bybitCategory}&symbol=${encodeURIComponent(`${base}${quote}`)}&interval=${bybitIv}&limit=160`,
+          3500,
+        );
+        if (
+          res.ok &&
+          res.data?.retCode === 0 &&
+          Array.isArray(res.data.result?.list) &&
+          res.data.result.list.length >= 20
+        ) {
+          candles = [...res.data.result.list]
+            .reverse()
+            .map((k) => ({
+              timestamp: Number(k[0]),
+              open: Number(k[1]),
+              high: Number(k[2]),
+              low: Number(k[3]),
+              close: Number(k[4]),
+              volume: Number(k[5]),
+            }));
+          sourceLabel = `${cfg?.exchange ?? 'Exchange'} · Bybit Cross-Venue Fallback`;
+        }
+      }
+
+      if (candles.length < 20 && cfg?.exchangeId !== 'coinbase') {
+        const gran =
+          interval === '15m' ? 900 : interval === '4h' ? 14400 : interval === '1d' ? 86400 : 3600;
+        const cbProduct = `${base}-${quote === 'USDT' ? 'USD' : quote}`;
+        const res = await fetchJsonWithTimeout<Array<[number, number, number, number, number, number]>>(
+          `https://api.exchange.coinbase.com/products/${encodeURIComponent(cbProduct)}/candles?granularity=${gran}`,
+          3500,
+        );
+        if (res.ok && Array.isArray(res.data) && res.data.length >= 20) {
+          candles = [...res.data]
+            .slice(0, 160)
+            .reverse()
+            .map((k) => ({
+              timestamp: Number(k[0]) * 1000,
+              low: Number(k[1]),
+              high: Number(k[2]),
+              open: Number(k[3]),
+              close: Number(k[4]),
+              volume: Number(k[5]),
+            }));
+          sourceLabel = `${cfg?.exchange ?? 'Exchange'} · Coinbase Cross-Venue Fallback`;
+        }
+      }
+    }
+
     // Enforce strict chronological monotonicity & finite positive OHLC values
     const cleanCandles: Candle[] = [];
     let lastTs = -1;

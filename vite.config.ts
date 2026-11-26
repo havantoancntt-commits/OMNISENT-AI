@@ -11,7 +11,7 @@ export default defineConfig(() => {
       react(),
       tailwindcss(),
       VitePWA({
-        registerType: 'prompt',
+        registerType: 'autoUpdate',
         includeManifestIcons: false,
         includeAssets: [],
         manifest: {
@@ -86,6 +86,8 @@ export default defineConfig(() => {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
           globIgnores: ['assets/aistudio/**'],
           cleanupOutdatedCaches: true,
+          skipWaiting: true,
+          clientsClaim: true,
           maximumFileSizeToCacheInBytes: 5 * 1024 * 1024,
           navigateFallbackDenylist: [/^\/api\//, /^\/ws/],
           runtimeCaching: [

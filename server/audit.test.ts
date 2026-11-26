@@ -182,4 +182,24 @@ test('HTTP security headers, diagnostics, atomic POST /api/positions/:id/close r
   });
   assert.equal(validTokenRes.status, 200);
   delete process.env.OMNISENT_ADMIN_TOKEN;
+
+  // 4. Verify single-trip PWA bootstrap sync endpoint & strict no-store cache-control header
+  const bootstrapRes = await fetch(`${baseUrl}/api/sync/bootstrap`);
+  assert.equal(bootstrapRes.status, 200);
+  const cacheControl = bootstrapRes.headers.get('cache-control') || '';
+  assert.ok(cacheControl.includes('no-store'));
+  assert.ok(cacheControl.includes('no-cache'));
+  const bootstrapJson = (await bootstrapRes.json()) as {
+    stateRevision: number;
+    tradingMode: string;
+    portfolio: { totalEquityUsd: number };
+    positions: unknown[];
+    tickers: unknown[];
+    serverUtc: string;
+  };
+  assert.equal(typeof bootstrapJson.stateRevision, 'number');
+  assert.equal(bootstrapJson.tradingMode, 'PAPER');
+  assert.ok(Array.isArray(bootstrapJson.positions));
+  assert.ok(Array.isArray(bootstrapJson.tickers));
+  assert.ok(typeof bootstrapJson.serverUtc === 'string' && bootstrapJson.serverUtc.length > 0);
 });

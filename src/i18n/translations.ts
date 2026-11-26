@@ -828,6 +828,14 @@ const vi = {
   'pwa.offlineDesc': 'Giao diện Terminal vẫn hoạt động từ bộ đệm; dữ liệu sàn & lệnh tạm dừng đến khi có mạng.',
   'pwa.onlineRestoredTitle': 'Đã khôi phục kết nối mạng',
   'pwa.onlineRestoredDesc': 'Đang tự động đồng bộ lại WebSocket sàn và vị thế thời gian thực.',
+  'pwa.syncNowBtn': 'Đồng bộ ngay',
+  'pwa.syncingBtn': 'Đang đồng bộ...',
+  'pwa.syncLabel': 'Đồng bộ dữ liệu',
+  'pwa.syncWsLive': 'WS Real-Time',
+  'pwa.syncHttpFast': 'HTTPS Fast Sync',
+  'pwa.syncOfflineCache': 'Offline Cache',
+  'pwa.syncDoneToast': 'Đã đồng bộ ({ms}ms)',
+  'pwa.standaloneUpdateMsg': 'Có phiên bản App mới — chạm để đồng bộ ngay',
 
   // Autonomous 9-Gate Auto-Execution Engine
   'auto.title': 'Động Cơ Vào Lệnh Tự Động 9 Cổng (Autonomous Execution)',
@@ -1744,6 +1752,14 @@ const en: Record<keyof typeof vi, string> = {
   'pwa.offlineDesc': 'Terminal shell stays responsive from cache; live exchange feeds & routing pause until reconnected.',
   'pwa.onlineRestoredTitle': 'Connection Restored',
   'pwa.onlineRestoredDesc': 'Re-synchronizing exchange WebSockets and live positions automatically.',
+  'pwa.syncNowBtn': 'Sync Now',
+  'pwa.syncingBtn': 'Syncing...',
+  'pwa.syncLabel': 'Data Sync',
+  'pwa.syncWsLive': 'WS Real-Time',
+  'pwa.syncHttpFast': 'HTTPS Fast Sync',
+  'pwa.syncOfflineCache': 'Offline Cache',
+  'pwa.syncDoneToast': 'Synced ({ms}ms)',
+  'pwa.standaloneUpdateMsg': 'App update ready — tap to sync',
 
   // Autonomous 9-Gate Auto-Execution Engine
   'auto.title': '9-Gate Autonomous Execution Engine',

@@ -13,8 +13,11 @@ import {
   detectDisplayMode,
   detectPWAPlatform,
   isRunningStandalone,
+  shouldAutoReloadOnSwControlChange,
+  shouldRunCooldownSync,
   shouldShowMobileInstallBanner,
   validateManifestPayload,
+  type PWADataSyncTransport,
   type PWADisplayMode,
   type PWAManifestAudit,
   type PWAPlatform,
@@ -62,12 +65,30 @@ const bootstrapState: PWABootstrapSnapshot = {
 let bootstrapInitialized = false;
 let updateSWFn: ((reloadPage?: boolean) => Promise<void>) | null = null;
 let lastVisibilityCheckMs = 0;
+let swControllerReloaded = false;
 const subscribers = new Set<() => void>();
+const dataSyncHandlers = new Set<() => Promise<void> | void>();
+let syncChannel: BroadcastChannel | null = null;
+
+const SW_VISIBILITY_COOLDOWN_MS = 20_000;
+const SW_RELOAD_GUARD_KEY = 'omnisent_sw_reloaded_ts';
 
 function notifySubscribers() {
   for (const cb of subscribers) {
     cb();
   }
+}
+
+export function triggerRegisteredDataSyncHandlers(): Promise<void> {
+  const tasks: Promise<void>[] = [];
+  for (const handler of dataSyncHandlers) {
+    try {
+      tasks.push(Promise.resolve(handler()));
+    } catch {
+      // ignore handler failure
+    }
+  }
+  return Promise.allSettled(tasks).then(() => undefined);
 }
 
 export function initPWABootstrapListeners(): void {
@@ -86,15 +107,49 @@ export function initPWABootstrapListeners(): void {
     notifySubscribers();
   });
 
+  if (typeof BroadcastChannel !== 'undefined') {
+    try {
+      syncChannel = new BroadcastChannel('omnisent-pwa-sync-v1');
+      syncChannel.addEventListener('message', (event: MessageEvent) => {
+        const type = (event.data as { type?: string } | null)?.type;
+        if (type === 'DATA_MUTATED' || type === 'FORCE_SYNC') {
+          void triggerRegisteredDataSyncHandlers();
+        }
+      });
+    } catch {
+      syncChannel = null;
+    }
+  }
+
   if (!('serviceWorker' in navigator)) {
     bootstrapState.swStatus = 'UNSUPPORTED';
     notifySubscribers();
     return;
   }
 
-  if (navigator.serviceWorker.controller) {
+  const hadControllerAtBoot = Boolean(navigator.serviceWorker.controller);
+  if (hadControllerAtBoot) {
     bootstrapState.swStatus = 'READY';
   }
+
+  // When a new autoUpdate Service Worker activates and takes control, cleanly refresh once
+  // so installed PWAs never stay on mismatched chunks or stale manifests.
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    bootstrapState.swStatus = 'READY';
+    bootstrapState.needRefresh = false;
+    notifySubscribers();
+    try {
+      const lastReloadTs = Number(window.sessionStorage.getItem(SW_RELOAD_GUARD_KEY) || 0);
+      const recentlyReloaded = Number.isFinite(lastReloadTs) && Date.now() - lastReloadTs < 15_000;
+      if (shouldAutoReloadOnSwControlChange(hadControllerAtBoot, swControllerReloaded || recentlyReloaded)) {
+        swControllerReloaded = true;
+        window.sessionStorage.setItem(SW_RELOAD_GUARD_KEY, String(Date.now()));
+        window.location.reload();
+      }
+    } catch {
+      // ignore sessionStorage restrictions
+    }
+  });
 
   try {
     updateSWFn = registerSW({
@@ -119,21 +174,25 @@ export function initPWABootstrapListeners(): void {
           }
           notifySubscribers();
 
-          // Background sync check for SW updates every 30 minutes
-          window.setInterval(() => {
-            if (!registration.installing && navigator.onLine) {
-              void registration.update().catch(() => {});
-            }
-          }, 30 * 60 * 1000);
+          const checkRegistrationUpdate = () => {
+            if (!navigator.onLine || registration.installing) return;
+            const now = Date.now();
+            if (!shouldRunCooldownSync(lastVisibilityCheckMs, now, SW_VISIBILITY_COOLDOWN_MS)) return;
+            lastVisibilityCheckMs = now;
+            void registration.update().catch(() => {});
+          };
+
+          // Background check every 10 minutes
+          window.setInterval(checkRegistrationUpdate, 10 * 60 * 1000);
 
           document.addEventListener('visibilitychange', () => {
-            if (document.visibilityState !== 'visible' || !navigator.onLine) return;
-            const now = Date.now();
-            if (now - lastVisibilityCheckMs < 5 * 60 * 1000) return;
-            lastVisibilityCheckMs = now;
-            if (!registration.installing) {
-              void registration.update().catch(() => {});
+            if (document.visibilityState === 'visible') {
+              checkRegistrationUpdate();
             }
+          });
+          window.addEventListener('online', checkRegistrationUpdate);
+          window.addEventListener('pageshow', (e) => {
+            if (e.persisted) checkRegistrationUpdate();
           });
         }
       },
@@ -200,12 +259,24 @@ export interface PWAContextValue {
   installing: boolean;
   modalOpen: boolean;
   showMobileBanner: boolean;
+  dataSyncTransport: PWADataSyncTransport;
+  lastDataSyncAtMs: number | null;
+  syncLatencyMs: number | null;
+  syncingNow: boolean;
   dismissBanner: () => void;
   openModal: () => void;
   closeModal: () => void;
   install: () => Promise<'accepted' | 'dismissed' | 'unavailable'>;
   checkForUpdate: () => Promise<'update-available' | 'up-to-date' | 'unavailable'>;
   applyUpdate: () => Promise<void>;
+  syncNow: () => Promise<void>;
+  registerDataSyncHandler: (fn: () => Promise<void> | void) => () => void;
+  reportDataSync: (meta: {
+    transport: PWADataSyncTransport;
+    syncedAtMs?: number;
+    latencyMs?: number | null;
+  }) => void;
+  broadcastSyncEvent: (type: 'DATA_MUTATED' | 'FORCE_SYNC') => void;
 }
 
 const DEFAULT_PWA_VALUE: PWAContextValue = {
@@ -229,12 +300,20 @@ const DEFAULT_PWA_VALUE: PWAContextValue = {
   installing: false,
   modalOpen: false,
   showMobileBanner: false,
+  dataSyncTransport: 'SYNCING',
+  lastDataSyncAtMs: null,
+  syncLatencyMs: null,
+  syncingNow: false,
   dismissBanner: () => {},
   openModal: () => {},
   closeModal: () => {},
   install: async () => 'unavailable',
   checkForUpdate: async () => 'unavailable',
   applyUpdate: async () => {},
+  syncNow: async () => {},
+  registerDataSyncHandler: () => () => {},
+  reportDataSync: () => {},
+  broadcastSyncEvent: () => {},
 };
 
 const PWAContext = createContext<PWAContextValue>(DEFAULT_PWA_VALUE);
@@ -250,6 +329,10 @@ export const PWAProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   const [updateCheckResult, setUpdateCheckResult] = useState<
     'idle' | 'up-to-date' | 'update-available' | 'unavailable'
   >('idle');
+  const [dataSyncTransport, setDataSyncTransport] = useState<PWADataSyncTransport>('SYNCING');
+  const [lastDataSyncAtMs, setLastDataSyncAtMs] = useState<number | null>(null);
+  const [syncLatencyMs, setSyncLatencyMs] = useState<number | null>(null);
+  const [syncingNow, setSyncingNow] = useState(false);
 
   const platform = useMemo<PWAPlatform>(() => {
     if (typeof navigator === 'undefined') return 'desktop-other';
@@ -412,6 +495,59 @@ export const PWAProvider: React.FC<{ children: React.ReactNode }> = ({ children 
     }
   }, []);
 
+  const registerDataSyncHandler = useCallback((fn: () => Promise<void> | void) => {
+    dataSyncHandlers.add(fn);
+    return () => {
+      dataSyncHandlers.delete(fn);
+    };
+  }, []);
+
+  const reportDataSync = useCallback(
+    (meta: {
+      transport: PWADataSyncTransport;
+      syncedAtMs?: number;
+      latencyMs?: number | null;
+    }) => {
+      setDataSyncTransport(meta.transport);
+      if (typeof meta.syncedAtMs === 'number') {
+        setLastDataSyncAtMs(meta.syncedAtMs);
+      }
+      if (meta.latencyMs !== undefined) {
+        setSyncLatencyMs(meta.latencyMs);
+      }
+    },
+    [],
+  );
+
+  const broadcastSyncEvent = useCallback((type: 'DATA_MUTATED' | 'FORCE_SYNC') => {
+    try {
+      syncChannel?.postMessage({ type, ts: Date.now() });
+    } catch {
+      // ignore closed channel
+    }
+  }, []);
+
+  const syncNow = useCallback(async () => {
+    if (syncingNow) return;
+    setSyncingNow(true);
+    const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    try {
+      await Promise.allSettled([
+        checkForUpdate(),
+        triggerRegisteredDataSyncHandlers(),
+      ]);
+      const elapsed = Math.max(
+        1,
+        Math.round((typeof performance !== 'undefined' ? performance.now() : Date.now()) - t0),
+      );
+      setLastDataSyncAtMs(Date.now());
+      setSyncLatencyMs(elapsed);
+      broadcastSyncEvent('FORCE_SYNC');
+    } finally {
+      setSyncingNow(false);
+    }
+  }, [syncingNow, checkForUpdate, broadcastSyncEvent]);
+
   const dismissBanner = useCallback(() => {
     setBannerDismissed(true);
     try {
@@ -453,12 +589,20 @@ export const PWAProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       installing,
       modalOpen,
       showMobileBanner,
+      dataSyncTransport,
+      lastDataSyncAtMs,
+      syncLatencyMs,
+      syncingNow,
       dismissBanner,
       openModal,
       closeModal,
       install,
       checkForUpdate,
       applyUpdate,
+      syncNow,
+      registerDataSyncHandler,
+      reportDataSync,
+      broadcastSyncEvent,
     }),
     [
       isInstalled,
@@ -477,12 +621,20 @@ export const PWAProvider: React.FC<{ children: React.ReactNode }> = ({ children 
       installing,
       modalOpen,
       showMobileBanner,
+      dataSyncTransport,
+      lastDataSyncAtMs,
+      syncLatencyMs,
+      syncingNow,
       dismissBanner,
       openModal,
       closeModal,
       install,
       checkForUpdate,
       applyUpdate,
+      syncNow,
+      registerDataSyncHandler,
+      reportDataSync,
+      broadcastSyncEvent,
     ],
   );
 

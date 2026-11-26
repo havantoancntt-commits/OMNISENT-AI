@@ -38,10 +38,32 @@ export const PWAInstallControl: React.FC<PWAInstallControlProps> = ({
     swStatus,
     needRefresh,
     installing,
+    dataSyncTransport,
+    syncLatencyMs,
+    syncingNow,
     openModal,
     install,
     applyUpdate,
+    syncNow,
   } = usePWA();
+
+  const syncTransportLabel =
+    dataSyncTransport === 'WS_LIVE'
+      ? t('pwa.syncWsLive')
+      : dataSyncTransport === 'HTTP_FAST'
+        ? t('pwa.syncHttpFast')
+        : dataSyncTransport === 'OFFLINE_CACHED'
+          ? t('pwa.syncOfflineCache')
+          : t('pwa.diagSwSync');
+
+  const syncTransportTone =
+    dataSyncTransport === 'WS_LIVE'
+      ? 'text-emerald-400'
+      : dataSyncTransport === 'HTTP_FAST'
+        ? 'text-cyan-300'
+        : dataSyncTransport === 'OFFLINE_CACHED'
+          ? 'text-amber-300'
+          : 'text-slate-400';
 
   const handlePrimaryAction = async () => {
     if (needRefresh) {
@@ -153,27 +175,50 @@ export const PWAInstallControl: React.FC<PWAInstallControlProps> = ({
           </div>
         )}
 
-        <div className="mt-2 flex items-center justify-between text-[10px] text-slate-500">
-          <span>{t('pwa.diagSw')}</span>
-          <span
-            className={`font-mono ${
-              swStatus === 'UPDATE_AVAILABLE'
-                ? 'text-amber-300'
-                : swStatus === 'READY' || swStatus === 'OFFLINE_READY'
-                  ? 'text-emerald-400'
-                  : 'text-slate-400'
-            }`}
+        <div className="mt-2 space-y-1 border-t border-slate-800/70 pt-2 text-[10px] text-slate-500">
+          <div className="flex items-center justify-between">
+            <span>{t('pwa.diagSw')}</span>
+            <span
+              className={`font-mono ${
+                swStatus === 'UPDATE_AVAILABLE'
+                  ? 'text-amber-300'
+                  : swStatus === 'READY' || swStatus === 'OFFLINE_READY'
+                    ? 'text-emerald-400'
+                    : 'text-slate-400'
+              }`}
+            >
+              {swStatus === 'UPDATE_AVAILABLE'
+                ? t('pwa.diagSwUpdate')
+                : swStatus === 'OFFLINE_READY'
+                  ? t('pwa.diagSwOfflineReady')
+                  : swStatus === 'READY'
+                    ? t('pwa.diagSwReady')
+                    : swStatus === 'UNSUPPORTED'
+                      ? t('pwa.diagSwUnsupported')
+                      : t('pwa.diagSwSync')}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-1.5">
+            <span className="shrink-0 whitespace-nowrap">{t('pwa.syncLabel')}</span>
+            <span className={`truncate text-right font-mono tabular-nums ${syncTransportTone}`}>
+              {dataSyncTransport === 'WS_LIVE'
+                ? 'WS LIVE'
+                : dataSyncTransport === 'HTTP_FAST'
+                  ? 'HTTP'
+                  : syncTransportLabel}
+              {typeof syncLatencyMs === 'number' && syncLatencyMs > 0 ? ` · ${syncLatencyMs}ms` : ''}
+            </span>
+          </div>
+          <button
+            type="button"
+            onClick={() => void syncNow()}
+            disabled={syncingNow}
+            data-testid="pwa-sync-now-sidebar"
+            className="mt-1 flex min-h-[30px] w-full items-center justify-center gap-1.5 rounded-lg border border-slate-800 bg-[#070B12] px-2 text-[11px] font-medium text-slate-300 transition-colors hover:border-cyan-500/40 hover:text-cyan-200 disabled:opacity-60"
           >
-            {swStatus === 'UPDATE_AVAILABLE'
-              ? t('pwa.diagSwUpdate')
-              : swStatus === 'OFFLINE_READY'
-                ? t('pwa.diagSwOfflineReady')
-                : swStatus === 'READY'
-                  ? t('pwa.diagSwReady')
-                  : swStatus === 'UNSUPPORTED'
-                    ? t('pwa.diagSwUnsupported')
-                    : t('pwa.diagSwSync')}
-          </span>
+            <RefreshCw className={`h-3 w-3 ${syncingNow ? 'animate-spin text-cyan-300' : ''}`} />
+            <span>{syncingNow ? t('pwa.syncingBtn') : t('pwa.syncNowBtn')}</span>
+          </button>
         </div>
       </div>
     );
@@ -259,6 +304,26 @@ export const PWAInstallControl: React.FC<PWAInstallControlProps> = ({
           </button>
         </div>
       )}
+
+      <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-800/80 pt-2.5 text-[11px]">
+        <div className="min-w-0">
+          <span className="text-slate-400">{t('pwa.syncLabel')}: </span>
+          <span className={`font-mono font-medium tabular-nums ${syncTransportTone}`}>
+            {syncTransportLabel}
+            {typeof syncLatencyMs === 'number' && syncLatencyMs > 0 ? ` · ${syncLatencyMs}ms` : ''}
+          </span>
+        </div>
+        <button
+          type="button"
+          onClick={() => void syncNow()}
+          disabled={syncingNow}
+          data-testid="pwa-sync-now-drawer"
+          className="flex min-h-[34px] shrink-0 items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0E1522] px-2.5 text-[11px] font-semibold text-cyan-200 hover:border-cyan-500/40 disabled:opacity-60"
+        >
+          <RefreshCw className={`h-3.5 w-3.5 ${syncingNow ? 'animate-spin' : ''}`} />
+          <span>{syncingNow ? t('pwa.syncingBtn') : t('pwa.syncNowBtn')}</span>
+        </button>
+      </div>
     </div>
   );
 };
@@ -266,13 +331,40 @@ export const PWAInstallControl: React.FC<PWAInstallControlProps> = ({
 export const PWASmartBanner: React.FC = () => {
   const { t } = useI18n();
   const {
+    isInstalled,
+    needRefresh,
     showMobileBanner,
     canNativePrompt,
     installing,
     install,
+    applyUpdate,
     openModal,
     dismissBanner,
   } = usePWA();
+
+  if (isInstalled && needRefresh) {
+    return (
+      <div
+        data-testid="pwa-standalone-update-banner"
+        className="mb-4 flex items-center justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3 shadow-sm lg:hidden"
+      >
+        <div className="flex min-w-0 flex-1 items-center gap-2.5">
+          <RefreshCw className="h-4 w-4 shrink-0 text-amber-300" />
+          <p className="truncate text-xs font-medium text-amber-100">
+            {t('pwa.standaloneUpdateMsg')}
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={() => void applyUpdate()}
+          data-testid="pwa-standalone-update-btn"
+          className="flex min-h-[36px] shrink-0 items-center gap-1.5 rounded-lg bg-amber-400 px-3 text-[11px] font-semibold text-slate-950 hover:bg-amber-300"
+        >
+          <span>{t('pwa.updateNowBtn')}</span>
+        </button>
+      </div>
+    );
+  }
 
   if (!showMobileBanner) return null;
 
@@ -336,10 +428,14 @@ export const PWAInstallModal: React.FC = () => {
     isInIframe,
     installing,
     modalOpen,
+    dataSyncTransport,
+    syncLatencyMs,
+    syncingNow,
     closeModal,
     install,
     checkForUpdate,
     applyUpdate,
+    syncNow,
   } = usePWA();
 
   const [activeGuideTab, setActiveGuideTab] = useState<PWAGuideTab>(uiState.recommendedGuideTab);
@@ -435,7 +531,7 @@ export const PWAInstallModal: React.FC = () => {
         </div>
 
         {/* Live PWA Readiness Telemetry (Verified from runtime probes) */}
-        <div className="mt-4 grid grid-cols-3 gap-2">
+        <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4">
           <div className="rounded-lg border border-slate-800 bg-[#070B12] p-2.5">
             <p className="text-[10px] text-slate-400">{t('pwa.diagManifest')}</p>
             <p
@@ -460,6 +556,29 @@ export const PWAInstallModal: React.FC = () => {
               }`}
             >
               {displayLabel}
+            </p>
+          </div>
+          <div className="rounded-lg border border-slate-800 bg-[#070B12] p-2.5">
+            <p className="text-[10px] text-slate-400">{t('pwa.syncLabel')}</p>
+            <p
+              className={`mt-0.5 font-mono text-[11px] font-semibold tabular-nums ${
+                dataSyncTransport === 'WS_LIVE'
+                  ? 'text-emerald-400'
+                  : dataSyncTransport === 'HTTP_FAST'
+                    ? 'text-cyan-300'
+                    : dataSyncTransport === 'OFFLINE_CACHED'
+                      ? 'text-amber-300'
+                      : 'text-slate-400'
+              }`}
+            >
+              {dataSyncTransport === 'WS_LIVE'
+                ? t('pwa.syncWsLive')
+                : dataSyncTransport === 'HTTP_FAST'
+                  ? t('pwa.syncHttpFast')
+                  : dataSyncTransport === 'OFFLINE_CACHED'
+                    ? t('pwa.syncOfflineCache')
+                    : t('pwa.diagSwSync')}
+              {typeof syncLatencyMs === 'number' && syncLatencyMs > 0 ? ` · ${syncLatencyMs}ms` : ''}
             </p>
           </div>
         </div>
@@ -694,6 +813,16 @@ export const PWAInstallModal: React.FC = () => {
         <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
           <span className="min-w-0 flex-1">{t('pwa.securityFootNote')}</span>
           <div className="flex shrink-0 items-center gap-2">
+            <button
+              type="button"
+              onClick={() => void syncNow()}
+              disabled={syncingNow}
+              data-testid="pwa-modal-sync-now-btn"
+              className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 text-xs font-medium text-cyan-200 hover:bg-cyan-500/20 disabled:opacity-60"
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${syncingNow ? 'animate-spin' : ''}`} />
+              <span>{syncingNow ? t('pwa.syncingBtn') : t('pwa.syncNowBtn')}</span>
+            </button>
             <button
               type="button"
               onClick={() => void checkForUpdate()}
