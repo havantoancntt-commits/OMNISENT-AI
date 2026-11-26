@@ -49,6 +49,77 @@ export interface CopilotStreamHandlers {
   onError: (err: { status: 'UNCONFIGURED' | 'ERROR'; message: string }) => void;
 }
 
+const VALID_RECOMMENDED_ACTIONS = new Set<NonNullable<GeminiSynthesisResponse['recommendedAction']>>([
+  'FOLLOW_SIGNAL',
+  'REDUCE_SIZE',
+  'WAIT_CONFIRMATION',
+  'NO_TRADE',
+]);
+
+export function parseValidatedSynthesisJson(
+  rawText: string,
+  fallbackThesis: string,
+  fallbackRegime: string,
+): {
+  executiveThesis: string;
+  regimeAssessment: string;
+  keyRisks: string[];
+  recommendedAction: NonNullable<GeminiSynthesisResponse['recommendedAction']>;
+} {
+  let cleaned = rawText.trim();
+  const fenced = cleaned.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    cleaned = fenced[1].trim();
+  }
+
+  let parsed: Record<string, unknown> = {};
+  try {
+    const obj = JSON.parse(cleaned);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      parsed = obj as Record<string, unknown>;
+    }
+  } catch {
+    parsed = {};
+  }
+
+  const rawAction = String(parsed.recommendedAction ?? '').trim().toUpperCase();
+  const recommendedAction = VALID_RECOMMENDED_ACTIONS.has(
+    rawAction as NonNullable<GeminiSynthesisResponse['recommendedAction']>,
+  )
+    ? (rawAction as NonNullable<GeminiSynthesisResponse['recommendedAction']>)
+    : 'WAIT_CONFIRMATION';
+
+  const keyRisks = Array.isArray(parsed.keyRisks)
+    ? parsed.keyRisks
+        .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+        .map((item) => item.trim().slice(0, 220))
+        .slice(0, 3)
+    : [];
+
+  const executiveThesis =
+    typeof parsed.executiveThesis === 'string' && parsed.executiveThesis.trim().length > 0
+      ? parsed.executiveThesis.trim().slice(0, 1200)
+      : fallbackThesis;
+
+  const regimeAssessment =
+    typeof parsed.regimeAssessment === 'string' && parsed.regimeAssessment.trim().length > 0
+      ? parsed.regimeAssessment.trim().slice(0, 800)
+      : fallbackRegime;
+
+  return {
+    executiveThesis,
+    regimeAssessment,
+    keyRisks,
+    recommendedAction,
+  };
+}
+
+function redactErrorSecrets(input: string): string {
+  return input
+    .replace(/([?&](?:key|apiKey|token)=)[^&\s]+/gi, '$1[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, 'Bearer [REDACTED]');
+}
+
 function isGeminiKeyValid(apiKey: string | undefined): apiKey is string {
   return Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim().length >= 10);
 }
@@ -103,7 +174,7 @@ function extractReadableGeminiError(
   return {
     isRetryable,
     message:
-      parsedMessage.slice(0, 260) ||
+      redactErrorSecrets(parsedMessage).slice(0, 260) ||
       (locale === 'en' ? 'Gemini API connection failed.' : 'Lỗi kết nối Gemini API.'),
   };
 }
@@ -446,24 +517,23 @@ ${quantSummaryLines}`;
       };
     }
 
-    const parsed = JSON.parse((synthValue.text ?? '{}').trim()) as {
-      executiveThesis?: string;
-      regimeAssessment?: string;
-      keyRisks?: string[];
-      recommendedAction?: GeminiSynthesisResponse['recommendedAction'];
-    };
+    const validated = parseValidatedSynthesisJson(
+      synthValue.text ?? '{}',
+      params.signal.reasoningSummary,
+      params.signal.marketRegime,
+    );
 
     return {
       status: 'OK',
       model: activeModel,
       thinkingLevel: activeThinkingLevel,
-      executiveThesis: parsed.executiveThesis ?? params.signal.reasoningSummary,
-      regimeAssessment: parsed.regimeAssessment ?? params.signal.marketRegime,
+      executiveThesis: validated.executiveThesis,
+      regimeAssessment: validated.regimeAssessment,
       catalystBrief,
       groundingSources,
       decisionCalibration,
-      keyRisks: parsed.keyRisks ?? [],
-      recommendedAction: parsed.recommendedAction ?? 'WAIT_CONFIRMATION',
+      keyRisks: validated.keyRisks,
+      recommendedAction: validated.recommendedAction,
       generatedAtUtc: nowIso,
     };
   } catch (err) {

@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import http from 'node:http';
 import path from 'node:path';
 import express from 'express';
@@ -6,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import {
   appendAgentLog,
   appendAuditLog,
+  closePositionAtomically,
   deletePosition,
   disconnectExchange,
   expireStaleAutoProposals,
@@ -14,6 +16,7 @@ import {
   getAuditLogs,
   getAutoExecutionConfig,
   getAutoProposals,
+  getDatabaseDiagnostics,
   getExchanges,
   getExchangeEncryptedCredentials,
   getLatestPnlSnapshot,
@@ -29,6 +32,7 @@ import {
   bumpStateRevision,
   initDatabase,
   insertOrder,
+  openPositionAtomically,
   recordPnlSnapshot,
   resetTradingSession,
   saveAutoExecutionConfig,
@@ -45,6 +49,8 @@ import {
 import {
   decryptSecretPayload,
   encryptSecretPayload,
+  isPersistentVaultKeyConfigured,
+  isStrictProductionRuntime,
   maskApiKey,
 } from './server/cryptoVault.ts';
 import { verifyExchangeCredentials } from './server/exchangeAuth.ts';
@@ -102,6 +108,7 @@ import type {
   BacktestConfig,
   BacktestStrategyId,
   Candle,
+  ClosePositionReceipt,
   ExchangeEnvironment,
   FullMarketOpportunity,
   FullMarketScanResponse,
@@ -124,7 +131,147 @@ dotenv.config();
 initDatabase();
 
 export const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.disable('x-powered-by');
+app.set('trust proxy', 1);
+app.use(express.json({ limit: '512kb' }));
+
+// Security Headers (compatible with AI Studio preview iframe)
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
+  res.setHeader('X-DNS-Prefetch-Control', 'off');
+  next();
+});
+
+function buildAllowedOrigins(): Set<string> {
+  const origins = new Set<string>([
+    'http://localhost:3000',
+    'http://127.0.0.1:3000',
+  ]);
+  for (const raw of [process.env.APP_URL, process.env.ALLOWED_ORIGIN]) {
+    if (!raw) continue;
+    for (const part of raw.split(',')) {
+      const trimmed = part.trim().replace(/\/+$/, '');
+      if (trimmed && trimmed !== 'MY_APP_URL') {
+        origins.add(trimmed);
+      }
+    }
+  }
+  return origins;
+}
+
+// Strict Origin/CORS policy for /api routes
+app.use('/api', (req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin) {
+    const allowed = buildAllowedOrigins();
+    const hostHeader = req.headers.host;
+    const isSameHost =
+      Boolean(hostHeader) &&
+      (origin === `https://${hostHeader}` || origin === `http://${hostHeader}`);
+    const isCloudRunPreview = /^https:\/\/[a-z0-9.-]+\.run\.app$/i.test(origin);
+    if (isSameHost || allowed.has(origin) || isCloudRunPreview) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
+    } else {
+      if (req.method === 'OPTIONS') {
+        res.status(403).end();
+        return;
+      }
+    }
+  }
+  if (req.method === 'OPTIONS') {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
+// Sliding-window per-IP rate limiter for sensitive / compute-heavy routes
+export function createRateLimiter(options: { maxRequests: number; windowMs: number }) {
+  const hits = new Map<string, number[]>();
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const now = Date.now();
+    const clientIp = String(req.ip || req.socket?.remoteAddress || 'unknown');
+    const cutoff = now - options.windowMs;
+    const prev = (hits.get(clientIp) ?? []).filter((ts) => ts > cutoff);
+    if (prev.length >= options.maxRequests) {
+      const retryAfterSec = Math.max(1, Math.ceil((prev[0] + options.windowMs - now) / 1000));
+      res.setHeader('Retry-After', String(retryAfterSec));
+      res.status(429).json({
+        error: `Quá nhiều yêu cầu trong thời gian ngắn. Vui lòng thử lại sau ${retryAfterSec}s.`,
+      });
+      return;
+    }
+    prev.push(now);
+    hits.set(clientIp, prev);
+    if (hits.size > 2000) {
+      for (const [k, list] of hits.entries()) {
+        const fresh = list.filter((ts) => ts > cutoff);
+        if (fresh.length === 0) hits.delete(k);
+        else hits.set(k, fresh);
+      }
+    }
+    next();
+  };
+}
+
+// Optional timing-safe bearer/header auth when OMNISENT_ADMIN_TOKEN is configured
+export function requireAdminAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction,
+): void {
+  const expected = process.env.OMNISENT_ADMIN_TOKEN?.trim();
+  if (!expected) {
+    next();
+    return;
+  }
+  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
+  const headerToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : '';
+  const supplied = bearerToken || headerToken;
+  const expectedBuf = Buffer.from(expected, 'utf8');
+  const suppliedBuf = Buffer.from(supplied, 'utf8');
+  if (
+    supplied.length === 0 ||
+    expectedBuf.length !== suppliedBuf.length ||
+    !crypto.timingSafeEqual(expectedBuf, suppliedBuf)
+  ) {
+    res.status(401).json({
+      error: 'Yêu cầu xác thực quản trị (Authorization: Bearer <OMNISENT_ADMIN_TOKEN> hoặc X-Admin-Token).',
+    });
+    return;
+  }
+  next();
+}
+
+const aiRateLimiter = createRateLimiter({ maxRequests: 24, windowMs: 60_000 });
+const exchangeRateLimiter = createRateLimiter({ maxRequests: 30, windowMs: 60_000 });
+const executionRateLimiter = createRateLimiter({ maxRequests: 45, windowMs: 60_000 });
+const scanBacktestRateLimiter = createRateLimiter({ maxRequests: 36, windowMs: 60_000 });
+
+app.use('/api/ai', aiRateLimiter);
+app.use('/api/exchanges/test', exchangeRateLimiter, requireAdminAuth);
+app.use('/api/exchanges/connect', exchangeRateLimiter, requireAdminAuth);
+app.use('/api/exchanges/:id/verify', exchangeRateLimiter, requireAdminAuth);
+app.use('/api/exchanges/verify-all', exchangeRateLimiter, requireAdminAuth);
+app.use('/api/exchanges/:id/disconnect', requireAdminAuth);
+app.use('/api/orders', executionRateLimiter, requireAdminAuth);
+app.use('/api/positions', executionRateLimiter, requireAdminAuth);
+app.use('/api/mode', requireAdminAuth);
+app.use('/api/emergency-stop', requireAdminAuth);
+app.use('/api/session/reset', requireAdminAuth);
+app.use('/api/risk/config', requireAdminAuth);
+app.use('/api/auto-trade/config', requireAdminAuth);
+app.use('/api/auto-trade/cycle', requireAdminAuth);
+app.use('/api/auto-trade/proposals', requireAdminAuth);
+app.use('/api/agents/:id/action', requireAdminAuth);
+app.use('/api/market/scan', scanBacktestRateLimiter);
+app.use('/api/backtest', scanBacktestRateLimiter);
 
 let coldWarmupPromise: Promise<void> | null = null;
 async function ensureServerWarm(): Promise<void> {
@@ -189,48 +336,6 @@ function syncPortfolioAndPositions(options?: {
     });
 
     if (lifecycle.closed && lifecycle.closePrice !== undefined) {
-      autoClosed = true;
-      const closePrice = lifecycle.closePrice;
-      const closeFee = lifecycle.closeFeeUsd ?? 0;
-      const net = lifecycle.realizedNetUsd ?? 0;
-
-      portfolio.realizedPnlUsd = Number((portfolio.realizedPnlUsd + net).toFixed(2));
-      portfolio.totalFeesUsd = Number((portfolio.totalFeesUsd + closeFee).toFixed(2));
-      if (net >= 0) portfolio.winCount += 1;
-      else portfolio.lossCount += 1;
-      portfolio.totalClosedTrades += 1;
-      portfolio.winRatePct =
-        portfolio.totalClosedTrades > 0
-          ? Number(((portfolio.winCount / portfolio.totalClosedTrades) * 100).toFixed(1))
-          : null;
-
-      deletePosition(pos.id);
-      try {
-        insertOrder({
-          id: `ORD-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`,
-          idempotencyKey: `CLOSE-${pos.id}`,
-          symbol: pos.symbol,
-          exchange: pos.exchange,
-          marketType: pos.marketType,
-          side: pos.side === 'LONG' ? 'SHORT' : 'LONG',
-          orderType: 'MARKET',
-          quantity: pos.quantity,
-          price: closePrice,
-          stopLoss: pos.stopLoss,
-          takeProfit: pos.takeProfit,
-          leverage: pos.leverage,
-          feesUsd: closeFee,
-          slippageUsd: 0,
-          status: 'FILLED',
-          mode: pos.mode,
-          strategyName: `${pos.strategyName} [${lifecycle.closeReason}]`,
-          riskDecision: 'APPROVE',
-          createdAtUtc: new Date().toISOString(),
-        });
-      } catch {
-        // Ignore if idempotency close record already exists
-      }
-
       const actionTag =
         lifecycle.closeReason === 'TAKE_PROFIT'
           ? 'AUTO_TAKE_PROFIT'
@@ -238,13 +343,25 @@ function syncPortfolioAndPositions(options?: {
             ? 'AUTO_TRAILING_PROFIT_EXIT'
             : 'AUTO_STOP_LOSS';
 
-      appendAuditLog({
-        category: 'ORDER',
-        severity: lifecycle.closeReason === 'STOP_LOSS' ? 'WARNING' : 'INFO',
+      const closedRes = closePositionAtomically({
+        positionId: pos.id,
+        resolveClosePrice: () => lifecycle.closePrice!,
+        closeReason: lifecycle.closeReason ?? 'STOP_LOSS',
+        idempotencyPrefix: 'CLOSE',
         actor: 'EXIT_STRATEGY',
-        action: actionTag,
-        details: `Đóng vị thế ${pos.symbol} ${pos.side} tại ${closePrice} (${lifecycle.closeReason}), PnL ròng $${net.toFixed(2)}.`,
+        auditAction: actionTag,
+        auditSeverity: lifecycle.closeReason === 'STOP_LOSS' ? 'WARNING' : 'INFO',
       });
+      if (closedRes.closed) {
+        autoClosed = true;
+        const freshPort = getPortfolioSummary();
+        portfolio.realizedPnlUsd = freshPort.realizedPnlUsd;
+        portfolio.totalFeesUsd = freshPort.totalFeesUsd;
+        portfolio.winCount = freshPort.winCount;
+        portfolio.lossCount = freshPort.lossCount;
+        portfolio.totalClosedTrades = freshPort.totalClosedTrades;
+        portfolio.winRatePct = freshPort.winRatePct;
+      }
       continue;
     }
 
@@ -395,6 +512,10 @@ app.get('/api/health', (_req, res) => {
     geminiConfigured:
       Boolean(process.env.GEMINI_API_KEY) &&
       process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
+    vaultPersistentKeyConfigured: isPersistentVaultKeyConfigured(),
+    strictVaultProduction: isStrictProductionRuntime(),
+    adminAuthEnabled: Boolean(process.env.OMNISENT_ADMIN_TOKEN?.trim()),
+    database: getDatabaseDiagnostics(),
     timestampUtc: new Date().toISOString(),
   });
 });
@@ -417,9 +538,9 @@ app.get('/api/market/tickers', (_req, res) => {
 });
 
 app.get('/api/market/quote', async (req, res) => {
-  const symbol = String(req.query.symbol || 'BTC/USDT');
+  const symbol = String(req.query.symbol || 'BTC/USDT').slice(0, 40);
   const marketType = (String(req.query.marketType || 'PERPETUAL') as MarketType);
-  const exchange = req.query.exchange ? String(req.query.exchange) : undefined;
+  const exchange = req.query.exchange ? String(req.query.exchange).slice(0, 32) : undefined;
   let ticker = marketFeed.getTicker(symbol, marketType, exchange);
   const staleOrMissing = !ticker || ticker.lastPrice <= 0 || Date.now() - ticker.timestampUtc > 2000;
   if (staleOrMissing) {
@@ -439,15 +560,15 @@ app.get('/api/market/quote', async (req, res) => {
 });
 
 app.get('/api/market/search', async (req, res) => {
-  const q = String(req.query.q || '');
+  const q = String(req.query.q || '').slice(0, 80);
   const rawMarket = String(req.query.marketType || 'ALL').toUpperCase();
   const marketType =
     rawMarket === 'SPOT' || rawMarket === 'PERPETUAL' ? (rawMarket as MarketType) : 'ALL';
-  const exchange = String(req.query.exchange || 'ALL');
+  const exchange = String(req.query.exchange || 'ALL').slice(0, 32);
   const rawSort = String(req.query.sort || 'relevance').toLowerCase();
   const sort =
     rawSort === 'volume' || rawSort === 'gainer' || rawSort === 'loser' ? rawSort : 'relevance';
-  const limit = Math.min(60, Math.max(1, Number(req.query.limit || 32)));
+  const limit = Math.min(60, Math.max(1, Number(req.query.limit || 32) || 32));
 
   const { results, totalIndexed } = await marketFeed.searchMarkets(q, {
     marketType,
@@ -1382,28 +1503,6 @@ function executeRiskVerifiedPaperOrder(params: {
   const slipUsd = Number((riskCheck.recommendedQuantity * orderReq.entryPrice * slippageAdj).toFixed(2));
   const effLev = orderReq.marketType === 'SPOT' ? 1 : orderReq.leverage;
 
-  insertOrder({
-    id: orderId,
-    idempotencyKey: orderReq.idempotencyKey,
-    symbol: orderReq.symbol,
-    exchange: orderReq.exchange,
-    marketType: orderReq.marketType,
-    side: orderReq.side,
-    orderType: orderReq.orderType,
-    quantity: riskCheck.recommendedQuantity,
-    price: execPrice,
-    stopLoss: orderReq.stopLoss,
-    takeProfit: orderReq.takeProfit,
-    leverage: effLev,
-    feesUsd: feeUsd,
-    slippageUsd: slipUsd,
-    status: 'FILLED',
-    mode: 'PAPER',
-    strategyName: orderReq.strategyName || 'Autonomous Alpha',
-    riskDecision: riskCheck.decision,
-    createdAtUtc: nowIso,
-  });
-
   const newPos: Position = {
     id: `POS-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
     symbol: orderReq.symbol,
@@ -1431,19 +1530,34 @@ function executeRiskVerifiedPaperOrder(params: {
     mode: 'PAPER',
     openedAtUtc: nowIso,
   };
-  upsertPosition(newPos);
 
-  const portfolio = getPortfolioSummary();
-  portfolio.realizedPnlUsd = Number((portfolio.realizedPnlUsd - feeUsd).toFixed(2));
-  portfolio.totalFeesUsd = Number((portfolio.totalFeesUsd + feeUsd).toFixed(2));
-  savePortfolioSummary(portfolio);
-
-  appendAuditLog({
-    category: 'ORDER',
-    severity: 'INFO',
-    actor,
-    action: auditAction,
-    details: `Khớp lệnh tự động ${orderReq.side} ${riskCheck.recommendedQuantity} ${orderReq.symbol} @ $${execPrice} (R:R ${riskCheck.riskRewardRatio}, Fee $${feeUsd}).`,
+  openPositionAtomically({
+    order: {
+      id: orderId,
+      idempotencyKey: orderReq.idempotencyKey,
+      symbol: orderReq.symbol,
+      exchange: orderReq.exchange,
+      marketType: orderReq.marketType,
+      side: orderReq.side,
+      orderType: orderReq.orderType,
+      quantity: riskCheck.recommendedQuantity,
+      price: execPrice,
+      stopLoss: orderReq.stopLoss,
+      takeProfit: orderReq.takeProfit,
+      leverage: effLev,
+      feesUsd: feeUsd,
+      slippageUsd: slipUsd,
+      status: 'FILLED',
+      mode: 'PAPER',
+      strategyName: orderReq.strategyName || 'Autonomous Alpha',
+      riskDecision: riskCheck.decision,
+      createdAtUtc: nowIso,
+    },
+    position: newPos,
+    feeUsd,
+    auditActor: actor,
+    auditAction,
+    auditDetails: `Khớp lệnh tự động ${orderReq.side} ${riskCheck.recommendedQuantity} ${orderReq.symbol} @ $${execPrice} (R:R ${riskCheck.riskRewardRatio}, Fee $${feeUsd}).`,
   });
 
   return { orderId, position: newPos, execPrice, feeUsd };
@@ -1976,6 +2090,7 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     idempotencyKey: `PROP-EXEC-${proposal.id}`,
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
+    tickerTimestampUtc: ticker.timestampUtc,
   };
 
   const riskCheck = evaluateOrderRisk(orderReq, riskConfig, {
@@ -2544,6 +2659,7 @@ app.post('/api/orders', async (req, res) => {
     idempotencyKey,
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
+    tickerTimestampUtc: ticker.timestampUtc,
   };
 
   const riskCheck = evaluateOrderRisk(orderReq, riskConfig, {
@@ -2658,66 +2774,41 @@ app.patch('/api/positions/:id', (req, res) => {
 
 app.post('/api/positions/:id/close', (req, res) => {
   const { id } = req.params;
-  const positions = getOpenPositions();
-  const pos = positions.find((p) => p.id === id);
-  if (!pos) {
-    res.status(404).json({ error: 'Không tìm thấy vị thế đang mở.' });
+  const closeResult = closePositionAtomically({
+    positionId: id,
+    resolveClosePrice: (pos) => {
+      const ticker = marketFeed.getTicker(pos.symbol, pos.marketType, pos.exchange);
+      return ticker && ticker.lastPrice > 0 ? ticker.lastPrice : pos.markPrice;
+    },
+    closeReason: 'MANUAL_CLOSE',
+    idempotencyPrefix: 'CLOSE-MANUAL',
+    actor: 'USER',
+    auditAction: 'CLOSE_POSITION',
+  });
+
+  if (!closeResult.closed) {
+    res.status(404).json({ ok: false, error: 'Không tìm thấy vị thế đang mở hoặc vị thế vừa được đóng.' });
     return;
   }
 
-  const ticker = marketFeed.getTicker(pos.symbol, pos.marketType, pos.exchange);
-  const closePrice = ticker && ticker.lastPrice > 0 ? ticker.lastPrice : pos.markPrice;
-  const gross =
-    pos.side === 'LONG'
-      ? (closePrice - pos.entryPrice) * pos.quantity
-      : (pos.entryPrice - closePrice) * pos.quantity;
-  const fee = Number((pos.quantity * closePrice * 0.0005).toFixed(2));
-  const net = Number((gross - fee).toFixed(2));
-
-  const portfolio = getPortfolioSummary();
-  portfolio.realizedPnlUsd = Number((portfolio.realizedPnlUsd + net).toFixed(2));
-  portfolio.totalFeesUsd = Number((portfolio.totalFeesUsd + fee).toFixed(2));
-  if (net >= 0) portfolio.winCount += 1;
-  else portfolio.lossCount += 1;
-  portfolio.totalClosedTrades += 1;
-  portfolio.winRatePct = Number(
-    ((portfolio.winCount / portfolio.totalClosedTrades) * 100).toFixed(1),
-  );
-  savePortfolioSummary(portfolio);
-  deletePosition(pos.id);
-  try {
-    insertOrder({
-      id: `ORD-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`,
-      idempotencyKey: `CLOSE-MANUAL-${pos.id}`,
-      symbol: pos.symbol,
-      exchange: pos.exchange,
-      marketType: pos.marketType,
-      side: pos.side === 'LONG' ? 'SHORT' : 'LONG',
-      orderType: 'MARKET',
-      quantity: pos.quantity,
-      price: closePrice,
-      stopLoss: pos.stopLoss,
-      takeProfit: pos.takeProfit,
-      leverage: pos.leverage,
-      feesUsd: fee,
-      slippageUsd: 0,
-      status: 'FILLED',
-      mode: pos.mode,
-      strategyName: `${pos.strategyName} [MANUAL_CLOSE]`,
-      riskDecision: 'APPROVE',
-      createdAtUtc: new Date().toISOString(),
-    });
-  } catch {
-    // Ignore if idempotency close record already exists
-  }
-
-  appendAuditLog({
-    category: 'ORDER',
-    severity: 'INFO',
-    actor: 'USER',
-    action: 'CLOSE_POSITION',
-    details: `Đóng vị thế ${pos.symbol} ${pos.side} @ $${closePrice}, PnL ròng $${net}.`,
-  });
+  const pos = closeResult.position;
+  const receipt: ClosePositionReceipt = {
+    positionId: pos.id,
+    symbol: pos.symbol,
+    exchange: pos.exchange,
+    marketType: pos.marketType,
+    side: pos.side,
+    leverage: pos.leverage,
+    quantity: pos.quantity,
+    entryPrice: pos.entryPrice,
+    closePrice: closeResult.closePrice,
+    grossPnlUsd: closeResult.grossPnlUsd,
+    closeFeeUsd: closeResult.closeFeeUsd,
+    realizedNetUsd: closeResult.realizedNetUsd,
+    rMultiple: closeResult.rMultiple,
+    closeReason: 'MANUAL_CLOSE',
+    closedAtUtc: closeResult.closedAtUtc,
+  };
 
   const autoCfg = getAutoExecutionConfig();
   autoExecRuntime.symbolCooldowns[pos.symbol] =
@@ -2734,7 +2825,9 @@ app.post('/api/positions/:id/close', (req, res) => {
     scheduleAutonomousReplenishment(1200);
   }
   res.json({
-    closedNetPnlUsd: net,
+    ok: true,
+    closedNetPnlUsd: closeResult.realizedNetUsd,
+    receipt,
     portfolio: synced.portfolio,
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
@@ -2820,7 +2913,8 @@ app.post('/api/mode', (req, res) => {
 
   if (requested === 'FULL_AUTO') {
     const tickers = marketFeed.getTickers();
-    const healthy = tickers.slice(0, 4).every((t) => validateTickerIntegrity(t).valid);
+    const healthy =
+      tickers.length > 0 && tickers.slice(0, 4).every((t) => validateTickerIntegrity(t).valid);
     if (!healthy) {
       res.status(400).json({ error: 'Không thể bật FULL_AUTO khi dữ liệu thị trường chưa hợp lệ.' });
       return;
@@ -3469,7 +3563,7 @@ app.get('/api/audit-logs', (_req, res) => {
 
 async function startServer() {
   const server = http.createServer(app);
-  const wss = new WebSocketServer({ noServer: true });
+  const wss = new WebSocketServer({ noServer: true, maxPayload: 16 * 1024 });
 
   wss.on('error', () => {
     // non-fatal WebSocketServer error

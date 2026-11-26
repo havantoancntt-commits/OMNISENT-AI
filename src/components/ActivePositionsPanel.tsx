@@ -1,17 +1,25 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   ArrowUpRight,
   Check,
+  CheckCircle2,
   LineChart,
   Shield,
   SlidersHorizontal,
   TrendingDown,
   TrendingUp,
+  X,
   XCircle,
 } from 'lucide-react';
 import { computePositionTelemetry } from '../engine/positionMetrics';
-import type { MarketType, Position } from '../engine/types';
+import type {
+  ClosePositionReceipt,
+  ClosePositionResponse,
+  MarketType,
+  Position,
+} from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
 
 interface ActivePositionsPanelProps {
@@ -21,7 +29,7 @@ interface ActivePositionsPanelProps {
     label: string;
     onClick: () => void;
   };
-  onClosePosition: (id: string) => Promise<void> | void;
+  onClosePosition: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp?: (
     id: string,
     stopLoss: number,
@@ -37,6 +45,11 @@ function formatPrice(value: number, decimals: number): string {
     minimumFractionDigits: decimals,
     maximumFractionDigits: decimals,
   });
+}
+
+function formatSignedUsd(value: number): string {
+  const sign = value >= 0 ? '+' : '-';
+  return `${sign}$${Math.abs(value).toFixed(2)}`;
 }
 
 export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
@@ -56,12 +69,49 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
   const [editError, setEditError] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
+  // Smart Close Confirmation Dialog & Post-Close Settlement Notification state
+  const [confirmTargetId, setConfirmTargetId] = useState<string | null>(null);
+  const [closeError, setCloseError] = useState<string | null>(null);
+  const [settlementNotice, setSettlementNotice] = useState<ClosePositionReceipt | null>(null);
+
   // Refresh elapsed open duration every 15s while trades are active
   useEffect(() => {
     if (positions.length === 0) return;
     const id = window.setInterval(() => setNowMs(Date.now()), 15_000);
     return () => window.clearInterval(id);
   }, [positions.length]);
+
+  // Keep modal target synchronized with live positions list
+  const confirmTarget = confirmTargetId
+    ? positions.find((p) => p.id === confirmTargetId) ?? null
+    : null;
+
+  useEffect(() => {
+    if (confirmTargetId && !confirmTarget && busyId !== confirmTargetId) {
+      setConfirmTargetId(null);
+      setCloseError(null);
+    }
+  }, [confirmTargetId, confirmTarget, busyId]);
+
+  // Escape key closes confirmation modal cleanly when not submitting
+  useEffect(() => {
+    if (!confirmTargetId) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && !busyId) {
+        setConfirmTargetId(null);
+        setCloseError(null);
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [confirmTargetId, busyId]);
+
+  // Auto-dismiss settlement notification banner after 12s
+  useEffect(() => {
+    if (!settlementNotice) return;
+    const timer = window.setTimeout(() => setSettlementNotice(null), 12_000);
+    return () => window.clearTimeout(timer);
+  }, [settlementNotice]);
 
   const totalNotional = positions.reduce(
     (sum, p) => sum + p.quantity * (p.markPrice > 0 ? p.markPrice : p.entryPrice),
@@ -95,24 +145,81 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
     }
   };
 
-  const handleMoveBreakeven = async (p: Position) => {
+  const handleMoveBreakeven = async (p: Position, closeModalOnSuccess = false) => {
     if (!onUpdateSlTp) return;
     setBusyId(p.id);
     setEditError(null);
+    setCloseError(null);
     const res = await onUpdateSlTp(p.id, p.entryPrice, p.takeProfit);
     setBusyId(null);
     if (!res.ok) {
-      setEditingId(p.id);
-      setDraftSl(String(p.stopLoss));
-      setDraftTp(String(p.takeProfit));
-      setEditError(res.error || t('pos.err.breakeven'));
+      if (closeModalOnSuccess) {
+        setCloseError(res.error || t('pos.err.breakeven'));
+      } else {
+        setEditingId(p.id);
+        setDraftSl(String(p.stopLoss));
+        setDraftTp(String(p.takeProfit));
+        setEditError(res.error || t('pos.err.breakeven'));
+      }
+    } else if (closeModalOnSuccess) {
+      setConfirmTargetId(null);
+      setCloseError(null);
     }
   };
 
-  const handleClose = async (id: string) => {
-    setBusyId(id);
-    await onClosePosition(id);
-    setBusyId(null);
+  const openCloseModal = (p: Position) => {
+    setCloseError(null);
+    setConfirmTargetId(p.id);
+  };
+
+  const handleConfirmClose = async (p: Position) => {
+    setBusyId(p.id);
+    setCloseError(null);
+    const liveMark = p.markPrice > 0 ? p.markPrice : p.entryPrice;
+    const estGross = Number(
+      (p.side === 'LONG'
+        ? (liveMark - p.entryPrice) * p.quantity
+        : (p.entryPrice - liveMark) * p.quantity
+      ).toFixed(2),
+    );
+    const estFee = Number((p.quantity * liveMark * 0.0005).toFixed(2));
+    const estNet = Number((estGross - estFee).toFixed(2));
+    const fallbackTel = computePositionTelemetry(p, nowMs);
+
+    try {
+      const result = await onClosePosition(p.id);
+      if (result && result.ok === false) {
+        setCloseError(result.error || t('pos.closeModal.errFallback'));
+        setBusyId(null);
+        return;
+      }
+
+      const receipt: ClosePositionReceipt = result?.receipt ?? {
+        positionId: p.id,
+        symbol: p.symbol,
+        exchange: p.exchange,
+        marketType: p.marketType,
+        side: p.side,
+        leverage: p.leverage,
+        quantity: p.quantity,
+        entryPrice: p.entryPrice,
+        closePrice: liveMark,
+        grossPnlUsd: estGross,
+        closeFeeUsd: estFee,
+        realizedNetUsd:
+          typeof result?.closedNetPnlUsd === 'number' ? result.closedNetPnlUsd : estNet,
+        rMultiple: fallbackTel.rMultiple,
+        closeReason: 'MANUAL_CLOSE',
+        closedAtUtc: new Date().toISOString(),
+      };
+
+      setConfirmTargetId(null);
+      setSettlementNotice(receipt);
+    } catch {
+      setCloseError(t('pos.closeModal.errFallback'));
+    } finally {
+      setBusyId(null);
+    }
   };
 
   const healthMeta = (
@@ -129,6 +236,38 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
         return { label: t('pos.health.MONITORING'), cls: 'text-cyan-300' };
     }
   };
+
+  // Precompute modal telemetry when confirmTarget is open
+  const modalMeta = confirmTarget
+    ? (() => {
+        const tel = computePositionTelemetry(confirmTarget, nowMs);
+        const liveMark =
+          confirmTarget.markPrice > 0 ? confirmTarget.markPrice : confirmTarget.entryPrice;
+        const grossPnlUsd = Number(
+          (confirmTarget.side === 'LONG'
+            ? (liveMark - confirmTarget.entryPrice) * confirmTarget.quantity
+            : (confirmTarget.entryPrice - liveMark) * confirmTarget.quantity
+          ).toFixed(2),
+        );
+        const estCloseFeeUsd = Number((confirmTarget.quantity * liveMark * 0.0005).toFixed(2));
+        const estNetPnlUsd = Number((grossPnlUsd - estCloseFeeUsd).toFixed(2));
+        const initialRiskPerUnit = Math.abs(
+          confirmTarget.entryPrice - (confirmTarget.initialStopLoss ?? confirmTarget.stopLoss),
+        );
+        const initialRiskUsd = initialRiskPerUnit * confirmTarget.quantity;
+        const estRMultiple =
+          initialRiskUsd > 0 ? Number((estNetPnlUsd / initialRiskUsd).toFixed(2)) : tel.rMultiple;
+        return {
+          position: confirmTarget,
+          tel,
+          liveMark,
+          grossPnlUsd,
+          estCloseFeeUsd,
+          estNetPnlUsd,
+          estRMultiple,
+        };
+      })()
+    : null;
 
   return (
     <section
@@ -164,7 +303,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                     totalUnrealized >= 0 ? 'text-emerald-400' : 'text-rose-400'
                   }
                 >
-                  {totalUnrealized >= 0 ? '+' : ''}${totalUnrealized.toFixed(2)}
+                  {formatSignedUsd(totalUnrealized)}
                 </strong>
               </span>
             </p>
@@ -186,6 +325,86 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           </button>
         )}
       </div>
+
+      {/* Post-Close Settlement Notification Card */}
+      {settlementNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="settlement-notice-banner"
+          className={`mt-3 flex items-start justify-between gap-3 rounded-xl border p-3.5 ${
+            settlementNotice.realizedNetUsd >= 0
+              ? 'border-emerald-500/40 bg-emerald-500/10'
+              : 'border-rose-500/40 bg-rose-500/10'
+          }`}
+        >
+          <div className="flex items-start gap-2.5 min-w-0">
+            <CheckCircle2
+              className={`mt-0.5 h-4 w-4 shrink-0 ${
+                settlementNotice.realizedNetUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
+              }`}
+            />
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+                {t('pos.settlement.badge')}
+              </p>
+              <div className="mt-0.5 flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5">
+                <span className="font-display text-sm font-bold text-slate-50">
+                  {t('pos.settlement.title', {
+                    side: settlementNotice.side,
+                    symbol: settlementNotice.symbol,
+                    leverage: settlementNotice.leverage,
+                  })}
+                </span>
+                <span
+                  className={`font-mono text-sm font-bold tabular-nums ${
+                    settlementNotice.realizedNetUsd >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                  }`}
+                >
+                  {formatSignedUsd(settlementNotice.realizedNetUsd)}
+                </span>
+              </div>
+              <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-300">
+                {t('pos.settlement.meta', {
+                  closePrice: formatPrice(
+                    settlementNotice.closePrice,
+                    computePositionTelemetry(
+                      {
+                        ...settlementNotice,
+                        id: settlementNotice.positionId,
+                        markPrice: settlementNotice.closePrice,
+                        stopLoss: settlementNotice.entryPrice,
+                        takeProfit: settlementNotice.entryPrice,
+                        marginUsd: 1,
+                        unrealizedPnlUsd: 0,
+                        unrealizedPnlPct: 0,
+                        liquidationPrice: null,
+                        fundingPaidUsd: 0,
+                        strategyName: '',
+                        mode: 'PAPER',
+                        openedAtUtc: settlementNotice.closedAtUtc,
+                      },
+                      nowMs,
+                    ).priceDecimals,
+                  ),
+                  fee: settlementNotice.closeFeeUsd.toFixed(2),
+                  r: `${settlementNotice.rMultiple >= 0 ? '+' : ''}${settlementNotice.rMultiple.toFixed(2)}`,
+                  time: settlementNotice.closedAtUtc.slice(11, 19),
+                })}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={() => setSettlementNotice(null)}
+            aria-label={t('pos.settlement.dismissAria')}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800/70 hover:text-slate-100"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
 
       {positions.length === 0 ? (
         <div className="mt-4 flex flex-col items-center justify-center rounded-lg border border-dashed border-slate-800 py-8 px-4 text-center">
@@ -443,7 +662,8 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                   <button
                     type="button"
                     disabled={isBusy}
-                    onClick={() => handleClose(p.id)}
+                    data-testid={`close-position-btn-${p.id}`}
+                    onClick={() => openCloseModal(p)}
                     className="ml-auto flex min-h-[38px] items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/15 px-3 py-1.5 text-xs font-semibold text-rose-200 whitespace-nowrap shrink-0 hover:bg-rose-500/25 disabled:opacity-50"
                   >
                     <XCircle className="h-3.5 w-3.5" />
@@ -505,6 +725,241 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
               </article>
             );
           })}
+        </div>
+      )}
+
+      {/* Smart Close-Position Confirmation Modal */}
+      {modalMeta && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="close-pos-modal-title"
+          data-testid="close-position-modal"
+          onClick={() => {
+            if (!busyId) {
+              setConfirmTargetId(null);
+              setCloseError(null);
+            }
+          }}
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-[2px]"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-700/90 bg-[#0E1522] p-5 shadow-2xl"
+          >
+            {/* Modal Header */}
+            <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
+              <div className="min-w-0">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span
+                    className={`inline-flex items-center gap-1 font-mono text-xs font-bold ${
+                      modalMeta.position.side === 'LONG' ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {modalMeta.position.side === 'LONG' ? (
+                      <TrendingUp className="h-3.5 w-3.5" />
+                    ) : (
+                      <TrendingDown className="h-3.5 w-3.5" />
+                    )}
+                    {modalMeta.position.side}
+                  </span>
+                  <h3
+                    id="close-pos-modal-title"
+                    className="font-display text-base font-bold text-slate-50"
+                  >
+                    {t('pos.closeModal.title')} · {modalMeta.position.symbol}
+                  </h3>
+                  <span className="font-mono text-xs font-semibold text-cyan-300 tabular-nums">
+                    {modalMeta.position.leverage}x
+                  </span>
+                </div>
+                <p className="mt-1 text-xs text-slate-400">
+                  {t('pos.closeModal.subtitle')}
+                </p>
+                <p className="mt-1 font-mono text-[11px] text-slate-400">
+                  {modalMeta.position.exchange} · {modalMeta.position.marketType} · {modalMeta.position.mode} ·{' '}
+                  {t('pos.openedAgo', {
+                    duration: modalMeta.tel.heldDurationLabel,
+                    time: modalMeta.position.openedAtUtc.slice(11, 19),
+                  })}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={Boolean(busyId)}
+                onClick={() => {
+                  setConfirmTargetId(null);
+                  setCloseError(null);
+                }}
+                aria-label={t('pos.closeModal.closeAria')}
+                className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-slate-100 disabled:opacity-50"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Live Financial Settlement Breakdown */}
+            <div className="mt-4 rounded-xl border border-slate-800 bg-[#070B12] p-3.5">
+              <div className="flex items-center justify-between border-b border-slate-800/80 pb-2.5">
+                <span className="text-xs text-slate-400">{t('pos.closeModal.estNetPnl')}</span>
+                <div className="text-right font-mono tabular-nums">
+                  <span
+                    className={`text-lg font-bold ${
+                      modalMeta.estNetPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {formatSignedUsd(modalMeta.estNetPnlUsd)}
+                  </span>
+                  <span
+                    className={`ml-2 text-xs font-semibold ${
+                      modalMeta.position.unrealizedPnlPct >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                    }`}
+                  >
+                    ({modalMeta.position.unrealizedPnlPct >= 0 ? '+' : ''}
+                    {modalMeta.position.unrealizedPnlPct.toFixed(2)}% ROE)
+                  </span>
+                </div>
+              </div>
+
+              <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2.5 text-xs font-mono tabular-nums">
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.entryMark')}
+                  </dt>
+                  <dd className="mt-0.5 text-slate-200">
+                    ${formatPrice(modalMeta.position.entryPrice, modalMeta.tel.priceDecimals)} →{' '}
+                    <strong className="text-cyan-300">
+                      ${formatPrice(modalMeta.liveMark, modalMeta.tel.priceDecimals)}
+                    </strong>
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.qtyNotional')}
+                  </dt>
+                  <dd className="mt-0.5 text-slate-200">
+                    {modalMeta.position.quantity} · $
+                    {modalMeta.tel.notionalUsd.toLocaleString('en-US', {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.grossPnl')}
+                  </dt>
+                  <dd
+                    className={`mt-0.5 font-semibold ${
+                      modalMeta.grossPnlUsd >= 0 ? 'text-emerald-400' : 'text-rose-400'
+                    }`}
+                  >
+                    {formatSignedUsd(modalMeta.grossPnlUsd)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.estFee')}
+                  </dt>
+                  <dd className="mt-0.5 text-amber-300">
+                    -${modalMeta.estCloseFeeUsd.toFixed(2)}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.rMultiple')}
+                  </dt>
+                  <dd
+                    className={`mt-0.5 font-semibold ${
+                      modalMeta.estRMultiple >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                    }`}
+                  >
+                    {modalMeta.estRMultiple >= 0 ? '+' : ''}
+                    {modalMeta.estRMultiple.toFixed(2)}R
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">SL / TP</dt>
+                  <dd className="mt-0.5 text-slate-300">
+                    ${formatPrice(modalMeta.position.stopLoss, modalMeta.tel.priceDecimals)} / $
+                    {formatPrice(modalMeta.position.takeProfit, modalMeta.tel.priceDecimals)}
+                  </dd>
+                </div>
+              </dl>
+            </div>
+
+            {/* Smart Contextual Advisory Banner */}
+            {modalMeta.estNetPnlUsd < 0 && modalMeta.tel.slDistancePct > 0.25 && (
+              <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/35 bg-amber-500/10 p-3 text-xs text-amber-200">
+                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                <span>
+                  {t('pos.closeModal.lossWarning', {
+                    net: formatSignedUsd(modalMeta.estNetPnlUsd),
+                    sl: formatPrice(modalMeta.position.stopLoss, modalMeta.tel.priceDecimals),
+                  })}
+                </span>
+              </div>
+            )}
+
+            {modalMeta.estNetPnlUsd >= 0 && modalMeta.tel.canMoveBreakeven && onUpdateSlTp && (
+              <div className="mt-3 rounded-xl border border-emerald-500/35 bg-emerald-500/10 p-3 text-xs text-emerald-200">
+                <p className="leading-relaxed">
+                  {t('pos.closeModal.profitAdvice', {
+                    r: `+${modalMeta.estRMultiple.toFixed(2)}`,
+                  })}
+                </p>
+                <button
+                  type="button"
+                  disabled={busyId === modalMeta.position.id}
+                  onClick={() => handleMoveBreakeven(modalMeta.position, true)}
+                  className="mt-2 inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-emerald-500/50 bg-emerald-500/20 px-3 text-xs font-semibold text-emerald-200 hover:bg-emerald-500/30 disabled:opacity-50"
+                >
+                  <Shield className="h-3.5 w-3.5" />
+                  <span>{t('pos.closeModal.altBreakevenBtn')}</span>
+                </button>
+              </div>
+            )}
+
+            {closeError && (
+              <div className="mt-3 rounded-lg border border-rose-500/40 bg-rose-500/10 px-3 py-2 text-xs text-rose-300">
+                {closeError}
+              </div>
+            )}
+
+            {/* Modal Footer CTAs */}
+            <div className="mt-4 flex flex-col-reverse gap-2 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                disabled={busyId === modalMeta.position.id}
+                data-testid="close-modal-keep-btn"
+                onClick={() => {
+                  setConfirmTargetId(null);
+                  setCloseError(null);
+                }}
+                className="min-h-[44px] rounded-lg border border-slate-700 bg-slate-900 px-4 text-xs font-semibold text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+              >
+                {t('pos.closeModal.keepBtn')}
+              </button>
+              <button
+                type="button"
+                disabled={busyId === modalMeta.position.id}
+                data-testid="close-modal-confirm-btn"
+                onClick={() => handleConfirmClose(modalMeta.position)}
+                className={`flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg px-4 text-xs font-semibold text-white disabled:opacity-50 ${
+                  modalMeta.estNetPnlUsd >= 0
+                    ? 'bg-emerald-600 hover:bg-emerald-500'
+                    : 'bg-rose-600 hover:bg-rose-500'
+                }`}
+              >
+                <XCircle className="h-4 w-4" />
+                <span>
+                  {busyId === modalMeta.position.id
+                    ? t('pos.closeModal.confirmingBtn')
+                    : `${t('pos.closeModal.confirmBtn')} (${formatSignedUsd(modalMeta.estNetPnlUsd)})`}
+                </span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </section>

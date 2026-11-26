@@ -24,6 +24,7 @@ import {
 } from '../engine/priceFeedGuard';
 import type {
   Candle,
+  ClosePositionResponse,
   FullMarketOpportunity,
   MarketTicker,
   MarketType,
@@ -63,7 +64,7 @@ interface MarketScannerProps {
   onRunPipeline?: (symbol: string, marketType: MarketType, exchange?: string) => void;
   pipelineLoading?: boolean;
   onOrderPlaced: () => void;
-  onClosePosition?: (id: string) => Promise<void> | void;
+  onClosePosition?: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp?: (id: string, stopLoss: number, takeProfit: number) => Promise<{ ok: boolean; error?: string }>;
 }
 

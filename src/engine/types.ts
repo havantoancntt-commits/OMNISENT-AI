@@ -217,6 +217,8 @@ export interface OrderRequest {
   idempotencyKey: string;
   dataStatus: DataSourceStatus;
   tradingStatus?: 'TRADING' | 'HALTED' | 'DELISTING_RISK';
+  tickerTimestampUtc?: number;
+  nowMs?: number;
 }
 
 export interface RiskContext {
@@ -275,6 +277,31 @@ export interface Position {
   strategyName: string;
   mode: 'PAPER' | 'LIVE';
   openedAtUtc: string;
+}
+
+export interface ClosePositionReceipt {
+  positionId: string;
+  symbol: string;
+  exchange: string;
+  marketType: MarketType;
+  side: OrderSide;
+  leverage: number;
+  quantity: number;
+  entryPrice: number;
+  closePrice: number;
+  grossPnlUsd: number;
+  closeFeeUsd: number;
+  realizedNetUsd: number;
+  rMultiple: number;
+  closeReason: 'MANUAL_CLOSE' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_PROFIT';
+  closedAtUtc: string;
+}
+
+export interface ClosePositionResponse {
+  ok: boolean;
+  closedNetPnlUsd?: number;
+  receipt?: ClosePositionReceipt;
+  error?: string;
 }
 
 export interface OrderRecord {

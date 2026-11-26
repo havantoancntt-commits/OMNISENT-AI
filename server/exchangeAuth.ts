@@ -98,19 +98,37 @@ export function signGateIoV4(params: {
   return crypto.createHmac('sha512', params.apiSecret).update(prehash).digest('hex');
 }
 
+let lastKrakenNonce = 0;
+
+export function generateMonotonicNonce(): string {
+  const micro = Date.now() * 1000;
+  lastKrakenNonce = micro > lastKrakenNonce ? micro : lastKrakenNonce + 1;
+  return String(lastKrakenNonce);
+}
+
+export function sanitizeExchangeErrorText(message: string): string {
+  return message
+    .replace(/([?&](?:client_secret|client_id|signature|Signature|apiKey|AccessKeyId|api_secret)=)[^&\s]+/gi, '$1[REDACTED]')
+    .slice(0, 260);
+}
+
 export function signKraken(params: {
   urlPath: string;
   nonce: string;
   postData: string;
   base64Secret: string;
 }): string {
+  const cleanB64 = params.base64Secret.trim();
+  const decoded = Buffer.from(cleanB64, 'base64');
+  if (!cleanB64 || decoded.length === 0 || !/^[A-Za-z0-9+/=]+$/.test(cleanB64)) {
+    throw new Error('Kraken API Secret phải là chuỗi Base64 hợp lệ.');
+  }
   const sha256Digest = crypto
     .createHash('sha256')
     .update(`${params.nonce}${params.postData}`)
     .digest();
-  const secretBuf = Buffer.from(params.base64Secret, 'base64');
   return crypto
-    .createHmac('sha512', secretBuf)
+    .createHmac('sha512', decoded)
     .update(Buffer.concat([Buffer.from(params.urlPath, 'utf8'), sha256Digest]))
     .digest('base64');
 }
@@ -312,6 +330,85 @@ export function detectWithdrawalPermission(
     };
   }
 
+  if (id === 'kucoin') {
+    const dataArr = Array.isArray(obj.data) ? obj.data : [];
+    const first = (dataArr[0] ?? obj.data ?? obj) as Record<string, unknown>;
+    const permStr = String(first.permission ?? first.permissions ?? '').toLowerCase();
+    if (permStr.includes('withdraw') || permStr.includes('transfer')) {
+      return {
+        hasWithdrawal: true,
+        reason: `KuCoin API Key có quyền nhạy cảm "${permStr}" (Withdraw/Transfer).`,
+      };
+    }
+    const acctType = String(first.type ?? '').toLowerCase();
+    return {
+      hasWithdrawal: false,
+      detectedPermissions: {
+        read: true,
+        spotTrade: permStr ? permStr.includes('spot') || permStr.includes('trade') : acctType === 'trade',
+        futuresTrade: permStr ? permStr.includes('future') : false,
+      },
+    };
+  }
+
+  if (id === 'gateio') {
+    const permStr = String(obj.permissions ?? obj.perm ?? '').toLowerCase();
+    if (permStr.includes('withdraw') || obj.withdraw === true) {
+      return {
+        hasWithdrawal: true,
+        reason: 'Gate.io API Key đang bật quyền Withdraw.',
+      };
+    }
+    return {
+      hasWithdrawal: false,
+      detectedPermissions: {
+        read: true,
+        spotTrade: true,
+        futuresTrade: false,
+      },
+    };
+  }
+
+  if (id === 'coinbase') {
+    const scopes = Array.isArray(obj.scopes)
+      ? obj.scopes.map((s) => String(s).toLowerCase())
+      : typeof obj.scope === 'string'
+        ? obj.scope.toLowerCase().split(/[\s,]+/)
+        : [];
+    if (scopes.some((s) => s.includes('withdraw') || s.includes('wallet:transactions:send'))) {
+      return {
+        hasWithdrawal: true,
+        reason: 'Coinbase API Key có scope gửi/rút tiền (send/withdraw).',
+      };
+    }
+    return {
+      hasWithdrawal: false,
+      detectedPermissions: {
+        read: true,
+        spotTrade: true,
+        futuresTrade: false,
+      },
+    };
+  }
+
+  if (id === 'htx' || id === 'kraken') {
+    const serialized = JSON.stringify(obj).toLowerCase();
+    if (serialized.includes('"canwithdraw":true') || serialized.includes('"withdraw":true')) {
+      return {
+        hasWithdrawal: true,
+        reason: `${exchangeId.toUpperCase()} API Key báo quyền rút tiền đang bật.`,
+      };
+    }
+    return {
+      hasWithdrawal: false,
+      detectedPermissions: {
+        read: true,
+        spotTrade: true,
+        futuresTrade: false,
+      },
+    };
+  }
+
   if (obj.canWithdraw === true || obj.enableWithdrawals === true) {
     return {
       hasWithdrawal: true,
@@ -356,11 +453,12 @@ async function fetchWithTiming(url: string, init: RequestInit): Promise<RawHttpR
       latencyMs: Math.max(1, Date.now() - started),
     };
   } catch (err) {
+    const rawMsg = err instanceof Error ? err.message : 'Network error';
     return {
       status: null,
       text: '',
       json: null,
-      networkError: err instanceof Error ? err.message : 'Network error',
+      networkError: sanitizeExchangeErrorText(rawMsg),
       latencyMs: Math.max(1, Date.now() - started),
     };
   }
@@ -428,7 +526,7 @@ function classifyRestrictionOrAuthError(
     };
   }
 
-  const msg =
+  const rawMsg =
     fallbackAuthMessage ||
     (resp.json &&
       String(
@@ -449,7 +547,7 @@ function classifyRestrictionOrAuthError(
     verificationStatus,
     latencyMs: resp.latencyMs,
     httpStatus: status || null,
-    message: `Xác thực ${exchangeId} thất bại: ${msg}`,
+    message: `Xác thực ${exchangeId} thất bại: ${sanitizeExchangeErrorText(rawMsg)}`,
   };
 }
 
@@ -679,14 +777,28 @@ export async function verifyExchangeCredentials(input: {
 
     case 'kraken': {
       const urlPath = '/0/private/Balance';
-      const nonce = Date.now().toString();
+      const nonce = generateMonotonicNonce();
       const postData = `nonce=${nonce}`;
-      const apiSign = signKraken({
-        urlPath,
-        nonce,
-        postData,
-        base64Secret: apiSecret,
-      });
+      let apiSign: string;
+      try {
+        apiSign = signKraken({
+          urlPath,
+          nonce,
+          postData,
+          base64Secret: apiSecret,
+        });
+      } catch (err) {
+        return {
+          ok: false,
+          exchangeId,
+          environment,
+          outcome: 'AUTH_FAILED',
+          verificationStatus: 'AUTH_FAILED',
+          latencyMs: 1,
+          httpStatus: null,
+          message: err instanceof Error ? err.message : 'Kraken API Secret không hợp lệ.',
+        };
+      }
       const resp = await fetchWithTiming(`https://api.kraken.com${urlPath}`, {
         method: 'POST',
         headers: {

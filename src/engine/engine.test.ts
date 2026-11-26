@@ -3503,6 +3503,145 @@ test('safeDisposeWebSocket absorbs CONNECTING termination errors without unhandl
   await new Promise<void>((resolve) => tcpServer.close(() => resolve()));
 });
 
+test('cryptoVault fails closed in strict production without persistent VAULT_ENCRYPTION_KEY', async () => {
+  const {
+    encryptSecretPayload,
+    decryptSecretPayload,
+    isPersistentVaultKeyConfigured,
+  } = await import('../../server/cryptoVault.ts');
+
+  const prodEnvMissing = { NODE_ENV: 'production' } as NodeJS.ProcessEnv;
+  assert.equal(isPersistentVaultKeyConfigured(prodEnvMissing), false);
+  assert.throws(
+    () =>
+      encryptSecretPayload(
+        { apiKey: 'prod-key-123456', apiSecret: 'prod-secret-123456' },
+        prodEnvMissing,
+      ),
+    /VAULT_ENCRYPTION_KEY/,
+  );
+
+  const prodEnvValid = {
+    NODE_ENV: 'production',
+    VAULT_ENCRYPTION_KEY: 'super-strong-production-vault-key-32bytes',
+  } as NodeJS.ProcessEnv;
+  assert.equal(isPersistentVaultKeyConfigured(prodEnvValid), true);
+  const cipherJson = encryptSecretPayload(
+    { apiKey: 'prod-key-123456', apiSecret: 'prod-secret-123456', passphrase: 'pass' },
+    prodEnvValid,
+  );
+  const decoded = decryptSecretPayload(cipherJson, prodEnvValid);
+  assert.equal(decoded.apiKey, 'prod-key-123456');
+  assert.equal(decoded.apiSecret, 'prod-secret-123456');
+  assert.equal(decoded.passphrase, 'pass');
+});
+
+test('exchangeAuth enforces monotonic Kraken nonces, expanded withdrawal detection, and secret redaction', async () => {
+  const {
+    generateMonotonicNonce,
+    signKraken,
+    detectWithdrawalPermission,
+    sanitizeExchangeErrorText,
+  } = await import('../../server/exchangeAuth.ts');
+
+  const n1 = BigInt(generateMonotonicNonce());
+  const n2 = BigInt(generateMonotonicNonce());
+  const n3 = BigInt(generateMonotonicNonce());
+  assert.ok(n2 > n1 && n3 > n2);
+
+  assert.throws(
+    () =>
+      signKraken({
+        urlPath: '/0/private/Balance',
+        nonce: String(n3),
+        postData: `nonce=${n3}`,
+        base64Secret: 'not valid base64 !!!',
+      }),
+    /Base64/,
+  );
+
+  assert.equal(
+    detectWithdrawalPermission('kucoin', { data: [{ permission: 'General,Trade,Withdraw' }] }).hasWithdrawal,
+    true,
+  );
+  assert.equal(
+    detectWithdrawalPermission('kucoin', { data: [{ permission: 'General,Trade' }] }).hasWithdrawal,
+    false,
+  );
+  assert.equal(
+    detectWithdrawalPermission('coinbase', { scopes: ['wallet:accounts:read', 'wallet:transactions:send'] }).hasWithdrawal,
+    true,
+  );
+  assert.equal(
+    detectWithdrawalPermission('gateio', { permissions: 'spot_trade,withdraw' }).hasWithdrawal,
+    true,
+  );
+
+  const cleaned = sanitizeExchangeErrorText(
+    'Failed GET https://www.deribit.com/api/v2/public/auth?client_id=abc&client_secret=topsecret123&signature=sigval',
+  );
+  assert.ok(!cleaned.includes('topsecret123'));
+  assert.ok(!cleaned.includes('sigval'));
+  assert.ok(cleaned.includes('[REDACTED]'));
+});
+
+test('geminiService validates synthesis JSON fences and recommendedAction allowlist', async () => {
+  const { parseValidatedSynthesisJson } = await import('../../server/geminiService.ts');
+
+  const fenced = parseValidatedSynthesisJson(
+    '```json\n{"executiveThesis":"Strong bullish HTF alignment.","regimeAssessment":"Trending H=0.63","keyRisks":["Funding elevated","Resistance ahead","Spread widening","Extra risk ignored"],"recommendedAction":"INVALID_EXEC_BYPASS"}\n```',
+    'fallback thesis',
+    'fallback regime',
+  );
+  assert.equal(fenced.executiveThesis, 'Strong bullish HTF alignment.');
+  assert.equal(fenced.recommendedAction, 'WAIT_CONFIRMATION');
+  assert.equal(fenced.keyRisks.length, 3);
+
+  const valid = parseValidatedSynthesisJson(
+    '{"recommendedAction":"FOLLOW_SIGNAL","keyRisks":["Slippage"]}',
+    'fallback thesis',
+    'fallback regime',
+  );
+  assert.equal(valid.recommendedAction, 'FOLLOW_SIGNAL');
+  assert.equal(valid.executiveThesis, 'fallback thesis');
+});
+
+test('riskEngine deterministically rejects stale market data older than 30s when tickerTimestampUtc is provided', () => {
+  const nowMs = Date.now();
+  const staleRes = evaluateOrderRisk(
+    {
+      symbol: 'BTC/USDT',
+      exchange: 'Binance',
+      marketType: 'PERPETUAL',
+      side: 'LONG',
+      orderType: 'MARKET',
+      entryPrice: 90_000,
+      stopLoss: 89_000,
+      takeProfit: 92_000,
+      leverage: 2,
+      idempotencyKey: 'FRESH-TEST-1',
+      dataStatus: 'LIVE_EXCHANGE',
+      tradingStatus: 'TRADING',
+      tickerTimestampUtc: nowMs - 45_000,
+      nowMs,
+    },
+    DEFAULT_RISK_CONFIG,
+    {
+      tradingMode: 'PAPER',
+      accountEquityUsd: 100_000,
+      availableBalanceUsd: 100_000,
+      dailyPnlPct: 0,
+      weeklyPnlPct: 0,
+      currentDrawdownPct: 0,
+      openPositions: [],
+      recentIdempotencyKeys: [],
+    },
+  );
+  assert.equal(staleRes.approved, false);
+  assert.ok(staleRes.reasons.some((r) => r.includes('30s')));
+});
+
+
 
 
 

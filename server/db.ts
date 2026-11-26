@@ -67,9 +67,75 @@ export function bumpStateRevision(): number {
   return stateRevision;
 }
 
+export function safeJsonParse<T>(raw: string | null | undefined, fallback: T): T {
+  if (!raw || typeof raw !== 'string') return fallback;
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+let transactionDepth = 0;
+export function runInTransaction<T>(fn: () => T): T {
+  if (transactionDepth > 0) {
+    transactionDepth += 1;
+    try {
+      return fn();
+    } finally {
+      transactionDepth -= 1;
+    }
+  }
+  db.exec('BEGIN IMMEDIATE;');
+  transactionDepth = 1;
+  try {
+    const result = fn();
+    db.exec('COMMIT;');
+    return result;
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK;');
+    } catch {
+      // ignore rollback error
+    }
+    throw err;
+  } finally {
+    transactionDepth = 0;
+  }
+}
+
+export function getDatabaseDiagnostics(): {
+  healthy: boolean;
+  journalMode: string;
+  isEphemeralStorage: boolean;
+  dataDir: string;
+  openPositions: number;
+  totalOrders: number;
+} {
+  const check = db.prepare('PRAGMA quick_check;').get() as { quick_check?: string } | undefined;
+  const journal = db.prepare('PRAGMA journal_mode;').get() as { journal_mode?: string } | undefined;
+  const posCount = (db.prepare('SELECT COUNT(*) as c FROM positions').get() as { c: number }).c;
+  const ordCount = (db.prepare('SELECT COUNT(*) as c FROM orders').get() as { c: number }).c;
+  const normalizedTmp = path.resolve(os.tmpdir());
+  const isEphemeralStorage =
+    Boolean(process.env.VERCEL || process.env.VERCEL_ENV) ||
+    path.resolve(DATA_DIR).startsWith(normalizedTmp);
+  return {
+    healthy: check?.quick_check === 'ok',
+    journalMode: journal?.journal_mode ?? 'unknown',
+    isEphemeralStorage,
+    dataDir: DATA_DIR,
+    openPositions: posCount,
+    totalOrders: ordCount,
+  };
+}
+
 export function initDatabase(): void {
   db.exec(`
     PRAGMA journal_mode = WAL;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA synchronous = NORMAL;
+    PRAGMA foreign_keys = ON;
 
     CREATE TABLE IF NOT EXISTS app_state (
       key TEXT PRIMARY KEY,
@@ -196,6 +262,19 @@ export function initDatabase(): void {
       payload_json TEXT NOT NULL
     );
   `);
+
+  try {
+    const integrity = db.prepare('PRAGMA quick_check;').all() as Array<{ quick_check?: string }>;
+    if (integrity.length !== 1 || integrity[0]?.quick_check !== 'ok') {
+      db.exec('REINDEX;');
+      db.exec('VACUUM;');
+    }
+  } catch (err) {
+    console.warn(
+      '[DB] Startup integrity check/repair warning:',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
 
   const nowIso = new Date().toISOString();
 
@@ -548,7 +627,7 @@ export function getTradingMode(): TradingMode {
   const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get('trading_mode') as
     | { value: string }
     | undefined;
-  return row ? (JSON.parse(row.value) as TradingMode) : 'FULL_AUTO';
+  return row ? safeJsonParse<TradingMode>(row.value, 'FULL_AUTO') : 'FULL_AUTO';
 }
 
 export function setTradingMode(mode: TradingMode): void {
@@ -561,72 +640,74 @@ export function setTradingMode(mode: TradingMode): void {
 }
 
 export function resetTradingSession(initialMode: TradingMode = 'FULL_AUTO'): void {
-  const nowMs = Date.now();
-  const nowIso = new Date(nowMs).toISOString();
-  db.exec(`
-    DELETE FROM positions;
-    DELETE FROM orders;
-    DELETE FROM signals;
-    DELETE FROM agent_logs;
-    DELETE FROM pnl_snapshots;
-    DELETE FROM auto_proposals;
-  `);
+  runInTransaction(() => {
+    const nowMs = Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    db.exec(`
+      DELETE FROM positions;
+      DELETE FROM orders;
+      DELETE FROM signals;
+      DELETE FROM agent_logs;
+      DELETE FROM pnl_snapshots;
+      DELETE FROM auto_proposals;
+    `);
 
-  setTradingMode(initialMode);
-  saveAutoExecutionConfig(syncAutoConfigWithTradingMode(initialMode, DEFAULT_AUTO_EXECUTION_CONFIG));
+    setTradingMode(initialMode);
+    saveAutoExecutionConfig(syncAutoConfigWithTradingMode(initialMode, DEFAULT_AUTO_EXECUTION_CONFIG));
 
-  const cleanPortfolio: PortfolioSummary = {
-    mode: initialMode,
-    initialEquityUsd: 100_000,
-    totalEquityUsd: 100_000,
-    availableBalanceUsd: 100_000,
-    usedMarginUsd: 0,
-    realizedPnlUsd: 0,
-    unrealizedPnlUsd: 0,
-    totalFeesUsd: 0,
-    dailyPnlPct: 0,
-    weeklyPnlPct: 0,
-    peakEquityUsd: 100_000,
-    currentDrawdownPct: 0,
-    winCount: 0,
-    lossCount: 0,
-    totalClosedTrades: 0,
-    winRatePct: null,
-  };
-  savePortfolioSummary(cleanPortfolio);
+    const cleanPortfolio: PortfolioSummary = {
+      mode: initialMode,
+      initialEquityUsd: 100_000,
+      totalEquityUsd: 100_000,
+      availableBalanceUsd: 100_000,
+      usedMarginUsd: 0,
+      realizedPnlUsd: 0,
+      unrealizedPnlUsd: 0,
+      totalFeesUsd: 0,
+      dailyPnlPct: 0,
+      weeklyPnlPct: 0,
+      peakEquityUsd: 100_000,
+      currentDrawdownPct: 0,
+      winCount: 0,
+      lossCount: 0,
+      totalClosedTrades: 0,
+      winRatePct: null,
+    };
+    savePortfolioSummary(cleanPortfolio);
 
-  recordPnlSnapshot({
-    timestampMs: nowMs,
-    timestampUtc: nowIso,
-    realizedPnlUsd: 0,
-    unrealizedPnlUsd: 0,
-    netPnlUsd: 0,
-    totalEquityUsd: 100_000,
-    openPositionsCount: 0,
-    eventTag: 'SESSION_RESET',
+    recordPnlSnapshot({
+      timestampMs: nowMs,
+      timestampUtc: nowIso,
+      realizedPnlUsd: 0,
+      unrealizedPnlUsd: 0,
+      netPnlUsd: 0,
+      totalEquityUsd: 100_000,
+      openPositionsCount: 0,
+      eventTag: 'SESSION_RESET',
+    });
+
+    const freshAgents = createInitialAgentRegistry(nowIso);
+    const insertAg = db.prepare('INSERT OR REPLACE INTO agent_registry (id, payload_json) VALUES (?, ?)');
+    for (const ag of freshAgents) {
+      insertAg.run(ag.id, JSON.stringify(ag));
+    }
+
+    appendAuditLog({
+      category: 'SYSTEM',
+      severity: 'INFO',
+      actor: 'USER',
+      action: 'SESSION_RESET',
+      details: `Đưa hệ thống về trạng thái khởi đầu sạch ($100,000, chế độ ${initialMode}).`,
+    });
+    bumpStateRevision();
   });
-
-  const freshAgents = createInitialAgentRegistry(nowIso);
-  const insertAg = db.prepare('INSERT OR REPLACE INTO agent_registry (id, payload_json) VALUES (?, ?)');
-  for (const ag of freshAgents) {
-    insertAg.run(ag.id, JSON.stringify(ag));
-  }
-
-  appendAuditLog({
-    category: 'SYSTEM',
-    severity: 'INFO',
-    actor: 'USER',
-    action: 'SESSION_RESET',
-    details: `Đưa hệ thống về trạng thái khởi đầu sạch ($100,000, chế độ ${initialMode}).`,
-  });
-  bumpStateRevision();
 }
 
 export function getRiskConfig(): RiskConfig {
   const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get('risk_config') as
     | { value: string }
     | undefined;
-  return row ? (JSON.parse(row.value) as RiskConfig) : DEFAULT_RISK_CONFIG;
+  return row ? { ...DEFAULT_RISK_CONFIG, ...safeJsonParse<Partial<RiskConfig>>(row.value, {}), allowMartingale: false } : DEFAULT_RISK_CONFIG;
 }
 
 export function saveRiskConfig(cfg: RiskConfig): void {
@@ -643,26 +724,27 @@ export function getPortfolioSummary(): PortfolioSummary {
   const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get('portfolio_summary') as
     | { value: string }
     | undefined;
+  const fallbackPortfolio: PortfolioSummary = {
+    mode: getTradingMode(),
+    initialEquityUsd: 100_000,
+    totalEquityUsd: 100_000,
+    availableBalanceUsd: 100_000,
+    usedMarginUsd: 0,
+    realizedPnlUsd: 0,
+    unrealizedPnlUsd: 0,
+    totalFeesUsd: 0,
+    dailyPnlPct: 0,
+    weeklyPnlPct: 0,
+    peakEquityUsd: 100_000,
+    currentDrawdownPct: 0,
+    winCount: 0,
+    lossCount: 0,
+    totalClosedTrades: 0,
+    winRatePct: null,
+  };
   const base = row
-    ? (JSON.parse(row.value) as PortfolioSummary)
-    : {
-        mode: getTradingMode(),
-        initialEquityUsd: 100_000,
-        totalEquityUsd: 100_000,
-        availableBalanceUsd: 100_000,
-        usedMarginUsd: 0,
-        realizedPnlUsd: 0,
-        unrealizedPnlUsd: 0,
-        totalFeesUsd: 0,
-        dailyPnlPct: 0,
-        weeklyPnlPct: 0,
-        peakEquityUsd: 100_000,
-        currentDrawdownPct: 0,
-        winCount: 0,
-        lossCount: 0,
-        totalClosedTrades: 0,
-        winRatePct: null,
-      };
+    ? { ...fallbackPortfolio, ...safeJsonParse<Partial<PortfolioSummary>>(row.value, {}) }
+    : fallbackPortfolio;
   base.mode = getTradingMode();
   return base;
 }
@@ -754,9 +836,139 @@ export function upsertPosition(pos: Position): void {
   );
 }
 
-export function deletePosition(id: string): void {
-  db.prepare('DELETE FROM positions WHERE id = ?').run(id);
-  bumpStateRevision();
+export function deletePosition(id: string): number {
+  const info = db.prepare('DELETE FROM positions WHERE id = ?').run(id);
+  if (info.changes > 0) {
+    bumpStateRevision();
+  }
+  return Number(info.changes ?? 0);
+}
+
+export function openPositionAtomically(params: {
+  order: OrderRecord;
+  position: Position;
+  feeUsd: number;
+  auditActor: string;
+  auditAction: string;
+  auditDetails: string;
+}): void {
+  runInTransaction(() => {
+    insertOrder(params.order);
+    upsertPosition(params.position);
+    const portfolio = getPortfolioSummary();
+    portfolio.realizedPnlUsd = Number((portfolio.realizedPnlUsd - params.feeUsd).toFixed(2));
+    portfolio.totalFeesUsd = Number((portfolio.totalFeesUsd + params.feeUsd).toFixed(2));
+    savePortfolioSummary(portfolio);
+    appendAuditLog({
+      category: 'ORDER',
+      severity: 'INFO',
+      actor: params.auditActor,
+      action: params.auditAction,
+      details: params.auditDetails,
+    });
+    bumpStateRevision();
+  });
+}
+
+export function closePositionAtomically(params: {
+  positionId: string;
+  resolveClosePrice: (pos: Position) => number;
+  closeReason: 'MANUAL_CLOSE' | 'STOP_LOSS' | 'TAKE_PROFIT' | 'TRAILING_PROFIT';
+  idempotencyPrefix: string;
+  actor: string;
+  auditAction: string;
+  auditSeverity?: AuditLogEntry['severity'];
+}):
+  | {
+      closed: true;
+      position: Position;
+      closePrice: number;
+      grossPnlUsd: number;
+      closeFeeUsd: number;
+      realizedNetUsd: number;
+      rMultiple: number;
+      closedAtUtc: string;
+    }
+  | { closed: false } {
+  return runInTransaction(() => {
+    const pos = getOpenPositions().find((p) => p.id === params.positionId);
+    if (!pos) return { closed: false };
+
+    const deletedCount = deletePosition(pos.id);
+    if (deletedCount !== 1) return { closed: false };
+
+    const closePrice = params.resolveClosePrice(pos);
+    const grossPnlUsd = Number(
+      (pos.side === 'LONG'
+        ? (closePrice - pos.entryPrice) * pos.quantity
+        : (pos.entryPrice - closePrice) * pos.quantity
+      ).toFixed(2),
+    );
+    const closeFeeUsd = Number((pos.quantity * closePrice * 0.0005).toFixed(2));
+    const realizedNetUsd = Number((grossPnlUsd - closeFeeUsd).toFixed(2));
+    const initialRiskPerUnit = Math.abs(pos.entryPrice - (pos.initialStopLoss ?? pos.stopLoss));
+    const initialRiskUsd = initialRiskPerUnit * pos.quantity;
+    const rMultiple =
+      initialRiskUsd > 0 ? Number((realizedNetUsd / initialRiskUsd).toFixed(2)) : 0;
+    const closedAtUtc = new Date().toISOString();
+
+    const portfolio = getPortfolioSummary();
+    portfolio.realizedPnlUsd = Number((portfolio.realizedPnlUsd + realizedNetUsd).toFixed(2));
+    portfolio.totalFeesUsd = Number((portfolio.totalFeesUsd + closeFeeUsd).toFixed(2));
+    if (realizedNetUsd >= 0) portfolio.winCount += 1;
+    else portfolio.lossCount += 1;
+    portfolio.totalClosedTrades += 1;
+    portfolio.winRatePct =
+      portfolio.totalClosedTrades > 0
+        ? Number(((portfolio.winCount / portfolio.totalClosedTrades) * 100).toFixed(1))
+        : null;
+    savePortfolioSummary(portfolio);
+
+    try {
+      insertOrder({
+        id: `ORD-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`,
+        idempotencyKey: `${params.idempotencyPrefix}-${pos.id}`,
+        symbol: pos.symbol,
+        exchange: pos.exchange,
+        marketType: pos.marketType,
+        side: pos.side === 'LONG' ? 'SHORT' : 'LONG',
+        orderType: 'MARKET',
+        quantity: pos.quantity,
+        price: closePrice,
+        stopLoss: pos.stopLoss,
+        takeProfit: pos.takeProfit,
+        leverage: pos.leverage,
+        feesUsd: closeFeeUsd,
+        slippageUsd: 0,
+        status: 'FILLED',
+        mode: pos.mode,
+        strategyName: `${pos.strategyName} [${params.closeReason}]`,
+        riskDecision: 'APPROVE',
+        createdAtUtc: closedAtUtc,
+      });
+    } catch {
+      // Ignore duplicate close idempotency key inside same transaction boundary
+    }
+
+    appendAuditLog({
+      category: 'ORDER',
+      severity: params.auditSeverity ?? 'INFO',
+      actor: params.actor,
+      action: params.auditAction,
+      details: `Đóng vị thế ${pos.symbol} ${pos.side} @ $${closePrice} (${params.closeReason}), PnL ròng $${realizedNetUsd.toFixed(2)} (${rMultiple >= 0 ? '+' : ''}${rMultiple}R).`,
+    });
+
+    return {
+      closed: true,
+      position: pos,
+      closePrice,
+      grossPnlUsd,
+      closeFeeUsd,
+      realizedNetUsd,
+      rMultiple,
+      closedAtUtc,
+    };
+  });
 }
 
 export function insertOrder(order: OrderRecord): void {
@@ -857,7 +1069,9 @@ export function getSignals(limit = 20): TradingSignal[] {
   const rows = db
     .prepare('SELECT payload_json FROM signals ORDER BY created_at_utc DESC LIMIT ?')
     .all(fetchLimit) as Array<{ payload_json: string }>;
-  const parsed = rows.map((r) => JSON.parse(r.payload_json) as TradingSignal);
+  const parsed = rows
+    .map((r) => safeJsonParse<TradingSignal | null>(r.payload_json, null))
+    .filter((s): s is TradingSignal => Boolean(s && s.id && s.symbol));
   return dedupeSignalsByPair(parsed).slice(0, limit);
 }
 
@@ -865,7 +1079,9 @@ export function getAgents(): AgentState[] {
   const rows = db.prepare('SELECT payload_json FROM agent_registry').all() as Array<{
     payload_json: string;
   }>;
-  return rows.map((r) => JSON.parse(r.payload_json) as AgentState);
+  return rows
+    .map((r) => safeJsonParse<AgentState | null>(r.payload_json, null))
+    .filter((a): a is AgentState => Boolean(a && a.id));
 }
 
 export function updateAgent(agent: AgentState): void {
@@ -974,7 +1190,7 @@ export function getExchanges(): ExchangeInfo[] {
     name: r.name,
     connectionStatus: r.connection_status as ExchangeInfo['connectionStatus'],
     apiStatus: r.api_status as ExchangeInfo['apiStatus'],
-    supportedMarkets: JSON.parse(r.supported_markets) as ExchangeInfo['supportedMarkets'],
+    supportedMarkets: safeJsonParse<ExchangeInfo['supportedMarkets']>(r.supported_markets, ['SPOT']),
     wsStatus: r.ws_status as ExchangeInfo['wsStatus'],
     apiLatencyMs: r.api_latency_ms,
     lastSyncUtc: r.last_sync_utc,
@@ -990,7 +1206,12 @@ export function getExchanges(): ExchangeInfo[] {
     verificationNote: r.verification_note ?? null,
     accountEquitySummaryUsd:
       typeof r.account_equity_summary_usd === 'number' ? r.account_equity_summary_usd : null,
-    permissions: JSON.parse(r.permissions_json) as ExchangeInfo['permissions'],
+    permissions: safeJsonParse<ExchangeInfo['permissions']>(r.permissions_json, {
+      read: false,
+      spotTrade: false,
+      futuresTrade: false,
+      withdrawalBlocked: true,
+    }),
     makerFeeBps: r.maker_fee_bps,
     takerFeeBps: r.taker_fee_bps,
   }));
@@ -1023,7 +1244,12 @@ export function getExchangeEncryptedCredentials(exchangeId: string): {
     encryptedCredentials: row.encrypted_credentials,
     maskedApiKey: row.masked_api_key,
     environment: row.environment === 'TESTNET' ? 'TESTNET' : 'MAINNET',
-    permissions: JSON.parse(row.permissions_json) as ExchangeInfo['permissions'],
+    permissions: safeJsonParse<ExchangeInfo['permissions']>(row.permissions_json, {
+      read: false,
+      spotTrade: false,
+      futuresTrade: false,
+      withdrawalBlocked: true,
+    }),
   };
 }
 
@@ -1268,7 +1494,10 @@ export function getAutoExecutionConfig(): AutoExecutionConfig {
     | { value: string }
     | undefined;
   return row
-    ? clampAutoExecutionConfig(JSON.parse(row.value) as Partial<AutoExecutionConfig>, DEFAULT_AUTO_EXECUTION_CONFIG)
+    ? clampAutoExecutionConfig(
+        safeJsonParse<Partial<AutoExecutionConfig>>(row.value, {}),
+        DEFAULT_AUTO_EXECUTION_CONFIG,
+      )
     : DEFAULT_AUTO_EXECUTION_CONFIG;
 }
 
@@ -1306,7 +1535,9 @@ export function getAutoProposals(statusFilter?: AutoProposalStatus, limit = 25):
         .prepare('SELECT payload_json FROM auto_proposals ORDER BY created_at_utc DESC LIMIT ?')
         .all(limit) as Array<{ payload_json: string }>);
 
-  return rows.map((r) => JSON.parse(r.payload_json) as AutoExecutionProposal);
+  return rows
+    .map((r) => safeJsonParse<AutoExecutionProposal | null>(r.payload_json, null))
+    .filter((p): p is AutoExecutionProposal => Boolean(p && p.id));
 }
 
 export function expireStaleAutoProposals(nowIso: string): void {

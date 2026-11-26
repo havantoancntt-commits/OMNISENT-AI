@@ -121,9 +121,21 @@ export function evaluateOrderRisk(
     reasons.push('Chế độ ANALYSIS_ONLY không cho phép đặt lệnh.');
   }
 
-  // 2. Data Integrity & Symbol Status Gates
+  // 2. Data Integrity, Freshness & Symbol Status Gates
   if (order.dataStatus !== 'LIVE_EXCHANGE') {
     reasons.push(`Dữ liệu thị trường không phải LIVE_EXCHANGE (${order.dataStatus}) — chặn đặt lệnh.`);
+  }
+  if (
+    typeof order.tickerTimestampUtc === 'number' &&
+    Number.isFinite(order.tickerTimestampUtc)
+  ) {
+    const evalNow = typeof order.nowMs === 'number' && Number.isFinite(order.nowMs) ? order.nowMs : Date.now();
+    const ageMs = evalNow - order.tickerTimestampUtc;
+    if (ageMs > 30_000) {
+      reasons.push(
+        `Dữ liệu giá thị trường đã cũ (${Math.round(ageMs / 1000)}s > 30s) — chặn đặt lệnh để tránh trượt giá.`,
+      );
+    }
   }
   if (order.tradingStatus && order.tradingStatus !== 'TRADING') {
     reasons.push(`Trạng thái cặp giao dịch không hợp lệ (${order.tradingStatus}).`);

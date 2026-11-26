@@ -1,12 +1,37 @@
 import crypto from 'node:crypto';
 
-// Ephemeral fallback only when VAULT_ENCRYPTION_KEY env var is absent in preview
-const RUNTIME_KEY_MATERIAL =
-  process.env.VAULT_ENCRYPTION_KEY && process.env.VAULT_ENCRYPTION_KEY.length >= 16
-    ? process.env.VAULT_ENCRYPTION_KEY
-    : crypto.randomBytes(32).toString('hex');
+// Ephemeral key is cached per dev/preview process only when non-production or explicitly opted in.
+let ephemeralRuntimeKey: string | null = null;
 
-const DERIVED_KEY = crypto.scryptSync(RUNTIME_KEY_MATERIAL, 'omnisent-vault-salt-v1', 32);
+export function isPersistentVaultKeyConfigured(env: NodeJS.ProcessEnv = process.env): boolean {
+  return Boolean(env.VAULT_ENCRYPTION_KEY && env.VAULT_ENCRYPTION_KEY.trim().length >= 16);
+}
+
+export function isStrictProductionRuntime(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (
+    env.NODE_ENV === 'production' ||
+    env.VERCEL_ENV === 'production' ||
+    env.OMNISENT_STRICT_VAULT === '1'
+  );
+}
+
+function getDerivedVaultKey(env: NodeJS.ProcessEnv = process.env): Buffer {
+  if (isPersistentVaultKeyConfigured(env)) {
+    const keyMaterial = env.VAULT_ENCRYPTION_KEY!.trim();
+    return crypto.scryptSync(keyMaterial, 'omnisent-vault-salt-v1', 32);
+  }
+
+  if (isStrictProductionRuntime(env) && env.ALLOW_EPHEMERAL_VAULT_KEY !== '1') {
+    throw new Error(
+      'Cấu hình bảo mật Production thiếu VAULT_ENCRYPTION_KEY (>= 16 ký tự). Không cho phép dùng khóa tạm thời cho Security Vault.',
+    );
+  }
+
+  if (!ephemeralRuntimeKey) {
+    ephemeralRuntimeKey = crypto.randomBytes(32).toString('hex');
+  }
+  return crypto.scryptSync(ephemeralRuntimeKey, 'omnisent-vault-salt-v1', 32);
+}
 
 export interface DecryptedSecretPayload {
   apiKey: string;
@@ -14,9 +39,13 @@ export interface DecryptedSecretPayload {
   passphrase?: string;
 }
 
-export function encryptSecretPayload(payload: DecryptedSecretPayload): string {
+export function encryptSecretPayload(
+  payload: DecryptedSecretPayload,
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const derivedKey = getDerivedVaultKey(env);
   const iv = crypto.randomBytes(12);
-  const cipher = crypto.createCipheriv('aes-256-gcm', DERIVED_KEY, iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', derivedKey, iv);
   const plaintext = JSON.stringify({
     apiKey: payload.apiKey,
     apiSecret: payload.apiSecret,
@@ -32,7 +61,11 @@ export function encryptSecretPayload(payload: DecryptedSecretPayload): string {
   });
 }
 
-export function decryptSecretPayload(encryptedJson: string): DecryptedSecretPayload {
+export function decryptSecretPayload(
+  encryptedJson: string,
+  env: NodeJS.ProcessEnv = process.env,
+): DecryptedSecretPayload {
+  const derivedKey = getDerivedVaultKey(env);
   let parsed: unknown;
   try {
     parsed = JSON.parse(encryptedJson);
@@ -65,7 +98,7 @@ export function decryptSecretPayload(encryptedJson: string): DecryptedSecretPayl
     throw new Error('Vault envelope có kích thước IV/AuthTag không hợp lệ.');
   }
 
-  const decipher = crypto.createDecipheriv('aes-256-gcm', DERIVED_KEY, iv);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', derivedKey, iv);
   decipher.setAuthTag(tag);
 
   let plaintext: string;
@@ -83,9 +116,10 @@ export function decryptSecretPayload(encryptedJson: string): DecryptedSecretPayl
   return {
     apiKey: payload.apiKey,
     apiSecret: payload.apiSecret,
-    passphrase: typeof payload.passphrase === 'string' && payload.passphrase.length > 0
-      ? payload.passphrase
-      : undefined,
+    passphrase:
+      typeof payload.passphrase === 'string' && payload.passphrase.length > 0
+        ? payload.passphrase
+        : undefined,
   };
 }
 

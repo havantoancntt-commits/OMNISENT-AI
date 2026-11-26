@@ -21,6 +21,7 @@ import type {
   AuditLogEntry,
   AutoExecutionConfig,
   AutoExecutionEngineStatus,
+  ClosePositionResponse,
   ExchangeInfo,
   MarketTicker,
   MarketType,
@@ -619,18 +620,26 @@ export default function App() {
     }
   };
 
-  const handleClosePosition = async (id: string) => {
+  const handleClosePosition = async (id: string): Promise<ClosePositionResponse> => {
     setActionError(null);
     try {
       const res = await fetch(`/api/positions/${encodeURIComponent(id)}/close`, { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
-        setActionError(data.error || t('app.error.actionFailed'));
-        return;
+        const errMsg = data.error || t('app.error.actionFailed');
+        setActionError(errMsg);
+        return { ok: false, error: errMsg };
       }
       await fetchAllState();
+      return {
+        ok: true,
+        closedNetPnlUsd: data.closedNetPnlUsd,
+        receipt: data.receipt,
+      };
     } catch {
-      setActionError(t('app.error.actionFailed'));
+      const errMsg = t('app.error.actionFailed');
+      setActionError(errMsg);
+      return { ok: false, error: errMsg };
     }
   };
 

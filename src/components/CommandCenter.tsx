@@ -16,6 +16,7 @@ import type {
   AgentState,
   AutoExecutionConfig,
   AutoExecutionEngineStatus,
+  ClosePositionResponse,
   HtfAlignment,
   MarketTicker,
   OrderBookSnapshot,
@@ -65,7 +66,7 @@ interface CommandCenterProps {
   onSmartScan?: () => void;
   smartOpportunities?: SmartOpportunityCandidate[];
   onOpenGlobalSearch?: () => void;
-  onClosePosition: (id: string) => Promise<void>;
+  onClosePosition: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp: (id: string, stopLoss: number, takeProfit: number) => Promise<{ ok: boolean; error?: string }>;
   pipelineLoading: boolean;
   autoExecutionStatus?: AutoExecutionEngineStatus | null;

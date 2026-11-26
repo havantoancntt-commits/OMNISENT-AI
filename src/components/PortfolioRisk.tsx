@@ -3,6 +3,7 @@ import { GitBranch, OctagonAlert, Save, ShieldCheck } from 'lucide-react';
 import type {
   AutoExecutionConfig,
   AutoExecutionEngineStatus,
+  ClosePositionResponse,
   MarketType,
   OrderRecord,
   PnlHistoryPoint,
@@ -26,7 +27,7 @@ interface PortfolioRiskProps {
   riskConfig: RiskConfig;
   correlationGuard?: PortfolioCorrelationGuard | null;
   tradingMode: TradingMode;
-  onClosePosition: (id: string) => Promise<void> | void;
+  onClosePosition: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp?: (id: string, stopLoss: number, takeProfit: number) => Promise<{ ok: boolean; error?: string }>;
   onInspectSymbol?: (symbol: string, marketType: MarketType, exchange?: string) => void;
   onSaveRiskConfig: (cfg: RiskConfig) => Promise<boolean | void>;
