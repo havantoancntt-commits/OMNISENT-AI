@@ -7,6 +7,7 @@ import { WebSocketServer, WebSocket } from 'ws';
 import {
   appendAgentLog,
   appendAuditLog,
+  checkpointDatabase,
   closePositionAtomically,
   deletePosition,
   disconnectExchange,
@@ -273,26 +274,45 @@ app.use('/api/agents/:id/action', requireAdminAuth);
 app.use('/api/market/scan', scanBacktestRateLimiter);
 app.use('/api/backtest', scanBacktestRateLimiter);
 
-let coldWarmupPromise: Promise<void> | null = null;
-async function ensureServerWarm(): Promise<void> {
-  if (!process.env.VERCEL && !process.env.VERCEL_ENV) return;
-  if (!coldWarmupPromise) {
-    coldWarmupPromise = (async () => {
-      try {
-        await marketFeed.refreshFeed();
-      } catch {
-        // Non-fatal in cold-start serverless fallback
+let initialBenchmarkCandlesWarmed = false;
+async function ensureFreshServerFeed(options?: { allowStaleRefresh?: boolean }): Promise<void> {
+  if (process.env.OMNISENT_SKIP_LISTEN === '1') return;
+  const isVercel = Boolean(process.env.VERCEL || process.env.VERCEL_ENV);
+  const feedEmpty = !marketFeed.isLiveFeedActive();
+  const feedStaleOnServerless =
+    Boolean(options?.allowStaleRefresh) && isVercel && marketFeed.getFeedAgeMs() > 2800;
+
+  if (!feedEmpty && !feedStaleOnServerless) return;
+
+  try {
+    const budgetMs = feedEmpty ? 4800 : 3000;
+    await Promise.race([
+      marketFeed.refreshFeed({ force: feedEmpty }),
+      new Promise<void>((resolve) => setTimeout(resolve, budgetMs)),
+    ]);
+    if (!initialBenchmarkCandlesWarmed && marketFeed.isLiveFeedActive()) {
+      initialBenchmarkCandlesWarmed = true;
+      if (isVercel) {
+        await Promise.race([
+          marketFeed.warmBenchmarkCandles(),
+          new Promise<void>((resolve) => setTimeout(resolve, 1400)),
+        ]);
+      } else {
+        void marketFeed.warmBenchmarkCandles();
       }
-    })();
+    }
+  } catch {
+    // Non-fatal fallback; next cycle retries cleanly
   }
-  await coldWarmupPromise;
 }
 
-app.use('/api', async (_req, res, next) => {
+app.use('/api', async (req, res, next) => {
   res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');
-  await ensureServerWarm();
+  const allowStaleRefresh =
+    req.path === '/sync/bootstrap' || req.path === '/market/tickers';
+  await ensureFreshServerFeed({ allowStaleRefresh });
   next();
 });
 
@@ -509,6 +529,8 @@ app.get('/api/health', (_req, res) => {
     status: 'OK',
     tradingMode: mode,
     liveExchangeFeed: marketFeed.isLiveFeedActive(),
+    wsSupported: !isVercelRuntime,
+    feedAgeMs: Number.isFinite(marketFeed.getFeedAgeMs()) ? marketFeed.getFeedAgeMs() : null,
     dataIntegrityHealthy: validCount === integrityReports.length,
     uptimeSec: Math.round(process.uptime()),
     memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
@@ -532,6 +554,8 @@ app.get('/api/sync/bootstrap', (_req, res) => {
     stateRevision: getStateRevision(),
     tradingMode: getTradingMode(),
     liveFeedActive: marketFeed.isLiveFeedActive(),
+    wsSupported: !isVercelRuntime,
+    feedAgeMs: Number.isFinite(marketFeed.getFeedAgeMs()) ? marketFeed.getFeedAgeMs() : null,
     feedHealth: computeFeedHealthMetrics(tickers),
     tickers,
     totalDirectoryCount: marketFeed.getDirectoryCount(),
@@ -555,6 +579,7 @@ app.get('/api/market/tickers', (_req, res) => {
       anomalies: integrity.filter((r) => !r.valid).slice(0, 10),
     },
     liveFeedActive: marketFeed.isLiveFeedActive(),
+    wsSupported: !isVercelRuntime,
     serverUtc: new Date().toISOString(),
   });
 });
@@ -3786,6 +3811,25 @@ async function startServer() {
   server.listen(port, '0.0.0.0', () => {
     console.log(`OMNISENT AI Command Center listening on http://0.0.0.0:${port}`);
   });
+
+  // Periodic WAL checkpoint every 5 minutes and graceful TRUNCATE checkpoint on shutdown
+  const walCheckpointTimer = setInterval(() => {
+    checkpointDatabase('PASSIVE');
+  }, 5 * 60 * 1000);
+  walCheckpointTimer.unref?.();
+
+  const gracefulShutdown = () => {
+    clearInterval(walCheckpointTimer);
+    checkpointDatabase('TRUNCATE');
+    try {
+      server.close();
+    } catch {
+      // ignore
+    }
+    process.exit(0);
+  };
+  process.once('SIGTERM', gracefulShutdown);
+  process.once('SIGINT', gracefulShutdown);
 
   // Run initial exchange feed probe, real-time Exchange WS streams, and 1h OHLCV warmup immediately
   // without blocking HTTP port binding so preview & health checks never stall during cold start.

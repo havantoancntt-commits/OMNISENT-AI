@@ -11,7 +11,7 @@
 ### Issues Resolved
 1. **Atomic SQLite Concurrency, Startup Integrity & Race Elimination (`/server/db.ts`, `/server.ts`)**
    - Resolved double-close race conditions on `POST /api/positions/:id/close` and concurrent order mutations by introducing `runInTransaction()` (`BEGIN IMMEDIATE ... COMMIT / ROLLBACK`), `openPositionAtomically()`, and `closePositionAtomically()` (verifying `DELETE FROM positions` affects `changes === 1` before crediting realized PnL, margin, and audit logs).
-   - Configured `PRAGMA busy_timeout = 5000`, `PRAGMA synchronous = NORMAL`, `PRAGMA foreign_keys = ON`, and added automatic startup integrity verification (`PRAGMA quick_check;`) with non-destructive `REINDEX; VACUUM;` self-repair when legacy index or freelist drift is detected.
+   - Configured `PRAGMA busy_timeout = 5000`, `PRAGMA synchronous = NORMAL`, `PRAGMA foreign_keys = ON`, added `openDatabaseWithRecovery()` (automatically quarantining corrupted database/WAL/SHM images on open and rebuilding cleanly), periodic `PASSIVE` WAL checkpoints, and graceful `TRUNCATE` checkpoints on `SIGTERM`/`SIGINT`.
    - Wrapped JSON state deserialization with `safeJsonParse()` fallbacks to prevent malformed database rows from crashing API responses.
 
 2. **Security Vault Fail-Closed Key Enforcement (`/server/cryptoVault.ts`, `/.env.example`)**
@@ -43,6 +43,12 @@
    - Implemented `GET /api/sync/bootstrap` single-trip fast sync with monotonic `stateRevision` diffing, 2-second adaptive serverless HTTP fallback polling when WebSocket upgrades are unavailable, `visibilitychange`/`focus`/`pageshow`/`online` resume recovery, `BroadcastChannel('omnisent-pwa-sync-v1')` cross-tab mutation sync, single-reload `controllerchange` guard, non-sensitive local telemetry snapshot hydration (`parseTelemetrySnapshot`), and 1-tap `Đồng bộ ngay` / `Sync Now` transport & latency telemetry controls.
    - Added cross-venue authentic OHLCV fallback (`OKX`, `Bybit`, `Coinbase`) in `marketFeed.ts` `getCandles()` plus prioritized live candidate fallback in `POST /api/run/smart` so Smart Run does not fail with `503` when one exchange REST endpoint is geo-restricted while live feeds are active.
 
+9. **Serverless & Installed PWA Real-Time Price Sync Hardening (`/server/marketFeed.ts`, `/server.ts`, `/src/pwa/directPriceSync.ts`, `/src/pwa/pwaHelpers.ts`, `/src/App.tsx`, `/src/components/CommandCenter.tsx`)**
+   - Added request-deduplicated cold-start warmup (`refreshInFlight`), Gate.io V4 futures ingestion, `warmBenchmarkCandles()`, and Cross-Venue Authentic Quote Relay (`OKX V5` / `Bybit V5` / `Gate.io V4` / `Binance`) inside `server/marketFeed.ts` so primary geo-restricted endpoints never fall back to `$0` / `UNAVAILABLE` / `UNKNOWN_REGIME`.
+   - Updated `/server.ts` with `ensureFreshServerFeed()` (bounding cold warmup and refreshing stale serverless lambdas) plus `wsSupported` & `feedAgeMs` diagnostics on `/api/health`, `/api/sync/bootstrap`, and `/api/market/tickers`.
+   - Created `/src/pwa/directPriceSync.ts` (`mergeTickerFeedSnapshots`, `pickBestBenchmarkTicker`, `applyDirectExchangeWsTick`, `repricePortfolioAndPositions`, `parseOkxPublicTickerFrame`) and hardened `parseTelemetrySnapshot()` & `App.tsx` snapshot persistence so `$0`/`UNAVAILABLE` payloads never poison `localStorage` or overwrite fresher `LIVE_EXCHANGE` prices.
+   - Added Direct OKX Public WebSocket streaming (`wss://ws.okx.com:8443/ws/v5/public`) with live mark-to-market floating PnL repricing whenever `/api/sync/bootstrap` reports `wsSupported: false` or backend `/ws` handshakes fail.
+
 ### Safeguards Verified
 - Independent deterministic Risk Engine vetoes AI/order requests missing SL/TP, exceeding leverage/exposure caps, or relying on stale market feeds (> 30s).
 - Zero-Withdrawal policy rejects exchange credentials containing withdrawal or transfer scopes across supported venues.
@@ -57,11 +63,11 @@
 
 1. **Automated Pure Engine & Hardening Unit Tests (`src/engine/engine.test.ts`)**
    - Command: `npx --yes tsx --test src/engine/engine.test.ts`
-   - Result: **37 / 37 passed (0 failed)** covering Quant indicators, Risk Engine exposure/stale-feed vetoes, Backtester causality, AES-256-GCM Vault tamper rejection & production fail-closed checks, Exchange Auth monotonic nonces/redaction/withdrawal rejection, Gemini JSON schema validation, Real-time Price Feed Guard, safe WebSocket disposal, and PWA telemetry snapshot & sync cooldown/reload guards.
+   - Result: **38 / 38 passed (0 failed)** covering Quant indicators, Risk Engine exposure/stale-feed vetoes, Backtester causality, AES-256-GCM Vault tamper rejection & production fail-closed checks, Exchange Auth monotonic nonces/redaction/withdrawal rejection, Gemini JSON schema validation, Real-time Price Feed Guard, safe WebSocket disposal, PWA `$0` snapshot rejection, and Direct OKX WS frame parsing & mark-to-market repricing.
 
 2. **Automated SQLite Transaction & Express Security Integration Tests (`server/audit.test.ts`)**
    - Command: `npx --yes tsx --test server/audit.test.ts`
-   - Result: **2 / 2 passed (0 failed)** verifying concurrent `closePositionAtomically()` double-close race prevention (exact single settlement receipt), HTTP security headers, `/api/health` diagnostics, `/api/sync/bootstrap` single-trip payload & `Cache-Control: no-store`, `POST /api/positions/:id/close` settlement payload accuracy, and optional `OMNISENT_ADMIN_TOKEN` bearer enforcement (`401` unauthorized vs `200` authorized).
+   - Result: **3 / 3 passed (0 failed)** verifying concurrent `closePositionAtomically()` double-close race prevention (exact single settlement receipt), HTTP security headers, `/api/health` diagnostics, `/api/sync/bootstrap` single-trip payload (`wsSupported`, `feedAgeMs`, `Cache-Control: no-store`), `POST /api/positions/:id/close` settlement accuracy, optional `OMNISENT_ADMIN_TOKEN` bearer enforcement (`401` vs `200`), and SQLite corruption quarantine & automatic recovery (`openDatabaseWithRecovery`).
 
 3. **Production Build & TypeScript Verification**
    - Commands: `npm install --package-lock-only --no-audit --no-fund`, `npm run build`, and `tsc --noEmit`
@@ -69,9 +75,8 @@
 
 4. **Live HTTP Health, Bootstrap Sync & Smart Run Verification**
    - Endpoints: `GET http://localhost:3000/api/health`, `GET http://localhost:3000/api/sync/bootstrap`, and `POST http://localhost:3000/api/run/smart`
-   - Verified HTTP `200 OK` with `Cache-Control: no-store` headers, security headers, `stateRevision` tracking, live exchange tickers (`LIVE_EXCHANGE`), and successful `BTC/USDT` Smart Run signal generation.
+   - Verified HTTP `200 OK` with `Cache-Control: no-store`, `liveFeedActive: true`, `wsSupported: true`, live BTC/ETH/SOL prices (`LIVE_EXCHANGE` + RSI + market regime), and successful `BTC/USDT` Smart Run signal generation.
 
 5. **End-to-End Browser Verification (`playwright-cli`, Chromium)**
    - Verified desktop (`1440x900`) and mobile (`390x844`) layouts with **0 browser console errors / 0 warnings**.
-   - Verified `Đóng lệnh` opens `[data-testid="close-position-modal"]` with live streaming telemetry and `Xác nhận đóng lệnh` settles positions atomically with `[data-testid="settlement-notice-banner"]`.
-   - Verified PWA sidebar card (`Đồng bộ ngay` / latency readout), `PWAInstallModal` diagnostics (`192 / 512 · Maskable`, `SW ĐÃ SẴN SÀNG`, `WS Real-Time`), mobile drawer (`pwa-drawer-card` + `pwa-sync-now-drawer`), and mobile Smart Run completion with zero stale/exchange-data error banner.
+   - Verified live prices (`BTC/USDT`, `ETH/USDT`, `SOL/USDT`), RSI, market regime, 3D Trading Room live BTC monitor, `Đóng lệnh` smart close modal (`[data-testid="close-position-modal"]`) + settlement notice (`[data-testid="settlement-notice-banner"]`), and PWA controls (`SW ĐÃ SẴN SÀNG`, `WS LIVE`).

@@ -151,10 +151,17 @@ export class MarketFeedManager {
   private wsStarted = false;
   private priceDirty = false;
   private lastProbeMs = 0;
+  private lastSuccessRefreshMs = 0;
   private refreshing = false;
+  private refreshInFlight: Promise<void> | null = null;
 
   constructor() {
     this.initEmptyUniverse();
+  }
+
+  public getFeedAgeMs(): number {
+    if (this.lastSuccessRefreshMs <= 0) return Number.POSITIVE_INFINITY;
+    return Math.max(0, Date.now() - this.lastSuccessRefreshMs);
   }
 
   private initEmptyUniverse(): void {
@@ -811,6 +818,58 @@ export class MarketFeedManager {
       }
     }
 
+    const afterPrimary = this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
+    if (afterPrimary && afterPrimary.lastPrice > 0 && Date.now() - afterPrimary.timestampUtc <= 2000) {
+      return afterPrimary;
+    }
+
+    // Authentic Cross-Venue Fallback Quote when primary exchange is rate-limited or regionally blocked
+    const [rawBase, rawQuote = 'USDT'] = cfg.symbol.toUpperCase().split('/');
+    const base = rawBase.trim();
+    const quote = rawQuote.trim() || 'USDT';
+
+    if (cfg.exchangeId !== 'okx') {
+      const okxInstId = cfg.marketType === 'PERPETUAL' ? `${base}-${quote}-SWAP` : `${base}-${quote}`;
+      const okxRes = await fetchJsonWithTimeout<{
+        code: string;
+        data?: Array<{ last: string; bidPx: string; askPx: string }>;
+      }>(`https://www.okx.com/api/v5/market/ticker?instId=${encodeURIComponent(okxInstId)}`, 2200);
+      const item = okxRes.ok && okxRes.data?.code === '0' ? okxRes.data.data?.[0] : undefined;
+      if (item && Number(item.last) > 0) {
+        this.applyLiveQuoteTick({
+          exchangeId: cfg.exchangeId,
+          marketType: cfg.marketType,
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(item.last),
+          bidPrice: Number(item.bidPx) || Number(item.last),
+          askPrice: Number(item.askPx) || Number(item.last),
+          sourceLabel: `${cfg.exchange} · OKX Cross-Venue Fast`,
+          eventTimeMs: Date.now() - Math.min(250, okxRes.latencyMs),
+        });
+        return this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
+      }
+    }
+
+    if (cfg.exchangeId !== 'coinbase' && cfg.marketType === 'SPOT') {
+      const cbProduct = `${base}-${quote === 'USDT' ? 'USD' : quote}`;
+      const cbRes = await fetchJsonWithTimeout<{ price?: string; bid?: string; ask?: string }>(
+        `https://api.exchange.coinbase.com/products/${encodeURIComponent(cbProduct)}/ticker`,
+        2200,
+      );
+      if (cbRes.ok && cbRes.data?.price && Number(cbRes.data.price) > 0) {
+        this.applyLiveQuoteTick({
+          exchangeId: cfg.exchangeId,
+          marketType: cfg.marketType,
+          nativeSymbol: cfg.nativeSymbol,
+          lastPrice: Number(cbRes.data.price),
+          bidPrice: Number(cbRes.data.bid) || Number(cbRes.data.price),
+          askPrice: Number(cbRes.data.ask) || Number(cbRes.data.price),
+          sourceLabel: `${cfg.exchange} · Coinbase Cross-Venue Fast`,
+          eventTimeMs: Date.now() - Math.min(250, cbRes.latencyMs),
+        });
+      }
+    }
+
     return this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
   }
 
@@ -886,173 +945,192 @@ export class MarketFeedManager {
    * Bybit V5, OKX V5, Kraken, and Coinbase Advanced public REST endpoints.
    * Never fabricates fallback numbers when an exchange is offline.
    */
-  public async refreshFeed(): Promise<void> {
+  public async refreshFeed(options?: { force?: boolean }): Promise<void> {
+    if (this.refreshInFlight) {
+      await this.refreshInFlight;
+      return;
+    }
     const now = Date.now();
-    if (this.refreshing || now - this.lastProbeMs < 7000) {
+    const forceRefresh = Boolean(options?.force) || !this.isLiveFeedActive();
+    if (!forceRefresh && now - this.lastProbeMs < 2500) {
       return;
     }
     this.refreshing = true;
     this.lastProbeMs = now;
 
-    try {
-      const activeConfigs = this.getActiveConfigs();
-      const binancePerpSyms = Array.from(
-        new Set(
-          activeConfigs
-            .filter((u) => u.exchangeId === 'binance' && u.marketType === 'PERPETUAL')
-            .map((u) => u.nativeSymbol),
-        ),
-      );
+    const run = async () => {
+      try {
+        const activeConfigs = this.getActiveConfigs();
+        const binancePerpSyms = Array.from(
+          new Set(
+            activeConfigs
+              .filter((u) => u.exchangeId === 'binance' && u.marketType === 'PERPETUAL')
+              .map((u) => u.nativeSymbol),
+          ),
+        );
 
-      const okxSwapSyms = Array.from(
-        new Set(
-          activeConfigs
-            .filter((u) => u.exchangeId === 'okx' && u.marketType === 'PERPETUAL')
-            .map((u) => u.nativeSymbol),
-        ),
-      );
+        const okxSwapSyms = Array.from(
+          new Set(
+            activeConfigs
+              .filter((u) => u.exchangeId === 'okx' && u.marketType === 'PERPETUAL')
+              .map((u) => u.nativeSymbol),
+          ),
+        );
 
-      const needLinkStats =
-        !this.coinbaseStatsCache.has('LINK-USD') ||
-        now - (this.coinbaseStatsCache.get('LINK-USD')?.fetchedAt ?? 0) > 60_000;
-      const needLtcStats =
-        !this.coinbaseStatsCache.has('LTC-USD') ||
-        now - (this.coinbaseStatsCache.get('LTC-USD')?.fetchedAt ?? 0) > 60_000;
+        const needLinkStats =
+          !this.coinbaseStatsCache.has('LINK-USD') ||
+          now - (this.coinbaseStatsCache.get('LINK-USD')?.fetchedAt ?? 0) > 60_000;
+        const needLtcStats =
+          !this.coinbaseStatsCache.has('LTC-USD') ||
+          now - (this.coinbaseStatsCache.get('LTC-USD')?.fetchedAt ?? 0) > 60_000;
 
-      const [
-        bnSpotRes,
-        bnSpotBookRes,
-        bnFapi24Res,
-        bnFapiBookRes,
-        bnFapiPremRes,
-        bybitLinearRes,
-        okxSpotRes,
-        okxSwapRes,
-        okxOiRes,
-        krakenRes,
-        cbLinkTicker,
-        cbLinkStats,
-        cbLtcTicker,
-        cbLtcStats,
-        ...extraRes
-      ] = await Promise.all([
-        fetchJsonWithTimeout<Array<{
-          symbol: string;
-          lastPrice: string;
-          bidPrice: string;
-          askPrice: string;
-          priceChangePercent: string;
-          highPrice: string;
-          lowPrice: string;
-          quoteVolume: string;
-        }>>('https://api.binance.com/api/v3/ticker/24hr'),
-        fetchJsonWithTimeout<Array<{
-          symbol: string;
-          bidPrice: string;
-          askPrice: string;
-        }>>('https://api.binance.com/api/v3/ticker/bookTicker'),
-        fetchJsonWithTimeout<Array<{
-          symbol: string;
-          lastPrice: string;
-          priceChangePercent: string;
-          highPrice: string;
-          lowPrice: string;
-          quoteVolume: string;
-        }>>('https://fapi.binance.com/fapi/v1/ticker/24hr'),
-        fetchJsonWithTimeout<Array<{
-          symbol: string;
-          bidPrice: string;
-          askPrice: string;
-        }>>('https://fapi.binance.com/fapi/v1/ticker/bookTicker'),
-        fetchJsonWithTimeout<Array<{
-          symbol: string;
-          lastFundingRate: string;
-        }>>('https://fapi.binance.com/fapi/v1/premiumIndex'),
-        fetchJsonWithTimeout<{
-          retCode: number;
-          result?: {
-            list?: Array<{
-              symbol: string;
-              lastPrice: string;
-              bid1Price: string;
-              ask1Price: string;
-              price24hPcnt: string;
-              highPrice24h: string;
-              lowPrice24h: string;
-              turnover24h: string;
-              openInterestValue: string;
-              fundingRate: string;
+        const [
+          bnSpotRes,
+          bnSpotBookRes,
+          bnFapi24Res,
+          bnFapiBookRes,
+          bnFapiPremRes,
+          bybitLinearRes,
+          okxSpotRes,
+          okxSwapRes,
+          okxOiRes,
+          gateFuturesRes,
+          krakenRes,
+          cbLinkTicker,
+          cbLinkStats,
+          cbLtcTicker,
+          cbLtcStats,
+          ...extraRes
+        ] = await Promise.all([
+          fetchJsonWithTimeout<Array<{
+            symbol: string;
+            lastPrice: string;
+            bidPrice: string;
+            askPrice: string;
+            priceChangePercent: string;
+            highPrice: string;
+            lowPrice: string;
+            quoteVolume: string;
+          }>>('https://api.binance.com/api/v3/ticker/24hr'),
+          fetchJsonWithTimeout<Array<{
+            symbol: string;
+            bidPrice: string;
+            askPrice: string;
+          }>>('https://api.binance.com/api/v3/ticker/bookTicker'),
+          fetchJsonWithTimeout<Array<{
+            symbol: string;
+            lastPrice: string;
+            priceChangePercent: string;
+            highPrice: string;
+            lowPrice: string;
+            quoteVolume: string;
+          }>>('https://fapi.binance.com/fapi/v1/ticker/24hr'),
+          fetchJsonWithTimeout<Array<{
+            symbol: string;
+            bidPrice: string;
+            askPrice: string;
+          }>>('https://fapi.binance.com/fapi/v1/ticker/bookTicker'),
+          fetchJsonWithTimeout<Array<{
+            symbol: string;
+            lastFundingRate: string;
+          }>>('https://fapi.binance.com/fapi/v1/premiumIndex'),
+          fetchJsonWithTimeout<{
+            retCode: number;
+            result?: {
+              list?: Array<{
+                symbol: string;
+                lastPrice: string;
+                bid1Price: string;
+                ask1Price: string;
+                price24hPcnt: string;
+                highPrice24h: string;
+                lowPrice24h: string;
+                turnover24h: string;
+                openInterestValue: string;
+                fundingRate: string;
+              }>;
+            };
+          }>('https://api.bybit.com/v5/market/tickers?category=linear'),
+          fetchJsonWithTimeout<{
+            code: string;
+            data?: Array<{
+              instId: string;
+              last: string;
+              bidPx: string;
+              askPx: string;
+              open24h: string;
+              high24h: string;
+              low24h: string;
+              volCcy24h: string;
             }>;
-          };
-        }>('https://api.bybit.com/v5/market/tickers?category=linear'),
-        fetchJsonWithTimeout<{
-          code: string;
-          data?: Array<{
-            instId: string;
+          }>('https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
+          fetchJsonWithTimeout<{
+            code: string;
+            data?: Array<{
+              instId: string;
+              last: string;
+              bidPx: string;
+              askPx: string;
+              open24h: string;
+              high24h: string;
+              low24h: string;
+              volCcy24h: string;
+            }>;
+          }>('https://www.okx.com/api/v5/market/tickers?instType=SWAP'),
+          fetchJsonWithTimeout<{
+            code: string;
+            data?: Array<{
+              instId: string;
+              oiUsd: string;
+            }>;
+          }>('https://www.okx.com/api/v5/public/open-interest?instType=SWAP'),
+          fetchJsonWithTimeout<Array<{
+            contract: string;
             last: string;
-            bidPx: string;
-            askPx: string;
-            open24h: string;
-            high24h: string;
-            low24h: string;
-            volCcy24h: string;
-          }>;
-        }>('https://www.okx.com/api/v5/market/tickers?instType=SPOT'),
-        fetchJsonWithTimeout<{
-          code: string;
-          data?: Array<{
-            instId: string;
-            last: string;
-            bidPx: string;
-            askPx: string;
-            open24h: string;
-            high24h: string;
-            low24h: string;
-            volCcy24h: string;
-          }>;
-        }>('https://www.okx.com/api/v5/market/tickers?instType=SWAP'),
-        fetchJsonWithTimeout<{
-          code: string;
-          data?: Array<{
-            instId: string;
-            oiUsd: string;
-          }>;
-        }>('https://www.okx.com/api/v5/public/open-interest?instType=SWAP'),
-        fetchJsonWithTimeout<{
-          error: string[];
-          result?: Record<
-            string,
-            {
-              a: [string, string, string];
-              b: [string, string, string];
-              c: [string, string];
-              v: [string, string];
-              p: [string, string];
-              l: [string, string];
-              h: [string, string];
-              o: string;
-            }
-          >;
-        }>('https://api.kraken.com/0/public/Ticker?pair=ADAUSDT,DOTUSDT'),
-        fetchJsonWithTimeout<{ price: string; bid: string; ask: string }>('https://api.exchange.coinbase.com/products/LINK-USD/ticker'),
-        needLinkStats
-          ? fetchJsonWithTimeout<{ open: string; high: string; low: string; last: string; volume: string }>('https://api.exchange.coinbase.com/products/LINK-USD/stats')
-          : Promise.resolve({ ok: true, data: this.coinbaseStatsCache.get('LINK-USD') ?? null, latencyMs: 0 }),
-        fetchJsonWithTimeout<{ price: string; bid: string; ask: string }>('https://api.exchange.coinbase.com/products/LTC-USD/ticker'),
-        needLtcStats
-          ? fetchJsonWithTimeout<{ open: string; high: string; low: string; last: string; volume: string }>('https://api.exchange.coinbase.com/products/LTC-USD/stats')
-          : Promise.resolve({ ok: true, data: this.coinbaseStatsCache.get('LTC-USD') ?? null, latencyMs: 0 }),
-        ...binancePerpSyms.map((s) =>
-          fetchJsonWithTimeout<{ symbol: string; openInterest: string }>(
-            `https://fapi.binance.com/fapi/v1/openInterest?symbol=${s}`,
+            highest_bid?: string;
+            lowest_ask?: string;
+            change_percentage?: string;
+            high_24h?: string;
+            low_24h?: string;
+            volume_24h_quote?: string;
+            funding_rate?: string;
+            mark_price?: string;
+          }>>('https://api.gateio.ws/api/v4/futures/usdt/tickers'),
+          fetchJsonWithTimeout<{
+            error: string[];
+            result?: Record<
+              string,
+              {
+                a: [string, string, string];
+                b: [string, string, string];
+                c: [string, string];
+                v: [string, string];
+                p: [string, string];
+                l: [string, string];
+                h: [string, string];
+                o: string;
+              }
+            >;
+          }>('https://api.kraken.com/0/public/Ticker?pair=ADAUSDT,DOTUSDT'),
+          fetchJsonWithTimeout<{ price: string; bid: string; ask: string }>('https://api.exchange.coinbase.com/products/LINK-USD/ticker'),
+          needLinkStats
+            ? fetchJsonWithTimeout<{ open: string; high: string; low: string; last: string; volume: string }>('https://api.exchange.coinbase.com/products/LINK-USD/stats')
+            : Promise.resolve({ ok: true, data: this.coinbaseStatsCache.get('LINK-USD') ?? null, latencyMs: 0 }),
+          fetchJsonWithTimeout<{ price: string; bid: string; ask: string }>('https://api.exchange.coinbase.com/products/LTC-USD/ticker'),
+          needLtcStats
+            ? fetchJsonWithTimeout<{ open: string; high: string; low: string; last: string; volume: string }>('https://api.exchange.coinbase.com/products/LTC-USD/stats')
+            : Promise.resolve({ ok: true, data: this.coinbaseStatsCache.get('LTC-USD') ?? null, latencyMs: 0 }),
+          ...binancePerpSyms.map((s) =>
+            fetchJsonWithTimeout<{ symbol: string; openInterest: string }>(
+              `https://fapi.binance.com/fapi/v1/openInterest?symbol=${s}`,
+            ),
           ),
-        ),
-        ...okxSwapSyms.map((instId) =>
-          fetchJsonWithTimeout<{ code: string; data?: Array<{ instId: string; fundingRate: string }> }>(
-            `https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`,
+          ...okxSwapSyms.map((instId) =>
+            fetchJsonWithTimeout<{ code: string; data?: Array<{ instId: string; fundingRate: string }> }>(
+              `https://www.okx.com/api/v5/public/funding-rate?instId=${instId}`,
+            ),
           ),
-        ),
-      ]);
+        ]);
 
       if (needLinkStats && cbLinkStats.ok && cbLinkStats.data) {
         this.coinbaseStatsCache.set('LINK-USD', { ...cbLinkStats.data, fetchedAt: now });
@@ -1135,6 +1213,14 @@ export class MarketFeedManager {
           const usd = Number(r.oiUsd);
           if (Number.isFinite(usd)) okxOiUsdMap.set(r.instId, usd);
         }
+      }
+
+      const gateFuturesMap = new Map<
+        string,
+        NonNullable<typeof gateFuturesRes.data>[number]
+      >();
+      if (gateFuturesRes.ok && Array.isArray(gateFuturesRes.data)) {
+        for (const r of gateFuturesRes.data) gateFuturesMap.set(r.contract, r);
       }
 
       const okxFrPctMap = new Map<string, number>();
@@ -1559,6 +1645,93 @@ export class MarketFeedManager {
           }
         }
 
+        // Cross-Venue Authentic Relay: if primary exchange REST is unreachable/geo-blocked (e.g. HTTP 451),
+        // fall back cleanly to verified live quotes from OKX V5, Bybit V5, Gate.io V4, or Binance without fabricating prices.
+        if (!fetchedOk) {
+          const okxSwapId = `${cfg.base}-${cfg.quote}-SWAP`;
+          const okxSpotId = `${cfg.base}-${cfg.quote}`;
+          const bybitSym = `${cfg.base}${cfg.quote}`;
+          const gateSym = `${cfg.base}_${cfg.quote}`;
+
+          if (cfg.marketType === 'PERPETUAL') {
+            const okxQ = okxSwapMap.get(okxSwapId);
+            const bybitQ = bybitMap.get(bybitSym);
+            const gateQ = gateFuturesMap.get(gateSym);
+
+            if (okxQ && Number(okxQ.last) > 0) {
+              lastPrice = Number(okxQ.last);
+              bidPrice = Number(okxQ.bidPx) || lastPrice;
+              askPrice = Number(okxQ.askPx) || lastPrice;
+              const open24 = Number(okxQ.open24h);
+              change24hPct = open24 > 0 ? ((lastPrice - open24) / open24) * 100 : 0;
+              high24h = Number(okxQ.high24h) || lastPrice;
+              low24h = Number(okxQ.low24h) || lastPrice;
+              volume24hUsd = Number(okxQ.volCcy24h) * lastPrice;
+              const oi = okxOiUsdMap.get(okxSwapId);
+              openInterestUsd = oi !== undefined ? Math.round(oi) : null;
+              fundingRatePct = okxFrPctMap.get(okxSwapId) ?? null;
+              latencyMs = okxSwapRes.latencyMs;
+              sourceLabel = `${cfg.exchange} · OKX Swap Relay`;
+              fetchedOk = askPrice >= bidPrice && bidPrice > 0;
+            } else if (bybitQ && Number(bybitQ.lastPrice) > 0) {
+              lastPrice = Number(bybitQ.lastPrice);
+              bidPrice = Number(bybitQ.bid1Price) || lastPrice;
+              askPrice = Number(bybitQ.ask1Price) || lastPrice;
+              change24hPct = Number(bybitQ.price24hPcnt) * 100;
+              high24h = Number(bybitQ.highPrice24h) || lastPrice;
+              low24h = Number(bybitQ.lowPrice24h) || lastPrice;
+              volume24hUsd = Number(bybitQ.turnover24h) || 0;
+              const oiVal = Number(bybitQ.openInterestValue);
+              openInterestUsd = Number.isFinite(oiVal) && oiVal > 0 ? Math.round(oiVal) : null;
+              const fr = Number(bybitQ.fundingRate);
+              fundingRatePct = Number.isFinite(fr) ? Number((fr * 100).toFixed(4)) : null;
+              latencyMs = bybitLinearRes.latencyMs;
+              sourceLabel = `${cfg.exchange} · Bybit Linear Relay`;
+              fetchedOk = askPrice >= bidPrice && bidPrice > 0;
+            } else if (gateQ && Number(gateQ.last) > 0) {
+              lastPrice = Number(gateQ.last);
+              bidPrice = Number(gateQ.highest_bid) || lastPrice;
+              askPrice = Number(gateQ.lowest_ask) || lastPrice;
+              change24hPct = Number(gateQ.change_percentage) || 0;
+              high24h = Number(gateQ.high_24h) || lastPrice;
+              low24h = Number(gateQ.low_24h) || lastPrice;
+              volume24hUsd = Number(gateQ.volume_24h_quote) || 0;
+              const fr = Number(gateQ.funding_rate);
+              fundingRatePct = Number.isFinite(fr) ? Number((fr * 100).toFixed(4)) : null;
+              latencyMs = gateFuturesRes.latencyMs;
+              sourceLabel = `${cfg.exchange} · Gate.io Futures Relay`;
+              fetchedOk = askPrice >= bidPrice && bidPrice > 0;
+            }
+          } else {
+            const okxQ = okxSpotMap.get(okxSpotId);
+            const bnQ = bnSpotMap.get(bybitSym);
+            if (okxQ && Number(okxQ.last) > 0) {
+              lastPrice = Number(okxQ.last);
+              bidPrice = Number(okxQ.bidPx) || lastPrice;
+              askPrice = Number(okxQ.askPx) || lastPrice;
+              const open24 = Number(okxQ.open24h);
+              change24hPct = open24 > 0 ? ((lastPrice - open24) / open24) * 100 : 0;
+              high24h = Number(okxQ.high24h) || lastPrice;
+              low24h = Number(okxQ.low24h) || lastPrice;
+              volume24hUsd = Number(okxQ.volCcy24h) || 0;
+              latencyMs = okxSpotRes.latencyMs;
+              sourceLabel = `${cfg.exchange} · OKX Spot Relay`;
+              fetchedOk = askPrice >= bidPrice && bidPrice > 0;
+            } else if (bnQ && Number(bnQ.lastPrice) > 0) {
+              lastPrice = Number(bnQ.lastPrice);
+              bidPrice = Number(bnQ.bidPrice) || lastPrice;
+              askPrice = Number(bnQ.askPrice) || lastPrice;
+              change24hPct = Number(bnQ.priceChangePercent) || 0;
+              high24h = Number(bnQ.highPrice) || lastPrice;
+              low24h = Number(bnQ.lowPrice) || lastPrice;
+              volume24hUsd = Number(bnQ.quoteVolume) || 0;
+              latencyMs = bnSpotRes.latencyMs;
+              sourceLabel = `${cfg.exchange} · Binance Spot Relay`;
+              fetchedOk = askPrice >= bidPrice && bidPrice > 0;
+            }
+          }
+        }
+
         if (fetchedOk && Number.isFinite(lastPrice) && lastPrice > 0) {
           // Preserve a fresher sub-second WebSocket tick if one arrived while slow REST probes were running
           const hasFresherWs =
@@ -1588,11 +1761,31 @@ export class MarketFeedManager {
           const volPct = effLastPrice > 0 && effHigh24 >= effLow24 ? ((effHigh24 - effLow24) / effLastPrice) * 100 : 0;
           const liq = computeLiquidityScore(volume24hUsd, spreadBps);
 
-          // Check cached 1h candles to keep RSI & Market Regime grounded in real OHLCV
+          // Check cached 1h candles (primary or cross-venue fallback key) to keep RSI & Market Regime grounded in real OHLCV
           const candleCacheKey = `${cfg.symbol.toUpperCase()}|${cfg.marketType}|${cfg.exchange.toUpperCase()}|1h`;
-          const cachedCandles = this.candleCache.get(candleCacheKey);
+          let cachedCandles = this.candleCache.get(candleCacheKey);
+          if (!cachedCandles || cachedCandles.candles.length < 20) {
+            const prefix = `${cfg.symbol.toUpperCase()}|${cfg.marketType}|`;
+            for (const [k, v] of this.candleCache.entries()) {
+              if (k.startsWith(prefix) && k.endsWith('|1h') && v.candles.length >= 20) {
+                cachedCandles = v;
+                break;
+              }
+            }
+          }
           let rsi14: number | null = prev?.rsi14 ?? null;
-          let regime: MarketRegime = prev?.regime ?? 'SIDEWAYS';
+          let regime: MarketRegime =
+            prev && prev.regime !== 'UNKNOWN_REGIME'
+              ? prev.regime
+              : change24hPct >= 2.5
+                ? 'STRONG_BULL'
+                : change24hPct >= 0.4
+                  ? 'BULL'
+                  : change24hPct <= -2.5
+                    ? 'STRONG_BEAR'
+                    : change24hPct <= -0.4
+                      ? 'BEAR'
+                      : 'SIDEWAYS';
           if (cachedCandles && cachedCandles.candles.length >= 20) {
             const stitched = mergeLiveTickIntoCandles(cachedCandles.candles, effLastPrice, effTimestampUtc, '1h');
             const ind = computeAllIndicators(stitched);
@@ -1674,9 +1867,19 @@ export class MarketFeedManager {
       });
 
       this.tickers = nextTickers;
+      if (nextTickers.some((t) => t.dataStatus === 'LIVE_EXCHANGE' && t.lastPrice > 0)) {
+        this.lastSuccessRefreshMs = Date.now();
+        this.priceDirty = true;
+      }
     } finally {
       this.refreshing = false;
     }
+    };
+
+    this.refreshInFlight = run().finally(() => {
+      this.refreshInFlight = null;
+    });
+    await this.refreshInFlight;
   }
 
   /**
@@ -1686,6 +1889,14 @@ export class MarketFeedManager {
   public async warmTopCandles(): Promise<void> {
     await Promise.allSettled(
       MARKET_UNIVERSE.map((cfg) => this.getCandles(cfg.symbol, cfg.marketType, '1h', cfg.exchange)),
+    );
+  }
+
+  public async warmBenchmarkCandles(): Promise<void> {
+    await Promise.allSettled(
+      MARKET_UNIVERSE.slice(0, 6).map((cfg) =>
+        this.getCandles(cfg.symbol, cfg.marketType, '1h', cfg.exchange),
+      ),
     );
   }
 

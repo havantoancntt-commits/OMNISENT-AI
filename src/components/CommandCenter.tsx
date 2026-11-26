@@ -12,6 +12,7 @@ import {
 import { formatAssetPrice } from '../engine/symbolSearch';
 import { isSameTickerSelection } from '../engine/pairSelection';
 import { computeFeedHealthMetrics } from '../engine/priceFeedGuard';
+import { pickBestBenchmarkTicker } from '../pwa/directPriceSync';
 import type {
   AgentState,
   AutoExecutionConfig,
@@ -104,9 +105,9 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   onRejectAutoProposal,
 }) => {
   const { t } = useI18n();
-  const btc = tickers.find((tk) => tk.symbol === 'BTC/USDT');
-  const eth = tickers.find((tk) => tk.symbol === 'ETH/USDT');
-  const sol = tickers.find((tk) => tk.symbol === 'SOL/USDT');
+  const btc = pickBestBenchmarkTicker(tickers, 'BTC/USDT', 'PERPETUAL');
+  const eth = pickBestBenchmarkTicker(tickers, 'ETH/USDT', 'PERPETUAL');
+  const sol = pickBestBenchmarkTicker(tickers, 'SOL/USDT', 'PERPETUAL');
   const benchmarkList = [btc, eth, sol].filter((x): x is MarketTicker => Boolean(x));
   const selectedInBenchmarks = benchmarkList.some((b) =>
     isSameTickerSelection(b, selectedTicker),

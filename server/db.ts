@@ -56,7 +56,53 @@ function resolveWritableDataDir(): string {
 
 const DATA_DIR = resolveWritableDataDir();
 const DB_PATH = path.join(DATA_DIR, 'omnisent.db');
-export const db = new DatabaseSync(DB_PATH);
+
+export function openDatabaseWithRecovery(dbPath: string): DatabaseSync {
+  const attempt = new DatabaseSync(dbPath);
+  try {
+    const check = attempt.prepare('PRAGMA quick_check;').get() as { quick_check?: string } | undefined;
+    if (check?.quick_check !== 'ok') {
+      throw new Error(`SQLite quick_check failed: ${check?.quick_check ?? 'unknown'}`);
+    }
+    attempt.prepare('SELECT COUNT(*) as c FROM sqlite_master;').get();
+    return attempt;
+  } catch (err) {
+    try {
+      attempt.close();
+    } catch {
+      // ignore close failure on corrupt handle
+    }
+    const quarantineSuffix = `.corrupt.${Date.now()}`;
+    for (const suffix of ['', '-wal', '-shm']) {
+      const src = `${dbPath}${suffix}`;
+      if (fs.existsSync(src)) {
+        try {
+          fs.renameSync(src, `${src}${quarantineSuffix}`);
+        } catch {
+          try {
+            fs.unlinkSync(src);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    }
+    console.warn(
+      `[DB] Detected malformed SQLite image (${err instanceof Error ? err.message : String(err)}); quarantined and created fresh database.`,
+    );
+    return new DatabaseSync(dbPath);
+  }
+}
+
+export const db = openDatabaseWithRecovery(DB_PATH);
+
+export function checkpointDatabase(mode: 'PASSIVE' | 'TRUNCATE' = 'PASSIVE'): void {
+  try {
+    db.exec(`PRAGMA wal_checkpoint(${mode});`);
+  } catch {
+    // ignore checkpoint errors during teardown
+  }
+}
 
 let stateRevision = 1;
 export function getStateRevision(): number {

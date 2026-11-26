@@ -54,6 +54,15 @@ import {
   validateManifestPayload,
 } from '../pwa/pwaHelpers.ts';
 import {
+  applyDirectExchangeWsTick,
+  buildOkxSubscriptionArgs,
+  hasAnyLiveTickerPrice,
+  mergeTickerFeedSnapshots,
+  parseOkxPublicTickerFrame,
+  pickBestBenchmarkTicker,
+  repricePortfolioAndPositions,
+} from '../pwa/directPriceSync.ts';
+import {
   DEFAULT_AUTO_EXECUTION_CONFIG,
   clampAutoExecutionConfig,
   evaluateAutoExecutionCandidate,
@@ -101,6 +110,7 @@ import type {
   MarketTicker,
   OrderBookSnapshot,
   PnlHistoryPoint,
+  PortfolioSummary,
   Position,
   RiskContext,
   TradingSignal,
@@ -3679,6 +3689,162 @@ test('PWA telemetry snapshot helpers validate expiry, corruption, cooldown gatin
   assert.equal(shouldAutoReloadOnSwControlChange(false, false), false);
   assert.equal(shouldAutoReloadOnSwControlChange(true, false), true);
   assert.equal(shouldAutoReloadOnSwControlChange(true, true), false);
+
+  // $0/UNAVAILABLE snapshot must be rejected so cold cache cannot poison UI
+  const zeroRaw = serializeTelemetrySnapshot({
+    nowMs,
+    stateRevision: 43,
+    tradingMode: 'FULL_AUTO',
+    serverUtc: '2026-11-26T08:30:00.000Z',
+    tickers: [makeValidTicker({ lastPrice: 0, bidPrice: 0, askPrice: 0, dataStatus: 'UNAVAILABLE' })],
+    portfolio: { totalEquityUsd: 100_000, realizedPnlUsd: 0 },
+    positions: [],
+  });
+  assert.equal(parseTelemetrySnapshot(zeroRaw, nowMs + 1000, 60_000), null);
+});
+
+test('Direct PWA Price Sync protects against $0 overwrites, parses OKX WS frames, and reprices floating PnL', () => {
+  const now = Date.now();
+  const liveBtc = makeValidTicker({
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 91_200,
+    bidPrice: 91_198,
+    askPrice: 91_202,
+    timestampUtc: now,
+    dataStatus: 'LIVE_EXCHANGE',
+    sourceLabel: 'OKX Relay',
+  });
+  const deadBtc = makeValidTicker({
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 0,
+    bidPrice: 0,
+    askPrice: 0,
+    timestampUtc: now + 500,
+    dataStatus: 'UNAVAILABLE',
+    sourceLabel: 'Binance · UNAVAILABLE',
+  });
+
+  assert.equal(hasAnyLiveTickerPrice([deadBtc]), false);
+  assert.equal(hasAnyLiveTickerPrice([liveBtc]), true);
+
+  // $0 UNAVAILABLE server payload must NOT overwrite live client quote
+  const merged = mergeTickerFeedSnapshots([liveBtc], [deadBtc]);
+  assert.equal(merged.length, 1);
+  assert.equal(merged[0].lastPrice, 91_200);
+  assert.equal(merged[0].dataStatus, 'LIVE_EXCHANGE');
+
+  // pickBestBenchmarkTicker prefers LIVE_EXCHANGE PERPETUAL quote over dead primary row
+  const ethDead = makeValidTicker({
+    symbol: 'ETH/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 0,
+    dataStatus: 'UNAVAILABLE',
+  });
+  const ethOkxLive = makeValidTicker({
+    symbol: 'ETH/USDT',
+    exchange: 'OKX',
+    marketType: 'PERPETUAL',
+    lastPrice: 3_150,
+    bidPrice: 3_149,
+    askPrice: 3_151,
+    dataStatus: 'LIVE_EXCHANGE',
+  });
+  assert.equal(pickBestBenchmarkTicker([ethDead, ethOkxLive], 'ETH/USDT', 'PERPETUAL')?.lastPrice, 3_150);
+
+  // OKX V5 public WebSocket frame parser
+  const parsedTick = parseOkxPublicTickerFrame(
+    JSON.stringify({
+      arg: { channel: 'tickers', instId: 'BTC-USDT-SWAP' },
+      data: [
+        {
+          instId: 'BTC-USDT-SWAP',
+          last: '92500.5',
+          bidPx: '92500.0',
+          askPx: '92501.0',
+          open24h: '90000.0',
+          high24h: '93000.0',
+          low24h: '89500.0',
+          volCcy24h: '12500',
+          ts: String(now + 2000),
+        },
+      ],
+    }),
+  );
+  assert.ok(parsedTick);
+  assert.equal(parsedTick.symbol, 'BTC/USDT');
+  assert.equal(parsedTick.marketType, 'PERPETUAL');
+  assert.equal(parsedTick.lastPrice, 92_500.5);
+
+  const subArgs = buildOkxSubscriptionArgs([liveBtc, ethOkxLive]);
+  assert.ok(subArgs.some((a) => a.instId === 'BTC-USDT-SWAP'));
+  assert.ok(subArgs.some((a) => a.instId === 'ETH-USDT-SWAP'));
+
+  // Apply valid OKX tick onto stale/empty tickers and reprice floating position
+  const updatedTickers = applyDirectExchangeWsTick([deadBtc], parsedTick);
+  assert.equal(updatedTickers[0].lastPrice, 92_500.5);
+  assert.equal(updatedTickers[0].dataStatus, 'LIVE_EXCHANGE');
+  assert.ok(updatedTickers[0].change24hPct > 2);
+
+  // Anomalous crossed book must be rejected cleanly
+  const rejectedTickers = applyDirectExchangeWsTick(updatedTickers, {
+    ...parsedTick,
+    lastPrice: 92_600,
+    bidPrice: 93_000,
+    askPrice: 92_400,
+    timestampUtc: now + 3000,
+  });
+  assert.equal(rejectedTickers[0].lastPrice, 92_500.5);
+
+  const pos: Position = {
+    id: 'POS-REPRICE-1',
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    side: 'LONG',
+    quantity: 0.2,
+    entryPrice: 90_000,
+    markPrice: 90_000,
+    stopLoss: 88_000,
+    takeProfit: 95_000,
+    leverage: 2,
+    marginUsd: 9_000,
+    unrealizedPnlUsd: 0,
+    unrealizedPnlPct: 0,
+    liquidationPrice: 45_500,
+    fundingPaidUsd: 0,
+    strategyName: 'Direct WS Test',
+    mode: 'PAPER',
+    openedAtUtc: new Date(now).toISOString(),
+  };
+  const portfolio: PortfolioSummary = {
+    mode: 'FULL_AUTO',
+    initialEquityUsd: 100_000,
+    totalEquityUsd: 100_000,
+    availableBalanceUsd: 91_000,
+    usedMarginUsd: 9_000,
+    realizedPnlUsd: 0,
+    unrealizedPnlUsd: 0,
+    totalFeesUsd: 0,
+    dailyPnlPct: 0,
+    weeklyPnlPct: 0,
+    peakEquityUsd: 100_000,
+    currentDrawdownPct: 0,
+    winCount: 0,
+    lossCount: 0,
+    totalClosedTrades: 0,
+    winRatePct: null,
+  };
+
+  const repriced = repricePortfolioAndPositions(portfolio, [pos], updatedTickers);
+  assert.equal(repriced.positions[0].markPrice, 92_500.5);
+  assert.equal(repriced.positions[0].unrealizedPnlUsd, 500.1);
+  assert.equal(repriced.portfolio.unrealizedPnlUsd, 500.1);
+  assert.equal(repriced.portfolio.totalEquityUsd, 100_500.1);
 });
 
 

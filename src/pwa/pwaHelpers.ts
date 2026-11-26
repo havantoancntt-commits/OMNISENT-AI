@@ -290,6 +290,16 @@ export function parseTelemetrySnapshot(
     if (nowMs - parsed.savedAtMs > maxAgeMs || parsed.savedAtMs > nowMs + 60_000) {
       return null;
     }
+    const hasPositivePrice = parsed.tickers.some(
+      (t) =>
+        t &&
+        typeof t === 'object' &&
+        typeof (t as { lastPrice?: unknown }).lastPrice === 'number' &&
+        (t as { lastPrice: number }).lastPrice > 0,
+    );
+    if (!hasPositivePrice) {
+      return null;
+    }
     return {
       v: 1,
       savedAtMs: parsed.savedAtMs,

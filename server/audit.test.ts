@@ -191,6 +191,8 @@ test('HTTP security headers, diagnostics, atomic POST /api/positions/:id/close r
   assert.ok(cacheControl.includes('no-cache'));
   const bootstrapJson = (await bootstrapRes.json()) as {
     stateRevision: number;
+    wsSupported: boolean;
+    feedAgeMs: number | null;
     tradingMode: string;
     portfolio: { totalEquityUsd: number };
     positions: unknown[];
@@ -198,8 +200,28 @@ test('HTTP security headers, diagnostics, atomic POST /api/positions/:id/close r
     serverUtc: string;
   };
   assert.equal(typeof bootstrapJson.stateRevision, 'number');
+  assert.equal(typeof bootstrapJson.wsSupported, 'boolean');
+  assert.ok(bootstrapJson.feedAgeMs === null || typeof bootstrapJson.feedAgeMs === 'number');
   assert.equal(bootstrapJson.tradingMode, 'PAPER');
   assert.ok(Array.isArray(bootstrapJson.positions));
   assert.ok(Array.isArray(bootstrapJson.tickers));
   assert.ok(typeof bootstrapJson.serverUtc === 'string' && bootstrapJson.serverUtc.length > 0);
+});
+
+test('openDatabaseWithRecovery quarantines corrupted SQLite files and recovers a clean writable DB', () => {
+  const corruptPath = path.join(tempDataDir, 'corrupt-probe.db');
+  fs.writeFileSync(corruptPath, Buffer.from('not-a-valid-sqlite-database-image-corrupted-bytes'));
+  const recovered = dbModule.openDatabaseWithRecovery(corruptPath);
+  try {
+    recovered.exec('CREATE TABLE IF NOT EXISTS probe (id INTEGER PRIMARY KEY);');
+    recovered.exec('INSERT INTO probe (id) VALUES (1);');
+    const row = recovered.prepare('SELECT id FROM probe WHERE id = 1').get() as { id?: number };
+    assert.equal(row?.id, 1);
+    const quarantined = fs
+      .readdirSync(tempDataDir)
+      .filter((name) => name.startsWith('corrupt-probe.db.corrupt.'));
+    assert.equal(quarantined.length, 1);
+  } finally {
+    recovered.close();
+  }
 });

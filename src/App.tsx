@@ -56,6 +56,15 @@ import {
   serializeTelemetrySnapshot,
 } from './pwa/pwaHelpers';
 import {
+  applyDirectExchangeWsTick,
+  buildOkxSubscriptionArgs,
+  hasAnyLiveTickerPrice,
+  mergeTickerFeedSnapshots,
+  parseOkxPublicTickerFrame,
+  pickBestBenchmarkTicker,
+  repricePortfolioAndPositions,
+} from './pwa/directPriceSync';
+import {
   OfflineIndicator,
   PWAInstallControl,
   PWAInstallModal,
@@ -197,6 +206,22 @@ export default function App() {
   const wsSyncTimerRef = useRef<number | null>(null);
   const lastSnapshotPersistMsRef = useRef<number>(0);
   const lastKnownRevisionRef = useRef<number | null>(null);
+  const wsSupportedRef = useRef<boolean>(true);
+  const tickersRef = useRef<MarketTicker[]>(tickers);
+  const portfolioRef = useRef<PortfolioSummary>(portfolio);
+  const positionsRef = useRef<Position[]>(positions);
+
+  useEffect(() => {
+    tickersRef.current = tickers;
+  }, [tickers]);
+
+  useEffect(() => {
+    portfolioRef.current = portfolio;
+  }, [portfolio]);
+
+  useEffect(() => {
+    positionsRef.current = positions;
+  }, [positions]);
 
   const persistTelemetrySnapshotThrottled = useCallback(
     (meta: {
@@ -207,7 +232,7 @@ export default function App() {
       portfolio: PortfolioSummary;
       positions: Position[];
     }) => {
-      if (typeof window === 'undefined' || meta.tickers.length === 0) return;
+      if (typeof window === 'undefined' || !hasAnyLiveTickerPrice(meta.tickers)) return;
       const now = Date.now();
       if (now - lastSnapshotPersistMsRef.current < 2500) return;
       lastSnapshotPersistMsRef.current = now;
@@ -254,11 +279,13 @@ export default function App() {
       if (mktRes.ok) {
         const mkt = await mktRes.json();
         const nextTickers: MarketTicker[] = Array.isArray(mkt.tickers) ? mkt.tickers : [];
-        latestTickers = nextTickers;
+        const mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, nextTickers);
+        tickersRef.current = mergedTickers;
+        latestTickers = mergedTickers;
         latestUtc = mkt.serverUtc ?? '';
-        setTickers(nextTickers);
-        setLiveFeedActive(Boolean(mkt.liveFeedActive));
-        setServerUtc(latestUtc);
+        setTickers(mergedTickers);
+        setLiveFeedActive(Boolean(mkt.liveFeedActive) || hasAnyLiveTickerPrice(mergedTickers));
+        if (latestUtc) setServerUtc(latestUtc);
       }
       if (portRes.ok) {
         const pt = await portRes.json();
@@ -326,18 +353,28 @@ export default function App() {
     }
   }, [persistTelemetrySnapshotThrottled, reportDataSync]);
 
-  const fetchFastBootstrap = useCallback(async () => {
+  const fetchFastBootstrap = useCallback(async (): Promise<{ wsSupported?: boolean } | null> => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
       reportDataSync({ transport: 'OFFLINE_CACHED' });
-      return;
+      return null;
     }
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     try {
       const res = await fetch('/api/sync/bootstrap', { cache: 'no-store' });
-      if (!res.ok) return;
+      if (!res.ok) return null;
       const data = await res.json();
-      if (Array.isArray(data.tickers)) setTickers(data.tickers);
-      if (typeof data.liveFeedActive === 'boolean') setLiveFeedActive(data.liveFeedActive);
+      if (typeof data.wsSupported === 'boolean') {
+        wsSupportedRef.current = data.wsSupported;
+      }
+      let mergedTickers: MarketTicker[] = tickersRef.current;
+      if (Array.isArray(data.tickers)) {
+        mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, data.tickers as MarketTicker[]);
+        tickersRef.current = mergedTickers;
+        setTickers(mergedTickers);
+      }
+      if (typeof data.liveFeedActive === 'boolean') {
+        setLiveFeedActive(data.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+      }
       if (data.serverUtc) setServerUtc(data.serverUtc);
       if (data.portfolio) setPortfolio(data.portfolio);
       if (Array.isArray(data.positions)) setPositions(data.positions);
@@ -369,20 +406,24 @@ export default function App() {
         lastKnownRevisionRef.current = nextRevision;
       }
 
-      if (Array.isArray(data.tickers) && data.portfolio && Array.isArray(data.positions)) {
+      if (mergedTickers.length > 0 && data.portfolio && Array.isArray(data.positions)) {
         persistTelemetrySnapshotThrottled({
           stateRevision: nextRevision,
           tradingMode: String(data.tradingMode ?? data.portfolio.mode ?? 'FULL_AUTO'),
           serverUtc: String(data.serverUtc ?? ''),
-          tickers: data.tickers as MarketTicker[],
+          tickers: mergedTickers,
           portfolio: data.portfolio as PortfolioSummary,
           positions: data.positions as Position[],
         });
       }
+      return {
+        wsSupported: typeof data.wsSupported === 'boolean' ? data.wsSupported : undefined,
+      };
     } catch {
       reportDataSync({
         transport: navigator.onLine ? 'SYNCING' : 'OFFLINE_CACHED',
       });
+      return null;
     }
   }, [fetchAllState, persistTelemetrySnapshotThrottled, reportDataSync]);
 
@@ -391,13 +432,19 @@ export default function App() {
     return registerDataSyncHandler(fetchAllState);
   }, [registerDataSyncHandler, fetchAllState]);
 
-  // Bootstrap initial state, WebSocket telemetry stream, fast HTTP fallback & PWA lifecycle resume sync
+  // Bootstrap initial state, WebSocket telemetry stream, serverless Direct OKX WS & PWA lifecycle resume sync
   useEffect(() => {
     void fetchAllState();
 
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
     const wsUrl = `${proto}//${window.location.host}/ws`;
     let ws: WebSocket | null = null;
+    let directWs: WebSocket | null = null;
+    let directPingTimer: number | null = null;
+    let directReconnectTimer: number | null = null;
+    let directConnected = false;
+    let directFailCount = 0;
+    let pollTickCount = 0;
     let closedByEffect = false;
     let wsConnected = false;
     let everOpened = false;
@@ -410,6 +457,147 @@ export default function App() {
     let prevEventTs = 0;
     let prevStateRevision: number | null = null;
 
+    const safelyCloseSocket = (sock: WebSocket | null) => {
+      if (!sock) return;
+      sock.onmessage = null;
+      sock.onclose = null;
+      sock.onerror = null;
+      if (sock.readyState === WebSocket.OPEN) {
+        try {
+          sock.close();
+        } catch {
+          // ignore
+        }
+      } else if (sock.readyState === WebSocket.CONNECTING) {
+        sock.onopen = () => {
+          try {
+            sock.close();
+          } catch {
+            // ignore
+          }
+        };
+      }
+    };
+
+    const stopDirectExchangeWs = () => {
+      directConnected = false;
+      if (directPingTimer !== null) {
+        window.clearInterval(directPingTimer);
+        directPingTimer = null;
+      }
+      if (directReconnectTimer !== null) {
+        window.clearTimeout(directReconnectTimer);
+        directReconnectTimer = null;
+      }
+      safelyCloseSocket(directWs);
+      directWs = null;
+    };
+
+    const startDirectExchangeWs = () => {
+      if (closedByEffect || wsConnected || directFailCount >= 3) return;
+      if (document.visibilityState === 'hidden') return;
+      if (typeof navigator !== 'undefined' && !navigator.onLine) return;
+      if (directWs && (directWs.readyState === WebSocket.OPEN || directWs.readyState === WebSocket.CONNECTING)) {
+        return;
+      }
+      try {
+        const sock = new WebSocket('wss://ws.okx.com:8443/ws/v5/public');
+        directWs = sock;
+        let directEverOpened = false;
+
+        sock.onerror = () => {
+          // fallback HTTP polling continues automatically
+        };
+        sock.onopen = () => {
+          if (closedByEffect || wsConnected) {
+            try {
+              sock.close();
+            } catch {
+              // ignore
+            }
+            return;
+          }
+          directConnected = true;
+          directEverOpened = true;
+          directFailCount = 0;
+          reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
+          try {
+            sock.send(
+              JSON.stringify({
+                op: 'subscribe',
+                args: buildOkxSubscriptionArgs(tickersRef.current),
+              }),
+            );
+          } catch {
+            // ignore
+          }
+          if (directPingTimer !== null) window.clearInterval(directPingTimer);
+          directPingTimer = window.setInterval(() => {
+            if (sock.readyState === WebSocket.OPEN) {
+              try {
+                sock.send('ping');
+              } catch {
+                // ignore
+              }
+            }
+          }, 20_000);
+        };
+        sock.onmessage = (ev) => {
+          if (closedByEffect || wsConnected) return;
+          const parsedTick = parseOkxPublicTickerFrame(typeof ev.data === 'string' ? ev.data : '');
+          if (!parsedTick) return;
+          const updatedTickers = applyDirectExchangeWsTick(tickersRef.current, parsedTick);
+          if (updatedTickers === tickersRef.current) return;
+
+          tickersRef.current = updatedTickers;
+          setTickers(updatedTickers);
+          setLiveFeedActive(true);
+          const utc = new Date(parsedTick.timestampUtc).toISOString();
+          setServerUtc(utc);
+          reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
+
+          const repriced = repricePortfolioAndPositions(
+            portfolioRef.current,
+            positionsRef.current,
+            updatedTickers,
+          );
+          if (repriced.portfolio !== portfolioRef.current) {
+            portfolioRef.current = repriced.portfolio;
+            setPortfolio(repriced.portfolio);
+          }
+          if (repriced.positions !== positionsRef.current) {
+            positionsRef.current = repriced.positions;
+            setPositions(repriced.positions);
+          }
+
+          persistTelemetrySnapshotThrottled({
+            stateRevision: lastKnownRevisionRef.current,
+            tradingMode: repriced.portfolio.mode ?? 'FULL_AUTO',
+            serverUtc: utc,
+            tickers: updatedTickers,
+            portfolio: repriced.portfolio,
+            positions: repriced.positions,
+          });
+        };
+        sock.onclose = () => {
+          directConnected = false;
+          if (directPingTimer !== null) {
+            window.clearInterval(directPingTimer);
+            directPingTimer = null;
+          }
+          if (!directEverOpened) {
+            directFailCount += 1;
+            if (directFailCount >= 3 || closedByEffect) return;
+          }
+          if (!closedByEffect && !wsConnected && document.visibilityState === 'visible') {
+            directReconnectTimer = window.setTimeout(startDirectExchangeWs, 4000);
+          }
+        };
+      } catch {
+        directFailCount += 1;
+      }
+    };
+
     const scheduleFullRefresh = () => {
       if (wsSyncTimerRef.current !== null) {
         window.clearTimeout(wsSyncTimerRef.current);
@@ -420,12 +608,14 @@ export default function App() {
       }, 220);
     };
 
-    // Adaptive fallback polling when WS unavailable (paused when PWA is backgrounded to preserve battery)
+    // Adaptive fallback polling (paused when PWA is backgrounded to preserve battery)
     const fastBootstrapTimer = window.setInterval(() => {
       if (!wsConnected && !closedByEffect && document.visibilityState === 'visible') {
+        pollTickCount += 1;
+        if (directConnected && pollTickCount % 2 !== 0) return;
         void fetchFastBootstrap();
       }
-    }, 2000);
+    }, 2500);
 
     const pollTimer = window.setInterval(() => {
       if (!wsConnected && !closedByEffect && document.visibilityState === 'visible') {
@@ -437,6 +627,10 @@ export default function App() {
       if (closedByEffect) return;
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         reportDataSync({ transport: 'OFFLINE_CACHED' });
+        return;
+      }
+      if (wsSupportedRef.current === false || (!everOpened && failedHandshakes >= 2)) {
+        startDirectExchangeWs();
         return;
       }
       if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
@@ -451,29 +645,37 @@ export default function App() {
           wsConnected = true;
           everOpened = true;
           failedHandshakes = 0;
+          stopDirectExchangeWs();
           reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
         };
         ws.onmessage = (ev) => {
           try {
             const msg = JSON.parse(ev.data);
             if (msg.type === 'PRICE_TICK_UPDATE') {
-              if (Array.isArray(msg.tickers)) setTickers(msg.tickers);
+              let mergedTickers: MarketTicker[] = tickersRef.current;
+              if (Array.isArray(msg.tickers)) {
+                mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, msg.tickers as MarketTicker[]);
+                tickersRef.current = mergedTickers;
+                setTickers(mergedTickers);
+              }
               if (msg.portfolio) setPortfolio(msg.portfolio);
               if (Array.isArray(msg.positions)) setPositions(msg.positions);
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
               }
-              if (typeof msg.liveFeedActive === 'boolean') setLiveFeedActive(msg.liveFeedActive);
+              if (typeof msg.liveFeedActive === 'boolean') {
+                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+              }
               if (msg.serverUtc) setServerUtc(msg.serverUtc);
               reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
 
-              if (Array.isArray(msg.tickers) && msg.portfolio && Array.isArray(msg.positions)) {
+              if (mergedTickers.length > 0 && msg.portfolio && Array.isArray(msg.positions)) {
                 persistTelemetrySnapshotThrottled({
                   stateRevision:
                     typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision,
                   tradingMode: msg.portfolio.mode ?? 'FULL_AUTO',
                   serverUtc: msg.serverUtc ?? '',
-                  tickers: msg.tickers as MarketTicker[],
+                  tickers: mergedTickers,
                   portfolio: msg.portfolio as PortfolioSummary,
                   positions: msg.positions as Position[],
                 });
@@ -505,14 +707,21 @@ export default function App() {
               return;
             }
             if (msg.type === 'TELEMETRY_UPDATE') {
-              if (Array.isArray(msg.tickers)) setTickers(msg.tickers);
+              let mergedTickers: MarketTicker[] = tickersRef.current;
+              if (Array.isArray(msg.tickers)) {
+                mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, msg.tickers as MarketTicker[]);
+                tickersRef.current = mergedTickers;
+                setTickers(mergedTickers);
+              }
               if (msg.portfolio) setPortfolio(msg.portfolio);
               if (Array.isArray(msg.positions)) setPositions(msg.positions);
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
               }
               if (msg.tradingMode) setTradingMode(msg.tradingMode);
-              if (typeof msg.liveFeedActive === 'boolean') setLiveFeedActive(msg.liveFeedActive);
+              if (typeof msg.liveFeedActive === 'boolean') {
+                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+              }
               if (msg.autoExecutionStatus) {
                 setAutoExecutionStatus(msg.autoExecutionStatus as AutoExecutionEngineStatus);
               }
@@ -569,22 +778,35 @@ export default function App() {
           if (!everOpened) {
             failedHandshakes += 1;
           }
-          // Stop spamming WS reconnects if host doesn't support WS upgrades (e.g. serverless); fastBootstrapTimer continues smoothly
-          if (!closedByEffect && (everOpened || failedHandshakes < 2)) {
+          if (!closedByEffect && (everOpened || failedHandshakes < 2) && wsSupportedRef.current !== false) {
             reconnectTimer = window.setTimeout(connect, 3500);
+          } else if (!closedByEffect) {
+            startDirectExchangeWs();
           }
         };
       } catch {
         wsConnected = false;
+        startDirectExchangeWs();
       }
     };
-    connect();
+
+    void fetchFastBootstrap().then((boot) => {
+      if (closedByEffect) return;
+      if (boot?.wsSupported === false) {
+        startDirectExchangeWs();
+      } else {
+        connect();
+      }
+    });
 
     // Immediate PWA Resume / Network Recovery Synchronization
     let lastResumeSyncMs = 0;
     const handleResumeSync = () => {
       if (closedByEffect) return;
-      if (document.visibilityState === 'hidden') return;
+      if (document.visibilityState === 'hidden') {
+        stopDirectExchangeWs();
+        return;
+      }
       if (typeof navigator !== 'undefined' && !navigator.onLine) {
         reportDataSync({ transport: 'OFFLINE_CACHED' });
         return;
@@ -593,21 +815,31 @@ export default function App() {
       if (now - lastResumeSyncMs < 1500) return;
       lastResumeSyncMs = now;
       void fetchFastBootstrap();
-      if (!wsConnected && (everOpened || failedHandshakes < 2)) {
-        connect();
+      if (!wsConnected) {
+        if (wsSupportedRef.current !== false && (everOpened || failedHandshakes < 2)) {
+          connect();
+        } else {
+          startDirectExchangeWs();
+        }
       }
     };
 
     const handleOnlineRecovery = () => {
       failedHandshakes = 0;
+      directFailCount = 0;
       void fetchAllState();
       if (!wsConnected) {
-        connect();
+        if (wsSupportedRef.current === false) {
+          startDirectExchangeWs();
+        } else {
+          connect();
+        }
       }
     };
 
     const handleOffline = () => {
       wsConnected = false;
+      stopDirectExchangeWs();
       reportDataSync({ transport: 'OFFLINE_CACHED' });
     };
 
@@ -632,23 +864,8 @@ export default function App() {
       if (wsSyncTimerRef.current !== null) {
         window.clearTimeout(wsSyncTimerRef.current);
       }
-      if (ws) {
-        const closingSocket = ws;
-        closingSocket.onmessage = null;
-        closingSocket.onclose = null;
-        closingSocket.onerror = null;
-        if (closingSocket.readyState === WebSocket.OPEN) {
-          closingSocket.close();
-        } else if (closingSocket.readyState === WebSocket.CONNECTING) {
-          closingSocket.onopen = () => {
-            try {
-              closingSocket.close();
-            } catch {
-              // ignore
-            }
-          };
-        }
-      }
+      stopDirectExchangeWs();
+      safelyCloseSocket(ws);
     };
   }, [fetchAllState, fetchFastBootstrap, persistTelemetrySnapshotThrottled, reportDataSync]);
 
@@ -688,11 +905,17 @@ export default function App() {
     return () => window.removeEventListener('keydown', onKeyDown);
   }, []);
 
-  const selectedTicker = findMatchingTicker(tickers, {
+  const rawSelectedTicker = findMatchingTicker(tickers, {
     symbol: selectedSymbol,
     marketType: selectedMarketType,
     exchange: selectedExchange,
   });
+  const selectedTicker =
+    rawSelectedTicker && rawSelectedTicker.lastPrice > 0
+      ? rawSelectedTicker
+      : pickBestBenchmarkTicker(tickers, selectedSymbol, selectedMarketType) ??
+        rawSelectedTicker ??
+        null;
   const selectedSignal = findMatchingSignal(signals, selectedTicker);
   const uniquePairTickers = dedupeTickersByPair(tickers);
 
@@ -723,7 +946,9 @@ export default function App() {
     }
     const data = await res.json();
     if (Array.isArray(data.tickers)) {
-      setTickers(data.tickers);
+      const mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, data.tickers as MarketTicker[]);
+      tickersRef.current = mergedTickers;
+      setTickers(mergedTickers);
     }
     const chosenSym = data.ticker?.symbol ?? symbol;
     const chosenMkt = (data.ticker?.marketType ?? marketType) as MarketType;
