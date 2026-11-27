@@ -3845,7 +3845,93 @@ test('Direct PWA Price Sync protects against $0 overwrites, parses OKX WS frames
   assert.equal(repriced.positions[0].unrealizedPnlUsd, 500.1);
   assert.equal(repriced.portfolio.unrealizedPnlUsd, 500.1);
   assert.equal(repriced.portfolio.totalEquityUsd, 100_500.1);
+  assert.equal(repriced.portfolio.availableBalanceUsd, 91_500.1);
+
+  // Repeated repricing across multiple live ticks with non-zero realizedPnlUsd must NEVER double-count unrealized PnL
+  const fundedPortfolio: PortfolioSummary = {
+    ...portfolio,
+    realizedPnlUsd: 250,
+    totalEquityUsd: 100_250,
+    availableBalanceUsd: 91_250,
+  };
+  const tick1 = repricePortfolioAndPositions(fundedPortfolio, [pos], updatedTickers);
+  assert.equal(tick1.portfolio.unrealizedPnlUsd, 500.1);
+  assert.equal(tick1.portfolio.totalEquityUsd, 100_750.1);
+  assert.equal(tick1.portfolio.availableBalanceUsd, 91_750.1);
+
+  const nextTickers = updatedTickers.map((t) => ({ ...t, lastPrice: 93_000 }));
+  const tick2 = repricePortfolioAndPositions(tick1.portfolio, tick1.positions, nextTickers);
+  assert.equal(tick2.positions[0].unrealizedPnlUsd, 600);
+  assert.equal(tick2.portfolio.unrealizedPnlUsd, 600);
+  assert.equal(tick2.portfolio.totalEquityUsd, 100_850); // 100_000 + 250 + 600 (no double-count)
+  assert.equal(tick2.portfolio.availableBalanceUsd, 91_850); // 100_850 - 9_000
+  assert.equal(tick2.portfolio.weeklyPnlPct, tick2.portfolio.dailyPnlPct);
+
+  // When an older REST poll arrives with stale server mark/equity while client WS tickers are newer,
+  // repricePortfolioAndPositions after mergeTickerFeedSnapshots keeps mark & floating PnL consistent.
+  const staleServerRestTickers = [{ ...deadBtc, lastPrice: 90_500, dataStatus: 'LIVE_EXCHANGE' as const, timestampUtc: now - 5_000 }];
+  const liveClientWsTickers = [{ ...deadBtc, lastPrice: 93_000, dataStatus: 'LIVE_EXCHANGE' as const, timestampUtc: now + 8_000 }];
+  const mergedNoSnapBack = mergeTickerFeedSnapshots(liveClientWsTickers, staleServerRestTickers);
+  assert.equal(mergedNoSnapBack[0].lastPrice, 93_000);
+  const reconciled = repricePortfolioAndPositions(
+    { ...fundedPortfolio, totalEquityUsd: 100_350, unrealizedPnlUsd: 100, availableBalanceUsd: 91_350 },
+    [{ ...pos, markPrice: 90_500, unrealizedPnlUsd: 100 }],
+    mergedNoSnapBack,
+  );
+  assert.equal(reconciled.positions[0].markPrice, 93_000);
+  assert.equal(reconciled.portfolio.totalEquityUsd, 100_850);
+
+  // Zero-position reconciliation repairs stale unrealized/equity cleanly
+  const flatCleared = repricePortfolioAndPositions(tick2.portfolio, [], nextTickers);
+  assert.equal(flatCleared.portfolio.unrealizedPnlUsd, 0);
+  assert.equal(flatCleared.portfolio.usedMarginUsd, 0);
+  assert.equal(flatCleared.portfolio.totalEquityUsd, 100_250);
+  assert.equal(flatCleared.portfolio.availableBalanceUsd, 100_250);
 });
+
+test('PWA telemetry snapshot preserves selectedPair & secret-free autoExecutionStatus and computeHurstRegime filters bad bars', () => {
+  const serialized = serializeTelemetrySnapshot({
+    nowMs: 1_700_000_000_000,
+    stateRevision: 42,
+    tradingMode: 'FULL_AUTO',
+    serverUtc: '2026-11-27T00:00:00.000Z',
+    tickers: [{ symbol: 'SOL/USDT', lastPrice: 210 }],
+    portfolio: { totalEquityUsd: 101_200, apiKey: 'should-be-stripped', secret: 'never-stored' },
+    positions: [],
+    selectedPair: { symbol: 'SOL/USDT', marketType: 'PERPETUAL', exchange: 'Binance' },
+    autoExecutionStatus: {
+      engineRunning: true,
+      tradingMode: 'FULL_AUTO',
+      autoTradesTotalCount: 3,
+      passphrase: 'must-not-persist',
+    },
+  });
+
+  const parsed = parseTelemetrySnapshot(serialized, 1_700_000_010_000);
+  assert.ok(parsed);
+  assert.equal(parsed.selectedPair?.symbol, 'SOL/USDT');
+  assert.equal(parsed.selectedPair?.marketType, 'PERPETUAL');
+  assert.equal(parsed.selectedPair?.exchange, 'Binance');
+  assert.equal((parsed.portfolio as Record<string, unknown>).apiKey, undefined);
+  assert.equal((parsed.portfolio as Record<string, unknown>).secret, undefined);
+  assert.equal((parsed.autoExecutionStatus as Record<string, unknown>).engineRunning, true);
+  assert.equal((parsed.autoExecutionStatus as Record<string, unknown>).passphrase, undefined);
+
+  // computeHurstRegime skips non-positive/NaN corrupt closes without crashing or generating artificial jumps
+  const mixedCandles: Candle[] = Array.from({ length: 30 }, (_, i) => ({
+    timestamp: 1_700_000_000_000 + i * 3600_000,
+    open: 100 + i,
+    high: 102 + i,
+    low: 99 + i,
+    close: i === 5 ? 0 : i === 12 ? Number.NaN : 100 + i * 1.5,
+    volume: 1000,
+  }));
+  const hurst = computeHurstRegime(mixedCandles);
+  assert.equal(hurst.sampleBars, 28);
+  assert.ok(Number.isFinite(hurst.hurstExponent) && hurst.hurstExponent >= 0.15 && hurst.hurstExponent <= 0.92);
+  assert.ok(Number.isFinite(hurst.efficiencyRatio) && hurst.efficiencyRatio > 0.8);
+});
+
 
 
 

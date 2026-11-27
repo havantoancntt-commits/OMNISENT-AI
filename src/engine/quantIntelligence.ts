@@ -29,7 +29,10 @@ function clamp(v: number, min: number, max: number): number {
  * - 0.44..0.56: random-walk noise / chop
  */
 export function computeHurstRegime(candles: Candle[]): HurstRegimeResult {
-  const sampleBars = candles.length;
+  const closes = candles
+    .map((c) => c.close)
+    .filter((c) => Number.isFinite(c) && c > 0);
+  const sampleBars = closes.length;
   if (sampleBars < 24) {
     return {
       hurstExponent: 0.5,
@@ -39,8 +42,7 @@ export function computeHurstRegime(candles: Candle[]): HurstRegimeResult {
     };
   }
 
-  const closes = candles.map((c) => c.close);
-  const logCloses = closes.map((c) => (c > 0 ? Math.log(c) : 0));
+  const logCloses = closes.map((c) => Math.log(c));
 
   // Kaufman Efficiency Ratio over up to 24 recent bars
   const erWindow = Math.min(24, closes.length - 1);

@@ -27,6 +27,11 @@ before(async () => {
 
 after(async () => {
   delete process.env.OMNISENT_ADMIN_TOKEN;
+  try {
+    serverModule?.clearAutonomousReplenishmentTimer?.();
+  } catch {
+    // ignore
+  }
   await new Promise<void>((resolve) => {
     httpServer.close(() => resolve());
   });
@@ -159,7 +164,15 @@ test('HTTP security headers, diagnostics, atomic POST /api/positions/:id/close r
   const closeRes2 = await fetch(`${baseUrl}/api/positions/POS-HTTP-CLOSE-1/close`, {
     method: 'POST',
   });
-  assert.equal(closeRes2.status, 404);
+  assert.equal(closeRes2.status, 409);
+  const closeBody2 = (await closeRes2.json()) as { ok: boolean; alreadyClosed?: boolean };
+  assert.equal(closeBody2.ok, false);
+  assert.equal(closeBody2.alreadyClosed, true);
+
+  const closeResMissing = await fetch(`${baseUrl}/api/positions/POS-NON-EXISTENT-999/close`, {
+    method: 'POST',
+  });
+  assert.equal(closeResMissing.status, 404);
 
   // 3. Verify optional OMNISENT_ADMIN_TOKEN bearer guard blocks unauthorized mutations and allows authorized ones
   process.env.OMNISENT_ADMIN_TOKEN = 'audit-secret-token-xyz';
@@ -206,6 +219,23 @@ test('HTTP security headers, diagnostics, atomic POST /api/positions/:id/close r
   assert.ok(Array.isArray(bootstrapJson.positions));
   assert.ok(Array.isArray(bootstrapJson.tickers));
   assert.ok(typeof bootstrapJson.serverUtc === 'string' && bootstrapJson.serverUtc.length > 0);
+
+  // 5. Verify /api/portfolio and mode/config mutations emit monotonic stateRevision
+  const portRes = await fetch(`${baseUrl}/api/portfolio`);
+  assert.equal(portRes.status, 200);
+  const portJson = (await portRes.json()) as { stateRevision: number };
+  assert.equal(typeof portJson.stateRevision, 'number');
+  assert.ok(portJson.stateRevision >= bootstrapJson.stateRevision);
+
+  const modeRes = await fetch(`${baseUrl}/api/mode`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'SEMI_AUTO' }),
+  });
+  assert.equal(modeRes.status, 200);
+  const modeJson = (await modeRes.json()) as { tradingMode: string; stateRevision: number };
+  assert.equal(modeJson.tradingMode, 'SEMI_AUTO');
+  assert.ok(modeJson.stateRevision > portJson.stateRevision);
 });
 
 test('openDatabaseWithRecovery quarantines corrupted SQLite files and recovers a clean writable DB', () => {

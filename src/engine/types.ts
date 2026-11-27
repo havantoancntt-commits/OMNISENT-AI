@@ -299,6 +299,7 @@ export interface ClosePositionReceipt {
 
 export interface ClosePositionResponse {
   ok: boolean;
+  alreadyClosed?: boolean;
   closedNetPnlUsd?: number;
   receipt?: ClosePositionReceipt;
   error?: string;

@@ -1358,6 +1358,7 @@ export function saveExchangeCredentials(params: {
     params.accountEquitySummaryUsd ?? null,
     params.exchangeId,
   );
+  bumpStateRevision();
 }
 
 export function updateExchangeVerificationStatus(params: {
@@ -1418,6 +1419,7 @@ export function updateExchangeVerificationStatus(params: {
     JSON.stringify(nextPerms),
     params.exchangeId,
   );
+  bumpStateRevision();
 }
 
 const PUBLIC_FEED_EXCHANGES = new Set(['binance', 'bybit', 'okx', 'kraken', 'coinbase']);
@@ -1452,6 +1454,7 @@ export function disconnectExchange(exchangeId: string): void {
     }),
     exchangeId,
   );
+  bumpStateRevision();
 }
 
 export function recordPnlSnapshot(point: PnlHistoryPoint): void {

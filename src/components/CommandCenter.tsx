@@ -15,8 +15,6 @@ import { computeFeedHealthMetrics } from '../engine/priceFeedGuard';
 import { pickBestBenchmarkTicker } from '../pwa/directPriceSync';
 import type {
   AgentState,
-  AutoExecutionConfig,
-  AutoExecutionEngineStatus,
   ClosePositionResponse,
   HtfAlignment,
   MarketTicker,
@@ -28,7 +26,6 @@ import type {
   TradingSignal,
 } from '../engine/types';
 import { ActivePositionsPanel } from './ActivePositionsPanel';
-import { AutoTradePanel } from './AutoTradePanel';
 import { CompanyProfileBoard } from './CompanyProfileBoard';
 import { Workspace3D } from './Workspace3D';
 import { useI18n } from '../i18n/I18nContext';
@@ -70,11 +67,6 @@ interface CommandCenterProps {
   onClosePosition: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp: (id: string, stopLoss: number, takeProfit: number) => Promise<{ ok: boolean; error?: string }>;
   pipelineLoading: boolean;
-  autoExecutionStatus?: AutoExecutionEngineStatus | null;
-  onUpdateAutoConfig?: (partial: Partial<AutoExecutionConfig>) => Promise<{ ok: boolean; error?: string }>;
-  onRunAutoCycle?: () => Promise<{ ok: boolean; error?: string }>;
-  onApproveAutoProposal?: (id: string) => Promise<{ ok: boolean; error?: string }>;
-  onRejectAutoProposal?: (id: string) => Promise<{ ok: boolean; error?: string }>;
 }
 
 export const CommandCenter: React.FC<CommandCenterProps> = ({
@@ -98,11 +90,6 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   onClosePosition,
   onUpdateSlTp,
   pipelineLoading,
-  autoExecutionStatus = null,
-  onUpdateAutoConfig,
-  onRunAutoCycle,
-  onApproveAutoProposal,
-  onRejectAutoProposal,
 }) => {
   const { t } = useI18n();
   const btc = pickBestBenchmarkTicker(tickers, 'BTC/USDT', 'PERPETUAL');
@@ -119,6 +106,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   const onlineAgents = agents.filter((a) => a.status === 'ONLINE' && a.enabled).length;
   const activeSignal = selectedSignal;
   const latestAnySignal = signals[0] ?? null;
+  const isEmergency = tradingMode === 'EMERGENCY_STOP';
 
   const feedHealth = useMemo(() => computeFeedHealthMetrics(tickers), [tickers]);
   const prevPricesRef = useRef<Record<string, number>>({});
@@ -338,8 +326,11 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             </div>
           </div>
 
-          {/* Synchronized Multi-Agent Signal Assessment for Active Coin */}
-          <div className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
+          {/* Unified AI Analysis & 9-Gate Auto-Pilot Engine Card */}
+          <div
+            data-testid="unified-ai-autopilot-card"
+            className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4"
+          >
             <div className="space-y-2.5">
               <div className="flex items-baseline justify-between gap-2">
                 <h2 className="font-display text-sm font-semibold text-slate-100">
@@ -355,7 +346,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 {onSmartScan && (
                   <button
                     type="button"
-                    disabled={pipelineLoading || tickers.length === 0 || tradingMode === 'EMERGENCY_STOP'}
+                    disabled={pipelineLoading || tickers.length === 0 || isEmergency}
                     onClick={onSmartScan}
                     title={t('cmd.ai.scanTitle')}
                     className="flex min-h-[36px] items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-2.5 py-1.5 text-xs font-medium text-cyan-300 whitespace-nowrap hover:border-cyan-500/50 disabled:opacity-50"
@@ -366,7 +357,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 )}
                 <button
                   type="button"
-                  disabled={pipelineLoading || !selectedTicker || tradingMode === 'EMERGENCY_STOP'}
+                  disabled={pipelineLoading || !selectedTicker || isEmergency}
                   onClick={() =>
                     selectedTicker &&
                     onRunPipeline(
@@ -596,24 +587,6 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           </div>
         </section>
       )}
-
-      {/* Autonomous 9-Gate Auto-Execution Status Bar */}
-      {autoExecutionStatus &&
-        onUpdateAutoConfig &&
-        onRunAutoCycle &&
-        onApproveAutoProposal &&
-        onRejectAutoProposal && (
-          <AutoTradePanel
-            variant="compact"
-            status={autoExecutionStatus}
-            onUpdateConfig={onUpdateAutoConfig}
-            onRunCycle={onRunAutoCycle}
-            onApproveProposal={onApproveAutoProposal}
-            onRejectProposal={onRejectAutoProposal}
-            onOpenFullConfig={() => onNavigate('portfolio')}
-            openPositionsCount={positions.length}
-          />
-        )}
 
       {/* Active Positions & Risk Guardrail Strip */}
       <section className="grid grid-cols-1 gap-6 lg:grid-cols-12">

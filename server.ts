@@ -316,6 +316,17 @@ app.use('/api', async (req, res, next) => {
   next();
 });
 
+function getLiveStitchedCandles(
+  candles: Candle[],
+  ticker: MarketTicker | null | undefined,
+  interval: string,
+): Candle[] {
+  if (!ticker || ticker.dataStatus !== 'LIVE_EXCHANGE' || !Number.isFinite(ticker.lastPrice) || ticker.lastPrice <= 0) {
+    return candles;
+  }
+  return mergeLiveTickIntoCandles(candles, ticker.lastPrice, ticker.timestampUtc, interval);
+}
+
 // Helper to recompute portfolio equity, mark-to-market positions, and record real PnL snapshots
 function syncPortfolioAndPositions(options?: {
   eventTag?: string;
@@ -326,14 +337,17 @@ function syncPortfolioAndPositions(options?: {
   positions: Position[];
   latestPnlPoint: PnlHistoryPoint | null;
 } {
-  const portfolio = getPortfolioSummary();
+  const initialPortfolio = getPortfolioSummary();
+  const portfolio = { ...initialPortfolio };
   const positions = getOpenPositions();
   const tickers = marketFeed.getTickers();
   const riskConfig = getRiskConfig();
+  const nowCheckMs = Date.now();
 
   let unrealizedSum = 0;
   let usedMarginSum = 0;
   let autoClosed = false;
+  let positionsDirty = false;
   const updatedPositions: Position[] = [];
 
   for (const pos of positions) {
@@ -342,14 +356,27 @@ function syncPortfolioAndPositions(options?: {
         (t) =>
           t.symbol === pos.symbol &&
           t.marketType === pos.marketType &&
-          t.exchange.toUpperCase() === pos.exchange.toUpperCase(),
+          t.exchange.toUpperCase() === pos.exchange.toUpperCase() &&
+          t.lastPrice > 0,
       ) ??
-      tickers.find((t) => t.symbol === pos.symbol && t.marketType === pos.marketType) ??
-      tickers.find((t) => t.symbol === pos.symbol);
+      tickers.find(
+        (t) => t.symbol === pos.symbol && t.marketType === pos.marketType && t.lastPrice > 0,
+      ) ??
+      tickers.find((t) => t.symbol === pos.symbol && t.lastPrice > 0);
     const hasLiveMark = Boolean(ticker && ticker.lastPrice > 0);
     const markPrice = hasLiveMark && ticker ? ticker.lastPrice : pos.markPrice;
+    const isFreshQuote = Boolean(
+      ticker && (ticker.timestampUtc === 0 || nowCheckMs - ticker.timestampUtc <= 45_000),
+    );
+    const isNonCrossedBook = Boolean(
+      ticker && (ticker.bidPrice <= 0 || ticker.askPrice <= 0 || ticker.askPrice >= ticker.bidPrice),
+    );
     const canEvaluateTriggers = Boolean(
-      ticker && ticker.dataStatus === 'LIVE_EXCHANGE' && ticker.lastPrice > 0,
+      ticker &&
+        ticker.dataStatus === 'LIVE_EXCHANGE' &&
+        ticker.lastPrice > 0 &&
+        isFreshQuote &&
+        isNonCrossedBook,
     );
 
     const lifecycle = evaluateLivePositionLifecycle({
@@ -384,6 +411,7 @@ function syncPortfolioAndPositions(options?: {
         portfolio.lossCount = freshPort.lossCount;
         portfolio.totalClosedTrades = freshPort.totalClosedTrades;
         portfolio.winRatePct = freshPort.winRatePct;
+        portfolio.peakEquityUsd = Math.max(portfolio.peakEquityUsd, freshPort.peakEquityUsd);
       }
       continue;
     }
@@ -416,7 +444,15 @@ function syncPortfolioAndPositions(options?: {
       unrealizedPnlUsd: lifecycle.unrealizedPnlUsd,
       unrealizedPnlPct: lifecycle.unrealizedPnlPct,
     };
-    upsertPosition(updated);
+    const posChanged =
+      updated.markPrice !== pos.markPrice ||
+      updated.stopLoss !== pos.stopLoss ||
+      updated.unrealizedPnlUsd !== pos.unrealizedPnlUsd ||
+      updated.unrealizedPnlPct !== pos.unrealizedPnlPct;
+    if (posChanged) {
+      upsertPosition(updated);
+      positionsDirty = true;
+    }
     updatedPositions.push(updated);
     unrealizedSum += updated.unrealizedPnlUsd;
     usedMarginSum += updated.marginUsd;
@@ -466,7 +502,23 @@ function syncPortfolioAndPositions(options?: {
     });
   }
 
-  savePortfolioSummary(portfolio);
+  const portfolioChanged =
+    autoClosed ||
+    circuitBreakerTripped ||
+    positionsDirty ||
+    portfolio.totalEquityUsd !== initialPortfolio.totalEquityUsd ||
+    portfolio.unrealizedPnlUsd !== initialPortfolio.unrealizedPnlUsd ||
+    portfolio.usedMarginUsd !== initialPortfolio.usedMarginUsd ||
+    portfolio.availableBalanceUsd !== initialPortfolio.availableBalanceUsd ||
+    portfolio.peakEquityUsd !== initialPortfolio.peakEquityUsd ||
+    portfolio.currentDrawdownPct !== initialPortfolio.currentDrawdownPct ||
+    portfolio.dailyPnlPct !== initialPortfolio.dailyPnlPct ||
+    portfolio.weeklyPnlPct !== initialPortfolio.weeklyPnlPct ||
+    portfolio.mode !== initialPortfolio.mode;
+
+  if (portfolioChanged) {
+    savePortfolioSummary(portfolio);
+  }
 
   const nowMs = Date.now();
   const prevSnap = getLatestPnlSnapshot();
@@ -685,10 +737,7 @@ app.get('/api/market/candles', async (req, res) => {
     return;
   }
   const ticker = marketFeed.getTicker(symbol, marketType, exchange);
-  const liveCandles =
-    ticker && ticker.dataStatus === 'LIVE_EXCHANGE' && ticker.lastPrice > 0
-      ? mergeLiveTickIntoCandles(candles, ticker.lastPrice, ticker.timestampUtc, interval)
-      : candles;
+  const liveCandles = getLiveStitchedCandles(candles, ticker, interval);
   const indicators = computeAllIndicators(liveCandles);
   const riskConfig = getRiskConfig();
   const portfolio = getPortfolioSummary();
@@ -743,11 +792,12 @@ app.get('/api/market/liquidation-radar', async (req, res) => {
     });
     return;
   }
-  const indicators = computeAllIndicators(candles);
   const ticker = marketFeed.getTicker(symbol, marketType, exchange);
+  const liveCandles = getLiveStitchedCandles(candles, ticker, interval);
+  const indicators = computeAllIndicators(liveCandles);
   const riskConfig = getRiskConfig();
   const liquidationRadar = computeLiquidationRadar({
-    candles,
+    candles: liveCandles,
     orderBook: book,
     ticker,
     atr14: indicators.atr14,
@@ -954,7 +1004,8 @@ async function runFullMarketAlphaScan(params: {
               cand.liquidityScore,
             );
 
-          const ind = computeAllIndicators(candles);
+          const liveCandles = getLiveStitchedCandles(candles, baseTicker, '1h');
+          const ind = computeAllIndicators(liveCandles);
           const liveTicker: MarketTicker = {
             ...baseTicker,
             rsi14: Number(ind.rsi14.toFixed(1)),
@@ -963,7 +1014,7 @@ async function runFullMarketAlphaScan(params: {
 
           const signal = runMultiAgentDecisionPipeline({
             ticker: liveTicker,
-            candles,
+            candles: liveCandles,
             htfCandles: htfRes.candles,
             orderBook,
             riskConfig,
@@ -1189,7 +1240,7 @@ app.post('/api/agents/:id/action', (req, res) => {
   });
   autoExecRuntime.broadcastAutoStatus?.();
 
-  res.json({ agent: target });
+  res.json({ agent: target, stateRevision: getStateRevision() });
 });
 
 app.post('/api/pipeline/run', async (req, res) => {
@@ -1218,10 +1269,11 @@ app.post('/api/pipeline/run', async (req, res) => {
   const riskConfig = getRiskConfig();
   const { portfolio, positions } = syncPortfolioAndPositions();
   const agents = getAgents();
+  const liveCandles = getLiveStitchedCandles(candles, ticker, '1h');
 
   const signal = runMultiAgentDecisionPipeline({
     ticker,
-    candles,
+    candles: liveCandles,
     htfCandles: htfRes.candles,
     orderBook,
     riskConfig,
@@ -1269,7 +1321,7 @@ app.post('/api/pipeline/run', async (req, res) => {
   });
   autoExecRuntime.broadcastAutoStatus?.();
 
-  res.json({ signal });
+  res.json({ signal, stateRevision: getStateRevision() });
 });
 
 app.post('/api/ai/synthesize', async (req, res) => {
@@ -1294,12 +1346,13 @@ app.post('/api/ai/synthesize', async (req, res) => {
     res.status(503).json({ error: `Chưa có dữ liệu OHLCV thực tế từ sàn cho ${symbol}.` });
     return;
   }
-  const indicators = computeAllIndicators(candles);
+  const liveCandles = getLiveStitchedCandles(candles, ticker, '1h');
+  const indicators = computeAllIndicators(liveCandles);
   const { portfolio, positions } = syncPortfolioAndPositions();
 
   const signal = runMultiAgentDecisionPipeline({
     ticker,
-    candles,
+    candles: liveCandles,
     htfCandles: htfRes.candles,
     orderBook,
     riskConfig: getRiskConfig(),
@@ -1499,10 +1552,16 @@ const autoExecRuntime: {
 
 let isBroadcastingTick = false;
 
-function scheduleAutonomousReplenishment(delayMs = 1800): void {
+export function clearAutonomousReplenishmentTimer(): void {
   if (autoExecRuntime.replenishTimer) {
     clearTimeout(autoExecRuntime.replenishTimer);
+    autoExecRuntime.replenishTimer = null;
   }
+}
+
+function scheduleAutonomousReplenishment(delayMs = 1800): void {
+  clearAutonomousReplenishmentTimer();
+  if (process.env.OMNISENT_SKIP_LISTEN === '1') return;
   autoExecRuntime.replenishTimer = setTimeout(() => {
     autoExecRuntime.replenishTimer = null;
     const cfg = getAutoExecutionConfig();
@@ -1510,6 +1569,7 @@ function scheduleAutonomousReplenishment(delayMs = 1800): void {
     if (!cfg.enabled || (mode !== 'FULL_AUTO' && mode !== 'SEMI_AUTO')) return;
     void runAutonomousExecutionCycle('SCHEDULER');
   }, delayMs);
+  autoExecRuntime.replenishTimer.unref?.();
 }
 
 function pruneAndCountHourlyTrades(nowMs = Date.now()): number {
@@ -2014,7 +2074,7 @@ async function runAutonomousExecutionCycle(
 }
 
 app.get('/api/auto-trade/status', (_req, res) => {
-  res.json(buildAutoExecutionStatus());
+  res.json({ ...buildAutoExecutionStatus(), stateRevision: getStateRevision() });
 });
 
 app.post('/api/auto-trade/config', (req, res) => {
@@ -2067,6 +2127,7 @@ app.post('/api/auto-trade/config', (req, res) => {
   res.json({
     ...buildAutoExecutionStatus(),
     tradingMode: getTradingMode(),
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2080,6 +2141,7 @@ app.post('/api/auto-trade/cycle', async (_req, res) => {
     positions,
     signals: getSignals(20),
     orders: getOrders(50),
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2198,6 +2260,7 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
     orders: getOrders(50),
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2224,7 +2287,7 @@ app.post('/api/auto-trade/proposals/:id/reject', (req, res) => {
     action: 'SEMI_AUTO_PROPOSAL_REJECTED',
     details: `Từ chối đề xuất SEMI_AUTO ${proposal.symbol} ${proposal.side}.`,
   });
-  res.json({ status: buildAutoExecutionStatus() });
+  res.json({ status: buildAutoExecutionStatus(), stateRevision: getStateRevision() });
 });
 
 app.post('/api/session/reset', (req, res) => {
@@ -2256,6 +2319,7 @@ app.post('/api/session/reset', (req, res) => {
   }
   res.json({
     ok: true,
+    stateRevision: getStateRevision(),
     tradingMode: getTradingMode(),
     portfolio,
     positions,
@@ -2399,9 +2463,10 @@ app.post('/api/run/smart', async (req, res) => {
       ]);
       if (candles.length === 0) continue;
 
+      const liveCandles = getLiveStitchedCandles(candles, candidate, '1h');
       const sig = runMultiAgentDecisionPipeline({
         ticker: candidate,
-        candles,
+        candles: liveCandles,
         htfCandles: htfRes.candles,
         orderBook,
         riskConfig,
@@ -2544,7 +2609,8 @@ app.post('/api/run/smart', async (req, res) => {
   if (includeGemini) {
     const smartLocale = req.body?.locale === 'en' ? 'en' : 'vi';
     const { candles } = await marketFeed.getCandles(chosenTicker.symbol, chosenTicker.marketType, '1h', chosenTicker.exchange);
-    const indicators = computeAllIndicators(candles);
+    const liveCandles = getLiveStitchedCandles(candles, chosenTicker, '1h');
+    const indicators = computeAllIndicators(liveCandles);
     synthesis = await synthesizeWithGemini({
       ticker: chosenTicker,
       indicators,
@@ -2589,6 +2655,7 @@ app.post('/api/run/smart', async (req, res) => {
     portfolio: synced.portfolio,
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2625,6 +2692,7 @@ app.get('/api/portfolio', async (_req, res) => {
   });
 
   res.json({
+    stateRevision: getStateRevision(),
     portfolio,
     positions,
     pnlHistory: getPnlHistory(360),
@@ -2805,6 +2873,7 @@ app.post('/api/orders', async (req, res) => {
     portfolio: synced.portfolio,
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2847,16 +2916,46 @@ app.patch('/api/positions/:id', (req, res) => {
 
   const synced = syncPortfolioAndPositions();
   autoExecRuntime.broadcastAutoStatus?.();
-  res.json({ position: updated, portfolio: synced.portfolio, positions: synced.positions });
+  res.json({
+    position: updated,
+    portfolio: synced.portfolio,
+    positions: synced.positions,
+    stateRevision: getStateRevision(),
+  });
 });
 
-app.post('/api/positions/:id/close', (req, res) => {
+app.post('/api/positions/:id/close', async (req, res) => {
   const { id } = req.params;
+  const existingPos = getOpenPositions().find((p) => p.id === id);
+  if (existingPos) {
+    const currentTicker =
+      marketFeed.getTicker(existingPos.symbol, existingPos.marketType, existingPos.exchange) ??
+      marketFeed
+        .getTickers()
+        .find((t) => t.symbol === existingPos.symbol && t.marketType === existingPos.marketType);
+    const isMissingOrStale =
+      !currentTicker ||
+      currentTicker.lastPrice <= 0 ||
+      Date.now() - currentTicker.timestampUtc > 2500;
+    if (isMissingOrStale) {
+      await Promise.race([
+        marketFeed
+          .activatePair(existingPos.symbol, existingPos.marketType, existingPos.exchange)
+          .catch(() => null),
+        new Promise<void>((resolve) => setTimeout(resolve, 2200)),
+      ]);
+    }
+  }
+
   const closeResult = closePositionAtomically({
     positionId: id,
     resolveClosePrice: (pos) => {
-      const ticker = marketFeed.getTicker(pos.symbol, pos.marketType, pos.exchange);
-      return ticker && ticker.lastPrice > 0 ? ticker.lastPrice : pos.markPrice;
+      const exact = marketFeed.getTicker(pos.symbol, pos.marketType, pos.exchange);
+      if (exact && exact.lastPrice > 0) return exact.lastPrice;
+      const peer = marketFeed
+        .getTickers()
+        .find((t) => t.symbol === pos.symbol && t.marketType === pos.marketType && t.lastPrice > 0);
+      return peer ? peer.lastPrice : pos.markPrice;
     },
     closeReason: 'MANUAL_CLOSE',
     idempotencyPrefix: 'CLOSE-MANUAL',
@@ -2865,6 +2964,19 @@ app.post('/api/positions/:id/close', (req, res) => {
   });
 
   if (!closeResult.closed) {
+    const recentCloseOrder = getOrders(20).find(
+      (o) =>
+        o.idempotencyKey === `CLOSE-${id}` ||
+        o.idempotencyKey === `CLOSE-MANUAL-${id}`,
+    );
+    if (recentCloseOrder) {
+      res.status(409).json({
+        ok: false,
+        alreadyClosed: true,
+        error: `Vị thế ${recentCloseOrder.symbol} vừa được hệ thống tự động tất toán ở mức $${recentCloseOrder.price}.`,
+      });
+      return;
+    }
     res.status(404).json({ ok: false, error: 'Không tìm thấy vị thế đang mở hoặc vị thế vừa được đóng.' });
     return;
   }
@@ -2909,6 +3021,7 @@ app.post('/api/positions/:id/close', (req, res) => {
     portfolio: synced.portfolio,
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -2978,7 +3091,11 @@ app.post('/api/risk/config', (req, res) => {
     details: `Cập nhật cấu hình rủi ro: Risk/trade=${next.riskPerTradePct}%, MaxLev=${next.maxLeverage}x, DailyLimit=${next.dailyLossLimitPct}%, MaxDD=${next.maxDrawdownPct}%, MaxAssetExp=${next.maxSingleAssetExposurePct}%.`,
   });
   autoExecRuntime.broadcastAutoStatus?.();
-  res.json({ riskConfig: next, autoExecutionStatus: buildAutoExecutionStatus() });
+  res.json({
+    riskConfig: next,
+    autoExecutionStatus: buildAutoExecutionStatus(),
+    stateRevision: getStateRevision(),
+  });
 });
 
 app.post('/api/mode', (req, res) => {
@@ -3021,7 +3138,11 @@ app.post('/api/mode', (req, res) => {
   if (requested === 'FULL_AUTO' || requested === 'SEMI_AUTO') {
     scheduleAutonomousReplenishment(600);
   }
-  res.json({ tradingMode: requested, autoExecutionStatus: buildAutoExecutionStatus() });
+  res.json({
+    tradingMode: requested,
+    autoExecutionStatus: buildAutoExecutionStatus(),
+    stateRevision: getStateRevision(),
+  });
 });
 
 app.post('/api/emergency-stop', (_req, res) => {
@@ -3041,6 +3162,7 @@ app.post('/api/emergency-stop', (_req, res) => {
     tradingMode: 'EMERGENCY_STOP',
     portfolio: getPortfolioSummary(),
     autoExecutionStatus: buildAutoExecutionStatus(),
+    stateRevision: getStateRevision(),
   });
 });
 
@@ -3630,7 +3752,7 @@ app.post('/api/exchanges/:id/disconnect', (req, res) => {
     action: 'VAULT_KEY_REVOKED',
     details: `Thu hồi và xóa API Key cho sàn ${id}.`,
   });
-  res.json({ exchanges: buildMergedExchanges() });
+  res.json({ exchanges: buildMergedExchanges(), stateRevision: getStateRevision() });
 });
 
 app.get('/api/audit-logs', (_req, res) => {
@@ -3797,7 +3919,7 @@ async function startServer() {
             res.setHeader('Service-Worker-Allowed', '/');
           } else if (base === 'manifest.webmanifest') {
             res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
-            res.setHeader('Cache-Control', 'public, max-age=3600');
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate');
           }
         },
       }),
@@ -3820,6 +3942,7 @@ async function startServer() {
 
   const gracefulShutdown = () => {
     clearInterval(walCheckpointTimer);
+    clearAutonomousReplenishmentTimer();
     checkpointDatabase('TRUNCATE');
     try {
       server.close();

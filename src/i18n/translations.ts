@@ -84,6 +84,11 @@ const vi = {
   'smartRun.resettingBtn': 'Đang xóa...',
   'smartRun.resetZeroBtn': 'Reset về 0',
   'smartRun.executeNowBtn': 'Thực thi RUN ngay',
+  'smartRun.unifiedTitle': 'Trung tâm Thực thi AI & 9-Gate Auto',
+  'smartRun.autoSectionTitle': 'Auto-Pilot 9 Cổng (Đồng bộ trực tiếp)',
+  'smartRun.manualSectionTitle': 'Chế độ RUN Thủ công (19 Robot)',
+  'smartRun.autoActiveBadge': 'AUTO',
+  'smartRun.autoStandbyBadge': 'CHỜ',
 
   // CoinSearchModal
   'search.title': 'Tìm kiếm bất kỳ coin nào trên thị trường',
@@ -237,6 +242,9 @@ const vi = {
   'pos.closeModal.confirmBtn': 'Xác nhận đóng lệnh',
   'pos.closeModal.confirmingBtn': 'Đang tất toán...',
   'pos.closeModal.errFallback': 'Không thể đóng vị thế lúc này. Vui lòng thử lại.',
+  'pos.closeModal.marginReleased': 'Ký quỹ hoàn lại',
+  'pos.closeModal.autoSettledNotice':
+    'Vị thế {symbol} vừa được hệ thống tự động tất toán (SL/TP/Trailing) ngay trước thao tác đóng.',
   'pos.settlement.badge': 'Thông báo tất toán lệnh',
   'pos.settlement.title': 'Đã đóng {side} {symbol} ({leverage}x)',
   'pos.settlement.meta': 'Giá đóng ${closePrice} · Phí ${fee} · {r}R · {time} UTC',
@@ -1005,6 +1013,11 @@ const en: Record<keyof typeof vi, string> = {
   'smartRun.resettingBtn': 'Resetting...',
   'smartRun.resetZeroBtn': 'Reset to Clean',
   'smartRun.executeNowBtn': 'Execute RUN Now',
+  'smartRun.unifiedTitle': 'Unified AI & 9-Gate Auto Engine',
+  'smartRun.autoSectionTitle': '9-Gate Auto-Pilot (Live Sync)',
+  'smartRun.manualSectionTitle': 'Manual Smart RUN (19 Agents)',
+  'smartRun.autoActiveBadge': 'AUTO',
+  'smartRun.autoStandbyBadge': 'STBY',
 
   // CoinSearchModal
   'search.title': 'Global Multi-Exchange Market Search',
@@ -1160,6 +1173,9 @@ const en: Record<keyof typeof vi, string> = {
   'pos.closeModal.confirmBtn': 'Confirm Close',
   'pos.closeModal.confirmingBtn': 'Settling...',
   'pos.closeModal.errFallback': 'Unable to close position right now. Please retry.',
+  'pos.closeModal.marginReleased': 'Margin Released',
+  'pos.closeModal.autoSettledNotice':
+    '{symbol} was just auto-settled (SL/TP/Trailing) immediately before your close request.',
   'pos.settlement.badge': 'Position Settlement Notice',
   'pos.settlement.title': 'Closed {side} {symbol} ({leverage}x)',
   'pos.settlement.meta': 'Exit ${closePrice} · Fee ${fee} · {r}R · {time} UTC',

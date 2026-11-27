@@ -160,9 +160,15 @@ export default function App() {
   const [tickers, setTickers] = useState<MarketTicker[]>(() =>
     cachedHydration ? (cachedHydration.tickers as MarketTicker[]) : [],
   );
-  const [selectedSymbol, setSelectedSymbol] = useState<string>('BTC/USDT');
-  const [selectedMarketType, setSelectedMarketType] = useState<MarketType>('PERPETUAL');
-  const [selectedExchange, setSelectedExchange] = useState<string>('Binance');
+  const [selectedSymbol, setSelectedSymbol] = useState<string>(
+    () => cachedHydration?.selectedPair?.symbol ?? 'BTC/USDT',
+  );
+  const [selectedMarketType, setSelectedMarketType] = useState<MarketType>(
+    () => cachedHydration?.selectedPair?.marketType ?? 'PERPETUAL',
+  );
+  const [selectedExchange, setSelectedExchange] = useState<string>(
+    () => cachedHydration?.selectedPair?.exchange ?? 'Binance',
+  );
   const [orderBook, setOrderBook] = useState<OrderBookSnapshot | null>(null);
 
   const [portfolio, setPortfolio] = useState<PortfolioSummary>(() =>
@@ -200,16 +206,25 @@ export default function App() {
   const [emergencyConfirmOpen, setEmergencyConfirmOpen] = useState(false);
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [autoExecutionStatus, setAutoExecutionStatus] = useState<AutoExecutionEngineStatus | null>(
-    null,
+    () =>
+      cachedHydration?.autoExecutionStatus
+        ? (cachedHydration.autoExecutionStatus as unknown as AutoExecutionEngineStatus)
+        : null,
   );
   const [actionError, setActionError] = useState<string | null>(null);
   const wsSyncTimerRef = useRef<number | null>(null);
   const lastSnapshotPersistMsRef = useRef<number>(0);
-  const lastKnownRevisionRef = useRef<number | null>(null);
+  const lastKnownRevisionRef = useRef<number | null>(cachedHydration?.stateRevision ?? null);
   const wsSupportedRef = useRef<boolean>(true);
   const tickersRef = useRef<MarketTicker[]>(tickers);
   const portfolioRef = useRef<PortfolioSummary>(portfolio);
   const positionsRef = useRef<Position[]>(positions);
+  const selectedPairRef = useRef<{ symbol: string; marketType: MarketType; exchange: string }>({
+    symbol: selectedSymbol,
+    marketType: selectedMarketType,
+    exchange: selectedExchange,
+  });
+  const autoExecutionStatusRef = useRef<AutoExecutionEngineStatus | null>(autoExecutionStatus);
 
   useEffect(() => {
     tickersRef.current = tickers;
@@ -223,6 +238,18 @@ export default function App() {
     positionsRef.current = positions;
   }, [positions]);
 
+  useEffect(() => {
+    selectedPairRef.current = {
+      symbol: selectedSymbol,
+      marketType: selectedMarketType,
+      exchange: selectedExchange,
+    };
+  }, [selectedSymbol, selectedMarketType, selectedExchange]);
+
+  useEffect(() => {
+    autoExecutionStatusRef.current = autoExecutionStatus;
+  }, [autoExecutionStatus]);
+
   const persistTelemetrySnapshotThrottled = useCallback(
     (meta: {
       stateRevision?: number | null;
@@ -231,10 +258,11 @@ export default function App() {
       tickers: MarketTicker[];
       portfolio: PortfolioSummary;
       positions: Position[];
+      force?: boolean;
     }) => {
       if (typeof window === 'undefined' || !hasAnyLiveTickerPrice(meta.tickers)) return;
       const now = Date.now();
-      if (now - lastSnapshotPersistMsRef.current < 2500) return;
+      if (!meta.force && now - lastSnapshotPersistMsRef.current < 2500) return;
       lastSnapshotPersistMsRef.current = now;
       try {
         window.localStorage.setItem(
@@ -247,11 +275,76 @@ export default function App() {
             tickers: meta.tickers,
             portfolio: meta.portfolio as unknown as Record<string, unknown>,
             positions: meta.positions,
+            selectedPair: selectedPairRef.current,
+            autoExecutionStatus: autoExecutionStatusRef.current
+              ? (autoExecutionStatusRef.current as unknown as Record<string, unknown>)
+              : null,
           }),
         );
       } catch {
         // ignore storage quota errors
       }
+    },
+    [],
+  );
+
+  const reconcileMarketPortfolioPositions = useCallback(
+    (params: {
+      incomingTickers?: MarketTicker[];
+      incomingPortfolio?: PortfolioSummary;
+      incomingPositions?: Position[];
+      incomingRevision?: number | null;
+    }): {
+      tickers: MarketTicker[];
+      portfolio: PortfolioSummary;
+      positions: Position[];
+      acceptedStructuralState: boolean;
+    } => {
+      const mergedTickers = params.incomingTickers
+        ? mergeTickerFeedSnapshots(tickersRef.current, params.incomingTickers)
+        : tickersRef.current;
+
+      if (params.incomingTickers) {
+        tickersRef.current = mergedTickers;
+        setTickers(mergedTickers);
+      }
+
+      const incomingRev =
+        typeof params.incomingRevision === 'number' && Number.isFinite(params.incomingRevision)
+          ? params.incomingRevision
+          : null;
+      const isStaleRevision =
+        incomingRev !== null &&
+        lastKnownRevisionRef.current !== null &&
+        incomingRev < lastKnownRevisionRef.current;
+
+      if (incomingRev !== null && !isStaleRevision) {
+        lastKnownRevisionRef.current = incomingRev;
+      }
+
+      const basePortfolio = isStaleRevision
+        ? portfolioRef.current
+        : (params.incomingPortfolio ?? portfolioRef.current);
+      const basePositions = isStaleRevision
+        ? positionsRef.current
+        : (params.incomingPositions ?? positionsRef.current);
+
+      const repriced = repricePortfolioAndPositions(basePortfolio, basePositions, mergedTickers);
+      if (repriced.portfolio !== portfolioRef.current) {
+        portfolioRef.current = repriced.portfolio;
+        setPortfolio(repriced.portfolio);
+      }
+      if (repriced.positions !== positionsRef.current) {
+        positionsRef.current = repriced.positions;
+        setPositions(repriced.positions);
+      }
+
+      return {
+        tickers: mergedTickers,
+        portfolio: repriced.portfolio,
+        positions: repriced.positions,
+        acceptedStructuralState: !isStaleRevision,
+      };
     },
     [],
   );
@@ -270,39 +363,50 @@ export default function App() {
         fetch('/api/auto-trade/status', noStoreInit),
       ]);
 
-      let latestTickers: MarketTicker[] | null = null;
-      let latestPortfolio: PortfolioSummary | null = null;
-      let latestPositions: Position[] | null = null;
-      let latestMode: TradingMode | null = null;
+      let incomingTickers: MarketTicker[] | undefined;
       let latestUtc = '';
+      let incomingPortfolio: PortfolioSummary | undefined;
+      let incomingPositions: Position[] | undefined;
+      let incomingRevision: number | null = null;
+      let latestMode: TradingMode | null = null;
 
       if (mktRes.ok) {
         const mkt = await mktRes.json();
-        const nextTickers: MarketTicker[] = Array.isArray(mkt.tickers) ? mkt.tickers : [];
-        const mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, nextTickers);
-        tickersRef.current = mergedTickers;
-        latestTickers = mergedTickers;
+        const parsedTickers: MarketTicker[] = Array.isArray(mkt.tickers) ? mkt.tickers : [];
+        incomingTickers = parsedTickers;
         latestUtc = mkt.serverUtc ?? '';
-        setTickers(mergedTickers);
+        const mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, parsedTickers);
         setLiveFeedActive(Boolean(mkt.liveFeedActive) || hasAnyLiveTickerPrice(mergedTickers));
         if (latestUtc) setServerUtc(latestUtc);
       }
       if (portRes.ok) {
         const pt = await portRes.json();
-        if (pt.portfolio) {
-          latestPortfolio = pt.portfolio;
-          latestMode = pt.portfolio.mode;
-          setPortfolio(pt.portfolio);
-          setTradingMode(pt.portfolio.mode);
+        if (typeof pt.stateRevision === 'number') {
+          incomingRevision = pt.stateRevision;
         }
-        const nextPositions: Position[] = Array.isArray(pt.positions) ? pt.positions : [];
-        latestPositions = nextPositions;
-        setPositions(nextPositions);
+        if (pt.portfolio) {
+          incomingPortfolio = pt.portfolio as PortfolioSummary;
+          latestMode = pt.portfolio.mode;
+        }
+        if (Array.isArray(pt.positions)) {
+          incomingPositions = pt.positions as Position[];
+        }
         if (Array.isArray(pt.pnlHistory)) setPnlHistory(pt.pnlHistory);
         setOrders(pt.orders ?? []);
         if (pt.riskConfig) setRiskConfig(pt.riskConfig);
         if (pt.correlationGuard) setCorrelationGuard(pt.correlationGuard);
       }
+
+      const reconciled = reconcileMarketPortfolioPositions({
+        incomingTickers,
+        incomingPortfolio,
+        incomingPositions,
+        incomingRevision,
+      });
+      if (latestMode && reconciled.acceptedStructuralState) {
+        setTradingMode(latestMode);
+      }
+
       if (agRes.ok) {
         const ag = await agRes.json();
         setAgents(ag.agents ?? []);
@@ -322,6 +426,7 @@ export default function App() {
       }
       if (autoRes.ok) {
         const autoData = (await autoRes.json()) as AutoExecutionEngineStatus;
+        autoExecutionStatusRef.current = autoData;
         setAutoExecutionStatus(autoData);
       }
 
@@ -336,14 +441,14 @@ export default function App() {
           latencyMs,
         });
       }
-      if (latestTickers && latestPortfolio && latestPositions && latestMode) {
+      if (reconciled.tickers.length > 0 && reconciled.portfolio) {
         persistTelemetrySnapshotThrottled({
           stateRevision: lastKnownRevisionRef.current,
-          tradingMode: latestMode,
+          tradingMode: latestMode ?? reconciled.portfolio.mode,
           serverUtc: latestUtc,
-          tickers: latestTickers,
-          portfolio: latestPortfolio,
-          positions: latestPositions,
+          tickers: reconciled.tickers,
+          portfolio: reconciled.portfolio,
+          positions: reconciled.positions,
         });
       }
     } catch {
@@ -351,7 +456,7 @@ export default function App() {
         transport: navigator.onLine ? 'SYNCING' : 'OFFLINE_CACHED',
       });
     }
-  }, [persistTelemetrySnapshotThrottled, reportDataSync]);
+  }, [persistTelemetrySnapshotThrottled, reconcileMarketPortfolioPositions, reportDataSync]);
 
   const fetchFastBootstrap = useCallback(async (): Promise<{ wsSupported?: boolean } | null> => {
     if (typeof navigator !== 'undefined' && !navigator.onLine) {
@@ -366,21 +471,29 @@ export default function App() {
       if (typeof data.wsSupported === 'boolean') {
         wsSupportedRef.current = data.wsSupported;
       }
-      let mergedTickers: MarketTicker[] = tickersRef.current;
-      if (Array.isArray(data.tickers)) {
-        mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, data.tickers as MarketTicker[]);
-        tickersRef.current = mergedTickers;
-        setTickers(mergedTickers);
-      }
+
+      const prevRevision = lastKnownRevisionRef.current;
+      const incomingRevision =
+        typeof data.stateRevision === 'number' ? data.stateRevision : null;
+
+      const reconciled = reconcileMarketPortfolioPositions({
+        incomingTickers: Array.isArray(data.tickers) ? (data.tickers as MarketTicker[]) : undefined,
+        incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+        incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+        incomingRevision,
+      });
+
       if (typeof data.liveFeedActive === 'boolean') {
-        setLiveFeedActive(data.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+        setLiveFeedActive(data.liveFeedActive || hasAnyLiveTickerPrice(reconciled.tickers));
       }
       if (data.serverUtc) setServerUtc(data.serverUtc);
-      if (data.portfolio) setPortfolio(data.portfolio);
-      if (Array.isArray(data.positions)) setPositions(data.positions);
-      if (data.tradingMode) setTradingMode(data.tradingMode);
-      if (data.autoExecutionStatus) {
-        setAutoExecutionStatus(data.autoExecutionStatus as AutoExecutionEngineStatus);
+      if (data.tradingMode && reconciled.acceptedStructuralState) {
+        setTradingMode(data.tradingMode);
+      }
+      if (data.autoExecutionStatus && reconciled.acceptedStructuralState) {
+        const autoData = data.autoExecutionStatus as AutoExecutionEngineStatus;
+        autoExecutionStatusRef.current = autoData;
+        setAutoExecutionStatus(autoData);
       }
 
       const latencyMs = Math.max(
@@ -393,27 +506,22 @@ export default function App() {
         latencyMs,
       });
 
-      const nextRevision =
-        typeof data.stateRevision === 'number' ? data.stateRevision : lastKnownRevisionRef.current;
       if (
-        nextRevision !== null &&
-        lastKnownRevisionRef.current !== null &&
-        nextRevision !== lastKnownRevisionRef.current
+        incomingRevision !== null &&
+        prevRevision !== null &&
+        incomingRevision > prevRevision
       ) {
-        lastKnownRevisionRef.current = nextRevision;
         void fetchAllState();
-      } else if (lastKnownRevisionRef.current === null && nextRevision !== null) {
-        lastKnownRevisionRef.current = nextRevision;
       }
 
-      if (mergedTickers.length > 0 && data.portfolio && Array.isArray(data.positions)) {
+      if (reconciled.tickers.length > 0 && reconciled.portfolio) {
         persistTelemetrySnapshotThrottled({
-          stateRevision: nextRevision,
-          tradingMode: String(data.tradingMode ?? data.portfolio.mode ?? 'FULL_AUTO'),
+          stateRevision: lastKnownRevisionRef.current,
+          tradingMode: String(data.tradingMode ?? reconciled.portfolio.mode ?? 'FULL_AUTO'),
           serverUtc: String(data.serverUtc ?? ''),
-          tickers: mergedTickers,
-          portfolio: data.portfolio as PortfolioSummary,
-          positions: data.positions as Position[],
+          tickers: reconciled.tickers,
+          portfolio: reconciled.portfolio,
+          positions: reconciled.positions,
         });
       }
       return {
@@ -425,7 +533,7 @@ export default function App() {
       });
       return null;
     }
-  }, [fetchAllState, persistTelemetrySnapshotThrottled, reportDataSync]);
+  }, [fetchAllState, persistTelemetrySnapshotThrottled, reconcileMarketPortfolioPositions, reportDataSync]);
 
   // Register unified PWA Sync Now handler
   useEffect(() => {
@@ -652,41 +760,36 @@ export default function App() {
           try {
             const msg = JSON.parse(ev.data);
             if (msg.type === 'PRICE_TICK_UPDATE') {
-              let mergedTickers: MarketTicker[] = tickersRef.current;
-              if (Array.isArray(msg.tickers)) {
-                mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, msg.tickers as MarketTicker[]);
-                tickersRef.current = mergedTickers;
-                setTickers(mergedTickers);
-              }
-              if (msg.portfolio) setPortfolio(msg.portfolio);
-              if (Array.isArray(msg.positions)) setPositions(msg.positions);
+              const incomingRev =
+                typeof msg.stateRevision === 'number' ? msg.stateRevision : null;
+              const reconciled = reconcileMarketPortfolioPositions({
+                incomingTickers: Array.isArray(msg.tickers) ? (msg.tickers as MarketTicker[]) : undefined,
+                incomingPortfolio: msg.portfolio as PortfolioSummary | undefined,
+                incomingPositions: Array.isArray(msg.positions) ? (msg.positions as Position[]) : undefined,
+                incomingRevision: incomingRev,
+              });
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
               }
               if (typeof msg.liveFeedActive === 'boolean') {
-                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(reconciled.tickers));
               }
               if (msg.serverUtc) setServerUtc(msg.serverUtc);
               reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
 
-              if (mergedTickers.length > 0 && msg.portfolio && Array.isArray(msg.positions)) {
+              if (reconciled.tickers.length > 0 && reconciled.portfolio) {
                 persistTelemetrySnapshotThrottled({
-                  stateRevision:
-                    typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision,
-                  tradingMode: msg.portfolio.mode ?? 'FULL_AUTO',
+                  stateRevision: lastKnownRevisionRef.current,
+                  tradingMode: reconciled.portfolio.mode ?? 'FULL_AUTO',
                   serverUtc: msg.serverUtc ?? '',
-                  tickers: mergedTickers,
-                  portfolio: msg.portfolio as PortfolioSummary,
-                  positions: msg.positions as Position[],
+                  tickers: reconciled.tickers,
+                  portfolio: reconciled.portfolio,
+                  positions: reconciled.positions,
                 });
               }
 
-              const nextPosCount = Array.isArray(msg.positions) ? msg.positions.length : prevPosCount;
-              const nextRevision =
-                typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision;
-              if (typeof nextRevision === 'number') {
-                lastKnownRevisionRef.current = nextRevision;
-              }
+              const nextPosCount = reconciled.positions.length;
+              const nextRevision = incomingRev ?? prevStateRevision;
               const pnlPt = msg.pnlPoint as PnlHistoryPoint | null | undefined;
               const eventTag = pnlPt?.eventTag;
               const eventTs = pnlPt?.timestampMs ?? 0;
@@ -694,7 +797,12 @@ export default function App() {
                 Boolean(eventTag && ['ORDER_FILLED', 'AUTO_SL_TP', 'POSITION_CLOSED', 'EMERGENCY_STOP'].includes(eventTag)) &&
                 eventTs !== prevEventTs;
 
-              if (
+              if (!initializedFromWs) {
+                initializedFromWs = true;
+                prevPosCount = nextPosCount;
+                prevEventTs = eventTs;
+                prevStateRevision = nextRevision;
+              } else if (
                 nextPosCount !== prevPosCount ||
                 isTradeEvent ||
                 (nextRevision !== null && prevStateRevision !== null && nextRevision !== prevStateRevision)
@@ -707,28 +815,43 @@ export default function App() {
               return;
             }
             if (msg.type === 'TELEMETRY_UPDATE') {
-              let mergedTickers: MarketTicker[] = tickersRef.current;
-              if (Array.isArray(msg.tickers)) {
-                mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, msg.tickers as MarketTicker[]);
-                tickersRef.current = mergedTickers;
-                setTickers(mergedTickers);
-              }
-              if (msg.portfolio) setPortfolio(msg.portfolio);
-              if (Array.isArray(msg.positions)) setPositions(msg.positions);
+              const incomingRev =
+                typeof msg.stateRevision === 'number' ? msg.stateRevision : null;
+              const reconciled = reconcileMarketPortfolioPositions({
+                incomingTickers: Array.isArray(msg.tickers) ? (msg.tickers as MarketTicker[]) : undefined,
+                incomingPortfolio: msg.portfolio as PortfolioSummary | undefined,
+                incomingPositions: Array.isArray(msg.positions) ? (msg.positions as Position[]) : undefined,
+                incomingRevision: incomingRev,
+              });
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
               }
-              if (msg.tradingMode) setTradingMode(msg.tradingMode);
-              if (typeof msg.liveFeedActive === 'boolean') {
-                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(mergedTickers));
+              if (msg.tradingMode && reconciled.acceptedStructuralState) {
+                setTradingMode(msg.tradingMode);
               }
-              if (msg.autoExecutionStatus) {
-                setAutoExecutionStatus(msg.autoExecutionStatus as AutoExecutionEngineStatus);
+              if (typeof msg.liveFeedActive === 'boolean') {
+                setLiveFeedActive(msg.liveFeedActive || hasAnyLiveTickerPrice(reconciled.tickers));
+              }
+              if (msg.autoExecutionStatus && reconciled.acceptedStructuralState) {
+                const autoData = msg.autoExecutionStatus as AutoExecutionEngineStatus;
+                autoExecutionStatusRef.current = autoData;
+                setAutoExecutionStatus(autoData);
               }
               if (msg.serverUtc) setServerUtc(msg.serverUtc);
               reportDataSync({ transport: 'WS_LIVE', syncedAtMs: Date.now() });
 
-              const nextPosCount = Array.isArray(msg.positions) ? msg.positions.length : prevPosCount;
+              if (reconciled.tickers.length > 0 && reconciled.portfolio) {
+                persistTelemetrySnapshotThrottled({
+                  stateRevision: lastKnownRevisionRef.current,
+                  tradingMode: String(msg.tradingMode ?? reconciled.portfolio.mode ?? 'FULL_AUTO'),
+                  serverUtc: msg.serverUtc ?? '',
+                  tickers: reconciled.tickers,
+                  portfolio: reconciled.portfolio,
+                  positions: reconciled.positions,
+                });
+              }
+
+              const nextPosCount = reconciled.positions.length;
               const nextAutoCount =
                 typeof msg.autoExecutionStatus?.autoTradesTotalCount === 'number'
                   ? msg.autoExecutionStatus.autoTradesTotalCount
@@ -741,11 +864,7 @@ export default function App() {
                 Boolean(eventTag && ['ORDER_FILLED', 'AUTO_SL_TP', 'POSITION_CLOSED', 'EMERGENCY_STOP'].includes(eventTag)) &&
                 eventTs !== prevEventTs;
 
-              const nextRevision =
-                typeof msg.stateRevision === 'number' ? msg.stateRevision : prevStateRevision;
-              if (typeof nextRevision === 'number') {
-                lastKnownRevisionRef.current = nextRevision;
-              }
+              const nextRevision = incomingRev ?? prevStateRevision;
 
               if (!initializedFromWs) {
                 initializedFromWs = true;
@@ -867,7 +986,13 @@ export default function App() {
       stopDirectExchangeWs();
       safelyCloseSocket(ws);
     };
-  }, [fetchAllState, fetchFastBootstrap, persistTelemetrySnapshotThrottled, reportDataSync]);
+  }, [
+    fetchAllState,
+    fetchFastBootstrap,
+    persistTelemetrySnapshotThrottled,
+    reconcileMarketPortfolioPositions,
+    reportDataSync,
+  ]);
 
   // Fetch Order Book for exact selected (symbol, marketType, exchange)
   useEffect(() => {
@@ -925,9 +1050,22 @@ export default function App() {
     exchange?: string,
   ) => {
     const matched = findMatchingTicker(tickers, { symbol, marketType, exchange });
-    setSelectedSymbol(matched?.symbol ?? symbol);
-    setSelectedMarketType(matched?.marketType ?? marketType);
-    setSelectedExchange(matched?.exchange ?? exchange ?? '');
+    const nextSym = matched?.symbol ?? symbol;
+    const nextMkt = matched?.marketType ?? marketType;
+    const nextEx = matched?.exchange ?? exchange ?? '';
+    setSelectedSymbol(nextSym);
+    setSelectedMarketType(nextMkt);
+    setSelectedExchange(nextEx);
+    selectedPairRef.current = { symbol: nextSym, marketType: nextMkt, exchange: nextEx };
+    persistTelemetrySnapshotThrottled({
+      stateRevision: lastKnownRevisionRef.current,
+      tradingMode,
+      serverUtc,
+      tickers: tickersRef.current,
+      portfolio: portfolioRef.current,
+      positions: positionsRef.current,
+      force: true,
+    });
   };
 
   const handleSelectRemotePair = async (
@@ -945,17 +1083,27 @@ export default function App() {
       throw new Error('Failed to activate remote market pair');
     }
     const data = await res.json();
-    if (Array.isArray(data.tickers)) {
-      const mergedTickers = mergeTickerFeedSnapshots(tickersRef.current, data.tickers as MarketTicker[]);
-      tickersRef.current = mergedTickers;
-      setTickers(mergedTickers);
-    }
     const chosenSym = data.ticker?.symbol ?? symbol;
     const chosenMkt = (data.ticker?.marketType ?? marketType) as MarketType;
     const chosenEx = (data.ticker?.exchange ?? exchange ?? '') as string;
     setSelectedSymbol(chosenSym);
     setSelectedMarketType(chosenMkt);
     setSelectedExchange(chosenEx);
+    selectedPairRef.current = { symbol: chosenSym, marketType: chosenMkt, exchange: chosenEx };
+    if (Array.isArray(data.tickers)) {
+      const reconciled = reconcileMarketPortfolioPositions({
+        incomingTickers: data.tickers as MarketTicker[],
+      });
+      persistTelemetrySnapshotThrottled({
+        stateRevision: lastKnownRevisionRef.current,
+        tradingMode,
+        serverUtc: data.serverUtc ?? serverUtc,
+        tickers: reconciled.tickers,
+        portfolio: reconciled.portfolio,
+        positions: reconciled.positions,
+        force: true,
+      });
+    }
     if (options?.runAi) {
       await handleSmartRun('ANALYZE_SINGLE', chosenSym, chosenMkt, chosenEx);
     }
@@ -1083,8 +1231,22 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const errMsg = data.error || t('app.error.actionFailed');
-        setActionError(errMsg);
-        return { ok: false, error: errMsg };
+        const alreadyClosed = Boolean(data.alreadyClosed);
+        if (alreadyClosed) {
+          await fetchAllState();
+          broadcastSyncEvent('DATA_MUTATED');
+        } else {
+          setActionError(errMsg);
+        }
+        return { ok: false, alreadyClosed, error: errMsg };
+      }
+      reconcileMarketPortfolioPositions({
+        incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+        incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+        incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+      });
+      if (data.pnlPoint) {
+        setPnlHistory((prev) => appendPnlPoint(prev, data.pnlPoint as PnlHistoryPoint));
       }
       await fetchAllState();
       broadcastSyncEvent('DATA_MUTATED');
@@ -1318,6 +1480,13 @@ export default function App() {
               onToggleGemini={setIncludeGeminiOnRun}
               onExecuteRun={(mode) => handleSmartRun(mode)}
               onResetSession={handleResetSession}
+              autoExecutionStatus={autoExecutionStatus}
+              openPositionsCount={positions.length}
+              onUpdateAutoConfig={handleUpdateAutoConfig}
+              onRunAutoCycle={handleRunAutoCycle}
+              onApproveAutoProposal={handleApproveAutoProposal}
+              onRejectAutoProposal={handleRejectAutoProposal}
+              onOpenAutoConfig={() => setActiveTab('portfolio')}
             />
             <button
               type="button"
@@ -1473,11 +1642,6 @@ export default function App() {
               onClosePosition={handleClosePosition}
               onUpdateSlTp={handleUpdatePositionSlTp}
               pipelineLoading={pipelineLoading}
-              autoExecutionStatus={autoExecutionStatus}
-              onUpdateAutoConfig={handleUpdateAutoConfig}
-              onRunAutoCycle={handleRunAutoCycle}
-              onApproveAutoProposal={handleApproveAutoProposal}
-              onRejectAutoProposal={handleRejectAutoProposal}
             />
           )}
 
@@ -1565,7 +1729,10 @@ export default function App() {
               onOpenGlobalSearch={() => setSearchModalOpen(true)}
               onRunPipeline={handleRunPipeline}
               pipelineLoading={pipelineLoading}
-              onOrderPlaced={fetchAllState}
+              onOrderPlaced={async () => {
+                await fetchAllState();
+                broadcastSyncEvent('DATA_MUTATED');
+              }}
               onClosePosition={handleClosePosition}
               onUpdateSlTp={handleUpdatePositionSlTp}
             />

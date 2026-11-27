@@ -9,6 +9,7 @@ import React, {
 import { registerSW } from 'virtual:pwa-register';
 import {
   PWA_BANNER_DISMISS_STORAGE_KEY,
+  PWA_SYNC_EVENT_STORAGE_KEY,
   computePWAUiState,
   detectDisplayMode,
   detectPWAPlatform,
@@ -120,6 +121,18 @@ export function initPWABootstrapListeners(): void {
       syncChannel = null;
     }
   }
+
+  window.addEventListener('storage', (event: StorageEvent) => {
+    if (event.key !== PWA_SYNC_EVENT_STORAGE_KEY || !event.newValue) return;
+    try {
+      const parsed = JSON.parse(event.newValue) as { type?: string };
+      if (parsed?.type === 'DATA_MUTATED' || parsed?.type === 'FORCE_SYNC') {
+        void triggerRegisteredDataSyncHandlers();
+      }
+    } catch {
+      // ignore malformed storage sync event
+    }
+  });
 
   if (!('serviceWorker' in navigator)) {
     bootstrapState.swStatus = 'UNSUPPORTED';
@@ -520,10 +533,19 @@ export const PWAProvider: React.FC<{ children: React.ReactNode }> = ({ children 
   );
 
   const broadcastSyncEvent = useCallback((type: 'DATA_MUTATED' | 'FORCE_SYNC') => {
+    const ts = Date.now();
     try {
-      syncChannel?.postMessage({ type, ts: Date.now() });
+      syncChannel?.postMessage({ type, ts });
     } catch {
       // ignore closed channel
+    }
+    try {
+      window.localStorage.setItem(
+        PWA_SYNC_EVENT_STORAGE_KEY,
+        JSON.stringify({ type, ts, nonce: Math.random().toString(36).slice(2, 7) }),
+      );
+    } catch {
+      // ignore storage quota errors
     }
   }, []);
 

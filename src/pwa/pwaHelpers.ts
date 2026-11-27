@@ -213,7 +213,14 @@ export function validateManifestPayload(raw: unknown): PWAManifestAudit {
 export type PWADataSyncTransport = 'WS_LIVE' | 'HTTP_FAST' | 'OFFLINE_CACHED' | 'SYNCING';
 
 export const PWA_DATA_SNAPSHOT_STORAGE_KEY = 'omnisent_pwa_snapshot_v1';
+export const PWA_SYNC_EVENT_STORAGE_KEY = 'omnisent_pwa_sync_event_v1';
 export const PWA_DATA_SNAPSHOT_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+
+export interface PWASelectedPairSnapshot {
+  symbol: string;
+  marketType: 'SPOT' | 'PERPETUAL' | 'FUTURES' | 'MARGIN';
+  exchange: string;
+}
 
 export interface PWATelemetrySnapshotPayload {
   v: 1;
@@ -224,6 +231,8 @@ export interface PWATelemetrySnapshotPayload {
   tickers: unknown[];
   portfolio: Record<string, unknown>;
   positions: unknown[];
+  selectedPair?: PWASelectedPairSnapshot;
+  autoExecutionStatus?: Record<string, unknown> | null;
 }
 
 export function shouldRunCooldownSync(
@@ -243,6 +252,56 @@ export function shouldAutoReloadOnSwControlChange(
   return Boolean(hadControllerBefore && !alreadyReloadedInSession);
 }
 
+const SECRET_FIELD_NAMES = new Set([
+  'apikey',
+  'apisecret',
+  'passphrase',
+  'encryptedcredentials',
+  'secret',
+  'token',
+]);
+
+function stripSecretFields(obj: Record<string, unknown>): Record<string, unknown> {
+  const clean: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(obj)) {
+    if (SECRET_FIELD_NAMES.has(key.toLowerCase())) continue;
+    clean[key] = val;
+  }
+  return clean;
+}
+
+function sanitizeSelectedPair(raw: unknown): PWASelectedPairSnapshot | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const candidate = raw as Record<string, unknown>;
+  const symbol = typeof candidate.symbol === 'string' ? candidate.symbol.trim() : '';
+  const marketType =
+    candidate.marketType === 'SPOT' ||
+    candidate.marketType === 'PERPETUAL' ||
+    candidate.marketType === 'FUTURES' ||
+    candidate.marketType === 'MARGIN'
+      ? candidate.marketType
+      : null;
+  const exchange = typeof candidate.exchange === 'string' ? candidate.exchange.trim() : '';
+  if (!symbol || !marketType) return undefined;
+  return { symbol, marketType, exchange };
+}
+
+function sanitizeAutoExecutionSnapshot(raw: unknown): Record<string, unknown> | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+  const src = raw as Record<string, unknown>;
+  if (typeof src.engineRunning !== 'boolean' && typeof src.tradingMode !== 'string') {
+    return undefined;
+  }
+  const clean = stripSecretFields(src);
+  if (Array.isArray(clean.recentActivity)) {
+    clean.recentActivity = clean.recentActivity.slice(0, 12);
+  }
+  if (Array.isArray(clean.pendingProposals)) {
+    clean.pendingProposals = clean.pendingProposals.slice(0, 10);
+  }
+  return clean;
+}
+
 export function serializeTelemetrySnapshot(input: {
   nowMs?: number;
   stateRevision?: number | null;
@@ -251,6 +310,8 @@ export function serializeTelemetrySnapshot(input: {
   tickers: unknown[];
   portfolio: Record<string, unknown>;
   positions: unknown[];
+  selectedPair?: PWASelectedPairSnapshot;
+  autoExecutionStatus?: Record<string, unknown> | null;
 }): string {
   const payload: PWATelemetrySnapshotPayload = {
     v: 1,
@@ -259,8 +320,10 @@ export function serializeTelemetrySnapshot(input: {
     tradingMode: input.tradingMode,
     serverUtc: input.serverUtc,
     tickers: Array.isArray(input.tickers) ? input.tickers.slice(0, 60) : [],
-    portfolio: input.portfolio,
+    portfolio: stripSecretFields(input.portfolio),
     positions: Array.isArray(input.positions) ? input.positions.slice(0, 50) : [],
+    selectedPair: sanitizeSelectedPair(input.selectedPair),
+    autoExecutionStatus: sanitizeAutoExecutionSnapshot(input.autoExecutionStatus),
   };
   return JSON.stringify(payload);
 }
@@ -307,8 +370,10 @@ export function parseTelemetrySnapshot(
       tradingMode: parsed.tradingMode,
       serverUtc: typeof parsed.serverUtc === 'string' ? parsed.serverUtc : '',
       tickers: parsed.tickers,
-      portfolio: parsed.portfolio as Record<string, unknown>,
+      portfolio: stripSecretFields(parsed.portfolio as Record<string, unknown>),
       positions: parsed.positions,
+      selectedPair: sanitizeSelectedPair(parsed.selectedPair),
+      autoExecutionStatus: sanitizeAutoExecutionSnapshot(parsed.autoExecutionStatus),
     };
   } catch {
     return null;

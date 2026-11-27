@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -73,6 +73,9 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
   const [confirmTargetId, setConfirmTargetId] = useState<string | null>(null);
   const [closeError, setCloseError] = useState<string | null>(null);
   const [settlementNotice, setSettlementNotice] = useState<ClosePositionReceipt | null>(null);
+  const [raceNotice, setRaceNotice] = useState<string | null>(null);
+  const closingIdsRef = useRef<Set<string>>(new Set());
+  const lastConfirmMetaRef = useRef<{ id: string; symbol: string } | null>(null);
 
   // Refresh elapsed open duration every 15s while trades are active
   useEffect(() => {
@@ -87,17 +90,31 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
     : null;
 
   useEffect(() => {
-    if (confirmTargetId && !confirmTarget && busyId !== confirmTargetId) {
+    if (
+      confirmTargetId &&
+      !confirmTarget &&
+      busyId !== confirmTargetId &&
+      !closingIdsRef.current.has(confirmTargetId)
+    ) {
+      if (lastConfirmMetaRef.current?.id === confirmTargetId) {
+        setRaceNotice(
+          t('pos.closeModal.autoSettledNotice', {
+            symbol: lastConfirmMetaRef.current.symbol,
+          }),
+        );
+      }
+      lastConfirmMetaRef.current = null;
       setConfirmTargetId(null);
       setCloseError(null);
     }
-  }, [confirmTargetId, confirmTarget, busyId]);
+  }, [confirmTargetId, confirmTarget, busyId, t]);
 
   // Escape key closes confirmation modal cleanly when not submitting
   useEffect(() => {
     if (!confirmTargetId) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape' && !busyId) {
+        lastConfirmMetaRef.current = null;
         setConfirmTargetId(null);
         setCloseError(null);
       }
@@ -112,6 +129,13 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
     const timer = window.setTimeout(() => setSettlementNotice(null), 12_000);
     return () => window.clearTimeout(timer);
   }, [settlementNotice]);
+
+  // Auto-dismiss race notice after 10s
+  useEffect(() => {
+    if (!raceNotice) return;
+    const timer = window.setTimeout(() => setRaceNotice(null), 10_000);
+    return () => window.clearTimeout(timer);
+  }, [raceNotice]);
 
   const totalNotional = positions.reduce(
     (sum, p) => sum + p.quantity * (p.markPrice > 0 ? p.markPrice : p.entryPrice),
@@ -168,11 +192,15 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
   };
 
   const openCloseModal = (p: Position) => {
+    lastConfirmMetaRef.current = { id: p.id, symbol: p.symbol };
+    setRaceNotice(null);
     setCloseError(null);
     setConfirmTargetId(p.id);
   };
 
   const handleConfirmClose = async (p: Position) => {
+    if (closingIdsRef.current.has(p.id)) return;
+    closingIdsRef.current.add(p.id);
     setBusyId(p.id);
     setCloseError(null);
     const liveMark = p.markPrice > 0 ? p.markPrice : p.entryPrice;
@@ -189,8 +217,14 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
     try {
       const result = await onClosePosition(p.id);
       if (result && result.ok === false) {
+        if (result.alreadyClosed) {
+          lastConfirmMetaRef.current = null;
+          setConfirmTargetId(null);
+          setCloseError(null);
+          setRaceNotice(t('pos.closeModal.autoSettledNotice', { symbol: p.symbol }));
+          return;
+        }
         setCloseError(result.error || t('pos.closeModal.errFallback'));
-        setBusyId(null);
         return;
       }
 
@@ -213,11 +247,13 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
         closedAtUtc: new Date().toISOString(),
       };
 
+      lastConfirmMetaRef.current = null;
       setConfirmTargetId(null);
       setSettlementNotice(receipt);
     } catch {
       setCloseError(t('pos.closeModal.errFallback'));
     } finally {
+      closingIdsRef.current.delete(p.id);
       setBusyId(null);
     }
   };
@@ -251,6 +287,10 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
         );
         const estCloseFeeUsd = Number((confirmTarget.quantity * liveMark * 0.0005).toFixed(2));
         const estNetPnlUsd = Number((grossPnlUsd - estCloseFeeUsd).toFixed(2));
+        const estNetRoePct =
+          confirmTarget.marginUsd > 0
+            ? Number(((estNetPnlUsd / confirmTarget.marginUsd) * 100).toFixed(2))
+            : confirmTarget.unrealizedPnlPct;
         const initialRiskPerUnit = Math.abs(
           confirmTarget.entryPrice - (confirmTarget.initialStopLoss ?? confirmTarget.stopLoss),
         );
@@ -264,6 +304,8 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           grossPnlUsd,
           estCloseFeeUsd,
           estNetPnlUsd,
+          estNetRoePct,
+          marginReleasedUsd: confirmTarget.marginUsd,
           estRMultiple,
         };
       })()
@@ -325,6 +367,29 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           </button>
         )}
       </div>
+
+      {/* Auto-Settled / Concurrent Close Race Notification */}
+      {raceNotice && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="auto-settled-notice-banner"
+          className="mt-3 flex items-start justify-between gap-3 rounded-xl border border-amber-500/40 bg-amber-500/10 p-3.5 text-xs text-amber-200"
+        >
+          <div className="flex items-start gap-2.5 min-w-0">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <p className="leading-relaxed">{raceNotice}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => setRaceNotice(null)}
+            aria-label={t('pos.settlement.dismissAria')}
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-amber-300 hover:bg-amber-500/20"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+      )}
 
       {/* Post-Close Settlement Notification Card */}
       {settlementNotice && (
@@ -618,12 +683,12 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                 </div>
 
                 {/* Row 4: Smart Interactive Actions */}
-                <div className="flex flex-wrap items-center gap-2 pt-1">
+                <div className="grid grid-cols-2 gap-2 pt-1 sm:flex sm:flex-wrap sm:items-center">
                   {onInspectSymbol && (
                     <button
                       type="button"
                       onClick={() => onInspectSymbol(p.symbol, p.marketType, p.exchange)}
-                      className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 hover:border-cyan-500/50 hover:text-cyan-300"
+                      className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 hover:border-cyan-500/50 hover:text-cyan-300 sm:justify-start"
                     >
                       <LineChart className="h-3.5 w-3.5" />
                       <span>{t('pos.btn.viewChart')}</span>
@@ -640,7 +705,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                           ? t('pos.btn.breakevenTipReady')
                           : t('pos.btn.breakevenTipWait')
                       }
-                      className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-emerald-300 whitespace-nowrap shrink-0 hover:border-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-45"
+                      className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-emerald-300 whitespace-nowrap shrink-0 hover:border-emerald-500/50 disabled:cursor-not-allowed disabled:opacity-45 sm:justify-start"
                     >
                       <Shield className="h-3.5 w-3.5" />
                       <span>{t('pos.btn.breakeven')}</span>
@@ -652,7 +717,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                       type="button"
                       disabled={isBusy}
                       onClick={() => openEditor(p, tel.priceDecimals)}
-                      className="flex min-h-[38px] items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 hover:border-cyan-500/50 hover:text-cyan-300"
+                      className="flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-900 px-3 py-1.5 text-xs font-medium text-slate-200 whitespace-nowrap shrink-0 hover:border-cyan-500/50 hover:text-cyan-300 sm:justify-start"
                     >
                       <SlidersHorizontal className="h-3.5 w-3.5" />
                       <span>{isEditing ? t('pos.btn.closeEdit') : t('pos.btn.editSlTp')}</span>
@@ -664,7 +729,9 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                     disabled={isBusy}
                     data-testid={`close-position-btn-${p.id}`}
                     onClick={() => openCloseModal(p)}
-                    className="ml-auto flex min-h-[38px] items-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/15 px-3 py-1.5 text-xs font-semibold text-rose-200 whitespace-nowrap shrink-0 hover:bg-rose-500/25 disabled:opacity-50"
+                    className={`flex min-h-[38px] items-center justify-center gap-1.5 rounded-lg border border-rose-500/40 bg-rose-500/15 px-3 py-1.5 text-xs font-semibold text-rose-200 whitespace-nowrap shrink-0 hover:bg-rose-500/25 disabled:opacity-50 sm:ml-auto ${
+                      !onInspectSymbol && !onUpdateSlTp ? 'col-span-2' : ''
+                    }`}
                   >
                     <XCircle className="h-3.5 w-3.5" />
                     <span>{isBusy ? t('pos.btn.closing') : t('pos.btn.closePosition')}</span>
@@ -737,15 +804,16 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           data-testid="close-position-modal"
           onClick={() => {
             if (!busyId) {
+              lastConfirmMetaRef.current = null;
               setConfirmTargetId(null);
               setCloseError(null);
             }
           }}
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-[2px]"
+          className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-[2px] sm:items-center sm:p-4"
         >
           <div
             onClick={(e) => e.stopPropagation()}
-            className="max-h-[90vh] w-full max-w-lg overflow-y-auto rounded-2xl border border-slate-700/90 bg-[#0E1522] p-5 shadow-2xl"
+            className="max-h-[88dvh] w-full max-w-lg overflow-y-auto rounded-t-2xl border border-slate-700/90 bg-[#0E1522] p-4 pb-6 shadow-2xl sm:rounded-2xl sm:p-5"
           >
             {/* Modal Header */}
             <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
@@ -788,6 +856,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                 type="button"
                 disabled={Boolean(busyId)}
                 onClick={() => {
+                  lastConfirmMetaRef.current = null;
                   setConfirmTargetId(null);
                   setCloseError(null);
                 }}
@@ -812,11 +881,11 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                   </span>
                   <span
                     className={`ml-2 text-xs font-semibold ${
-                      modalMeta.position.unrealizedPnlPct >= 0 ? 'text-emerald-300' : 'text-rose-300'
+                      modalMeta.estNetRoePct >= 0 ? 'text-emerald-300' : 'text-rose-300'
                     }`}
                   >
-                    ({modalMeta.position.unrealizedPnlPct >= 0 ? '+' : ''}
-                    {modalMeta.position.unrealizedPnlPct.toFixed(2)}% ROE)
+                    ({modalMeta.estNetRoePct >= 0 ? '+' : ''}
+                    {modalMeta.estNetRoePct.toFixed(2)}% ROE)
                   </span>
                 </div>
               </div>
@@ -867,6 +936,17 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                 </div>
                 <div>
                   <dt className="font-sans text-[11px] text-slate-500">
+                    {t('pos.closeModal.marginReleased')}
+                  </dt>
+                  <dd className="mt-0.5 font-semibold text-cyan-300">
+                    +${modalMeta.marginReleasedUsd.toLocaleString('en-US', {
+                      minimumFractionDigits: 2,
+                      maximumFractionDigits: 2,
+                    })}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="font-sans text-[11px] text-slate-500">
                     {t('pos.closeModal.rMultiple')}
                   </dt>
                   <dd
@@ -878,7 +958,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                     {modalMeta.estRMultiple.toFixed(2)}R
                   </dd>
                 </div>
-                <div>
+                <div className="col-span-2 border-t border-slate-800/70 pt-2">
                   <dt className="font-sans text-[11px] text-slate-500">SL / TP</dt>
                   <dd className="mt-0.5 text-slate-300">
                     ${formatPrice(modalMeta.position.stopLoss, modalMeta.tel.priceDecimals)} / $
@@ -933,6 +1013,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                 disabled={busyId === modalMeta.position.id}
                 data-testid="close-modal-keep-btn"
                 onClick={() => {
+                  lastConfirmMetaRef.current = null;
                   setConfirmTargetId(null);
                   setCloseError(null);
                 }}

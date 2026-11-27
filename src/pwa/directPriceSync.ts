@@ -245,13 +245,47 @@ export function repricePortfolioAndPositions(
   tickers: readonly MarketTicker[],
 ): { portfolio: PortfolioSummary; positions: Position[] } {
   if (positions.length === 0) {
-    return { portfolio, positions: [...positions] };
+    const exactEquity = Number((portfolio.initialEquityUsd + portfolio.realizedPnlUsd).toFixed(2));
+    const exactAvail = Number(Math.max(0, exactEquity).toFixed(2));
+    if (
+      portfolio.unrealizedPnlUsd === 0 &&
+      portfolio.usedMarginUsd === 0 &&
+      portfolio.totalEquityUsd === exactEquity &&
+      portfolio.availableBalanceUsd === exactAvail
+    ) {
+      return { portfolio, positions: [...positions] };
+    }
+    const dailyPnlPct =
+      portfolio.initialEquityUsd > 0
+        ? Number((((exactEquity - portfolio.initialEquityUsd) / portfolio.initialEquityUsd) * 100).toFixed(2))
+        : portfolio.dailyPnlPct;
+    const peakEquityUsd = Math.max(portfolio.peakEquityUsd, exactEquity);
+    const currentDrawdownPct =
+      peakEquityUsd > 0
+        ? Number((Math.max(0, (peakEquityUsd - exactEquity) / peakEquityUsd) * 100).toFixed(2))
+        : portfolio.currentDrawdownPct;
+    return {
+      positions: [],
+      portfolio: {
+        ...portfolio,
+        unrealizedPnlUsd: 0,
+        usedMarginUsd: 0,
+        totalEquityUsd: exactEquity,
+        availableBalanceUsd: exactAvail,
+        dailyPnlPct,
+        weeklyPnlPct: dailyPnlPct,
+        peakEquityUsd,
+        currentDrawdownPct,
+      },
+    };
   }
 
   let unrealizedSum = 0;
-  let changed = false;
+  let usedMarginSum = 0;
+  let positionsChanged = false;
 
   const updatedPositions = positions.map((pos) => {
+    usedMarginSum += pos.marginUsd;
     const matched =
       tickers.find(
         (t) =>
@@ -268,13 +302,7 @@ export function repricePortfolioAndPositions(
       ) ??
       tickers.find((t) => t.symbol.toUpperCase() === pos.symbol.toUpperCase() && t.lastPrice > 0);
 
-    if (!matched || matched.lastPrice <= 0 || matched.lastPrice === pos.markPrice) {
-      unrealizedSum += pos.unrealizedPnlUsd;
-      return pos;
-    }
-
-    changed = true;
-    const markPrice = matched.lastPrice;
+    const markPrice = matched && matched.lastPrice > 0 ? matched.lastPrice : pos.markPrice;
     const direction = pos.side === 'LONG' ? 1 : -1;
     const unrealizedPnlUsd = Number(
       ((markPrice - pos.entryPrice) * direction * pos.quantity).toFixed(2),
@@ -283,6 +311,15 @@ export function repricePortfolioAndPositions(
       pos.marginUsd > 0 ? Number(((unrealizedPnlUsd / pos.marginUsd) * 100).toFixed(2)) : 0;
     unrealizedSum += unrealizedPnlUsd;
 
+    if (
+      markPrice === pos.markPrice &&
+      unrealizedPnlUsd === pos.unrealizedPnlUsd &&
+      unrealizedPnlPct === pos.unrealizedPnlPct
+    ) {
+      return pos;
+    }
+
+    positionsChanged = true;
     return {
       ...pos,
       markPrice,
@@ -291,13 +328,12 @@ export function repricePortfolioAndPositions(
     };
   });
 
-  if (!changed) {
-    return { portfolio, positions: [...positions] };
-  }
-
+  const roundedUnrealized = Number(unrealizedSum.toFixed(2));
+  const roundedUsedMargin = Number(usedMarginSum.toFixed(2));
   const totalEquityUsd = Number(
-    (portfolio.availableBalanceUsd + portfolio.usedMarginUsd + unrealizedSum).toFixed(2),
+    (portfolio.initialEquityUsd + portfolio.realizedPnlUsd + roundedUnrealized).toFixed(2),
   );
+  const availableBalanceUsd = Number(Math.max(0, totalEquityUsd - roundedUsedMargin).toFixed(2));
   const dailyPnlPct =
     portfolio.initialEquityUsd > 0
       ? Number(
@@ -310,16 +346,35 @@ export function repricePortfolioAndPositions(
       ? Number((Math.max(0, (peakEquityUsd - totalEquityUsd) / peakEquityUsd) * 100).toFixed(2))
       : portfolio.currentDrawdownPct;
 
+  const portfolioChanged =
+    portfolio.unrealizedPnlUsd !== roundedUnrealized ||
+    portfolio.usedMarginUsd !== roundedUsedMargin ||
+    portfolio.totalEquityUsd !== totalEquityUsd ||
+    portfolio.availableBalanceUsd !== availableBalanceUsd ||
+    portfolio.dailyPnlPct !== dailyPnlPct ||
+    portfolio.weeklyPnlPct !== dailyPnlPct ||
+    portfolio.peakEquityUsd !== peakEquityUsd ||
+    portfolio.currentDrawdownPct !== currentDrawdownPct;
+
+  if (!positionsChanged && !portfolioChanged) {
+    return { portfolio, positions: [...positions] };
+  }
+
   return {
-    positions: updatedPositions,
-    portfolio: {
-      ...portfolio,
-      unrealizedPnlUsd: Number(unrealizedSum.toFixed(2)),
-      totalEquityUsd,
-      dailyPnlPct,
-      peakEquityUsd,
-      currentDrawdownPct,
-    },
+    positions: positionsChanged ? updatedPositions : [...positions],
+    portfolio: portfolioChanged
+      ? {
+          ...portfolio,
+          unrealizedPnlUsd: roundedUnrealized,
+          usedMarginUsd: roundedUsedMargin,
+          totalEquityUsd,
+          availableBalanceUsd,
+          dailyPnlPct,
+          weeklyPnlPct: dailyPnlPct,
+          peakEquityUsd,
+          currentDrawdownPct,
+        }
+      : portfolio,
   };
 }
 
