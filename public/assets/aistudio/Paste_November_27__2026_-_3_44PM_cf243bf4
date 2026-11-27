@@ -1,0 +1,1394 @@
+OMNISENT-AI — MASTER SYSTEM REPAIR & WORLD-CLASS ENGINEERING UPGRADE
+
+MISSION
+
+You are acting as a principal software architect, senior full-stack engineer, cybersecurity engineer, quantitative systems engineer, AI agent architect, database engineer, DevOps engineer, QA automation engineer, and production reliability specialist.
+
+Your mission is to conduct a COMPLETE, DEEP, SOURCE-LEVEL AUDIT, REPAIR, HARDENING, AND ENGINEERING UPGRADE of the existing OMNISENT-AI repository.
+
+Repository:
+https://github.com/havantoancntt-commits/OMNISENT-AI
+
+Do not merely analyze, describe, recommend, redesign, or generate a report.
+
+YOU MUST WORK DIRECTLY ON THE EXISTING CODEBASE, inspect the actual files, identify defects, implement verified fixes, create tests, execute available verification commands, and produce a comprehensive engineering report.
+
+The objective is to transform OMNISENT-AI into a robust, secure, maintainable, mobile-first, AI-assisted quantitative trading intelligence platform with reliable data architecture, deterministic risk controls, secure infrastructure, and verifiable operational behavior.
+
+Do not claim that the platform is world-class, production-ready, profitable, secure, or fully functional unless the corresponding properties have been independently verified.
+
+---
+
+PHASE 0 — NON-NEGOTIABLE RULES
+
+1. Inspect the actual repository before making changes.
+2. Do not assume the existing implementation is correct.
+3. Do not fabricate files, functions, APIs, test results, metrics, or capabilities.
+4. Do not delete functional features merely to simplify implementation.
+5. Preserve the existing product identity and core capabilities.
+6. Preserve existing functional UI unless a change is justified.
+7. Avoid unnecessary rewrites of the entire application.
+8. Use incremental, reversible, documented changes.
+9. Do not silently remove functionality.
+10. Do not introduce unnecessary paid dependencies.
+11. Prioritize free, open-source, and cost-efficient infrastructure when feasible.
+12. Do not expose API keys, secrets, credentials, passwords, tokens, private user data, or wallet secrets.
+13. Never commit credentials or sensitive runtime data.
+14. Do not enable live trading automatically.
+15. Do not send real exchange orders during development, auditing, testing, or repair.
+16. Paper trading must remain the default trading mode.
+17. Never bypass or weaken the Risk Engine.
+18. Never use AI-generated decisions to override deterministic safety controls.
+19. Never represent simulated execution as actual exchange execution.
+20. Never represent synthetic, stale, cached, or simulated data as live data.
+21. Never claim a test passed unless it was actually executed and passed.
+22. Never claim a build passed unless the build was actually executed and passed.
+23. Never claim a vulnerability was fixed unless the relevant implementation and verification support that claim.
+24. If a task cannot be completed because of unavailable credentials, infrastructure, APIs, dependencies, or permissions, clearly document the limitation.
+25. Do not stop after the initial audit. Continue implementing fixes until the scope is completed or a clearly documented blocker is reached.
+
+---
+
+PHASE 1 — COMPLETE REPOSITORY INVENTORY
+
+Inspect the entire repository.
+
+Review:
+
+- package.json
+- lock files
+- TypeScript configuration
+- Vite configuration
+- application entry points
+- frontend components
+- backend/server
+- API routes
+- middleware
+- database modules
+- SQLite files
+- migrations
+- schemas
+- Risk Engine
+- Quant Engine
+- Market Data
+- Exchange integrations
+- Exchange authentication
+- Crypto Vault
+- Auto-Execution
+- Portfolio
+- PnL
+- Backtesting
+- Multi-Agent architecture
+- Gemini/LLM integrations
+- Prompt management
+- AI tool calling
+- PWA
+- service workers
+- cache
+- deployment configurations
+- environment variables
+- .gitignore
+- CI/CD
+- testing infrastructure
+- logs
+- monitoring
+- documentation
+
+Identify:
+
+- incomplete features
+- duplicate implementations
+- unused modules
+- dead code
+- broken imports
+- circular dependencies
+- architecture inconsistencies
+- type errors
+- runtime risks
+- API contract inconsistencies
+- database inconsistencies
+- security vulnerabilities
+- unreliable financial calculations
+- misleading UI states
+- missing tests
+- deployment risks
+
+Create a structured audit report.
+
+Classify issues:
+
+CRITICAL
+HIGH
+MEDIUM
+LOW
+
+Each finding must include:
+
+- Issue ID
+- Severity
+- File and location
+- Actual evidence
+- Root cause
+- Impact
+- Proposed remediation
+- Implementation status
+- Verification status
+
+Do not treat assumptions as confirmed defects.
+
+---
+
+PHASE 2 — SECURITY HARDENING
+
+Conduct a complete security audit and implement fixes.
+
+2.1 Authentication
+
+Audit all authentication mechanisms.
+
+Implement secure, mandatory authentication for production.
+
+Critical requirement:
+
+If required authentication configuration is missing, production must FAIL CLOSED.
+
+Never implement:
+
+if admin token is missing:
+allow access
+
+Instead, production must:
+
+- refuse startup when critical authentication configuration is missing
+- reject unauthorized requests
+- enforce authentication consistently
+- distinguish development and production behavior
+- prevent accidental exposure of administrative APIs
+
+2.2 Authorization
+
+Implement endpoint-level authorization.
+
+Separate permissions for:
+
+- public market data
+- user data
+- portfolio
+- trading
+- exchange credentials
+- agent controls
+- administrative operations
+- audit logs
+- emergency controls
+
+Do not treat authentication as equivalent to authorization.
+
+Enforce ownership and permission checks for individual resources.
+
+Prevent cross-user data access.
+
+2.3 API security
+
+Audit every API endpoint.
+
+Implement:
+
+- authentication
+- authorization
+- input validation
+- request size limits
+- rate limiting
+- timeout
+- abuse protection
+- safe error handling
+- security headers
+- API versioning where appropriate
+- request IDs
+- audit logging
+
+Review:
+
+- SSRF
+- XSS
+- CSRF
+- SQL injection
+- path traversal
+- command injection
+- injection vulnerabilities
+- credential exposure
+- unauthorized access
+- IDOR
+- information leakage
+- denial-of-service risks
+
+2.4 CORS
+
+CORS must never be treated as an authentication mechanism.
+
+Configure explicit trusted origins.
+
+Reject inappropriate origins where applicable.
+
+Do not allow unrestricted origins in production unless there is a documented and justified requirement.
+
+2.5 Secrets management
+
+Audit:
+
+- API keys
+- exchange secrets
+- admin tokens
+- encryption keys
+- database credentials
+- AI API keys
+- OAuth tokens
+- session secrets
+
+Ensure:
+
+- secrets are never committed
+- secrets are never exposed to frontend bundles
+- secrets are never included in logs
+- secrets are never returned by APIs
+- secrets are never included in error messages
+- secrets are not stored in browser local storage
+- production secrets are injected securely
+
+Implement safe secret rotation strategies where practical.
+
+2.6 Security headers
+
+Implement appropriate:
+
+- Content Security Policy
+- Strict Transport Security when applicable
+- X-Content-Type-Options
+- Referrer Policy
+- frame protection
+- permissions policy
+
+Ensure CSP does not unnecessarily break the existing application.
+
+2.7 Rate limiting
+
+Replace process-local rate limiting where distributed production deployment requires centralized enforcement.
+
+Consider:
+
+- Redis
+- distributed counters
+- user-level limits
+- IP-level limits
+- endpoint-specific quotas
+- AI cost limits
+- execution limits
+
+If Redis is unavailable, implement a documented safe degradation strategy.
+
+2.8 Security audit logs
+
+Implement structured security logging for:
+
+- login
+- authentication failures
+- authorization failures
+- API abuse
+- credential operations
+- exchange connections
+- agent operations
+- trading actions
+- emergency stops
+- configuration changes
+
+Never log secret material.
+
+Implement log redaction.
+
+---
+
+PHASE 3 — DATABASE ARCHITECTURE & DATA INTEGRITY
+
+Audit the entire database architecture.
+
+3.1 Persistent storage
+
+Eliminate unreliable reliance on ephemeral filesystem storage for persistent production state.
+
+Evaluate and implement an appropriate persistent database architecture.
+
+Preferred production architecture:
+
+PostgreSQL.
+
+The system must support:
+
+- durable storage
+- transaction safety
+- concurrent users
+- concurrent requests
+- deployment scaling
+- data integrity
+- migrations
+- backups
+- recovery
+
+Do not silently replace or destroy the existing database.
+
+3.2 Migration strategy
+
+Create a safe migration system.
+
+Requirements:
+
+- schema versioning
+- reversible migrations where practical
+- backup before destructive migrations
+- validation
+- migration logs
+- rollback strategy
+- preservation of existing data
+
+If SQLite remains available for local development, implement an explicit database abstraction and documented environment configuration.
+
+3.3 Data integrity
+
+Audit and enforce:
+
+- primary keys
+- foreign keys
+- uniqueness
+- indexes
+- constraints
+- transaction boundaries
+- idempotency
+- consistency
+- atomic state transitions
+
+3.4 Concurrency
+
+Audit:
+
+- duplicate requests
+- race conditions
+- simultaneous order creation
+- proposal execution
+- concurrent position updates
+- portfolio accounting
+- multi-instance execution
+
+Implement transaction-safe execution and appropriate locking.
+
+3.5 Persistent state
+
+Ensure persistent storage for:
+
+- orders
+- positions
+- portfolio
+- signals
+- proposals
+- audit logs
+- execution records
+- agent state
+- configuration
+- risk state
+- exchange registry
+
+Do not rely on process memory for critical persistent state.
+
+---
+
+PHASE 4 — REPAIR THE QUANT ENGINE
+
+Audit and repair every quantitative calculation.
+
+Do not optimize trading profitability through fabricated performance claims.
+
+4.1 Financial calculation integrity
+
+Review:
+
+- price
+- quantity
+- contract size
+- notional
+- leverage
+- margin
+- fees
+- funding
+- slippage
+- realized PnL
+- unrealized PnL
+- equity
+- drawdown
+- exposure
+- risk/reward
+
+Use precise arithmetic where appropriate.
+
+Avoid floating-point errors in financial calculations.
+
+Use decimal arithmetic where justified.
+
+Document calculation conventions.
+
+4.2 Position sizing
+
+Audit position sizing.
+
+Validate:
+
+- account equity
+- available balance
+- risk percentage
+- stop-loss distance
+- contract specifications
+- leverage
+- minimum quantity
+- maximum quantity
+- tick size
+- lot size
+- notional limits
+
+Prevent invalid position sizing.
+
+Reject unsafe calculations.
+
+4.3 Liquidation estimates
+
+Do not present simplified liquidation estimates as exchange-accurate.
+
+Implement exchange-specific models only where supported by verified specifications.
+
+Account for:
+
+- maintenance margin
+- risk tiers
+- position size
+- leverage
+- isolated margin
+- cross margin
+- fees
+- funding
+- mark price
+- other positions where relevant
+
+If accurate calculations cannot be established, label the result as an estimate and prohibit it from being treated as an authoritative exchange liquidation value.
+
+4.4 Fees and slippage
+
+Unify fee and slippage models across:
+
+- signal generation
+- risk evaluation
+- execution
+- backtesting
+- portfolio
+- PnL
+
+Do not use inconsistent assumptions between modules.
+
+Support configurable fee models.
+
+Support configurable slippage models.
+
+Document assumptions.
+
+4.5 Risk/reward
+
+Verify:
+
+- entry
+- stop loss
+- take profit
+- direction
+- risk distance
+- reward distance
+- position size
+
+Reject invalid or nonsensical calculations.
+
+4.6 Backtesting integrity
+
+Audit the backtester for:
+
+- look-ahead bias
+- data leakage
+- survivorship bias
+- unrealistic execution
+- spread
+- fees
+- slippage
+- funding
+- latency
+- stop-loss handling
+- take-profit handling
+- intrabar assumptions
+- position sizing
+- leverage
+- liquidation
+- duplicate signals
+
+Ensure backtests are not presented as guaranteed future performance.
+
+4.7 Quant testing
+
+Implement tests for:
+
+- long position
+- short position
+- stop-loss
+- take-profit
+- invalid price
+- invalid quantity
+- extreme volatility
+- gap scenarios
+- fee calculation
+- slippage
+- funding
+- leverage
+- drawdown
+- exposure
+- liquidation estimation
+
+---
+
+PHASE 5 — RISK ENGINE: INDEPENDENT SAFETY AUTHORITY
+
+The Risk Engine must remain independent from AI decision-making.
+
+AI must not override Risk Engine decisions.
+
+Implement and verify:
+
+- maximum risk per trade
+- maximum portfolio risk
+- maximum daily loss
+- maximum weekly loss
+- maximum drawdown
+- maximum leverage
+- maximum exposure
+- maximum positions
+- maximum concentration
+- maximum correlation exposure where feasible
+- minimum liquidity
+- minimum data freshness
+- spread limits
+- volatility limits
+- emergency stop
+- risk lock
+- cooldown
+- position limits
+- funding exposure
+- margin checks
+
+5.1 Risk veto
+
+The Risk Engine must be capable of rejecting any proposed order.
+
+Every rejected order must include an understandable reason.
+
+5.2 Risk state persistence
+
+Persist risk state.
+
+Do not reset daily loss, drawdown or emergency state merely because a process restarts.
+
+5.3 Risk state reconciliation
+
+Reconcile:
+
+- database positions
+- exchange positions
+- portfolio equity
+- open orders
+- margin
+- execution records
+
+5.4 Risk fail-safe
+
+When critical risk data is unavailable, inconsistent, stale or invalid:
+
+FAIL CLOSED.
+
+Do not generate or execute new orders.
+
+5.5 Emergency Stop
+
+Implement an emergency stop that:
+
+- prevents new orders
+- disables automatic execution
+- persists state
+- records the event
+- notifies the user
+- requires deliberate authorization to reactivate
+
+Do not automatically liquidate positions without an explicit, separately configured and verified policy.
+
+---
+
+PHASE 6 — MARKET DATA INFRASTRUCTURE
+
+Audit all data providers and feeds.
+
+6.1 Data validation
+
+Validate:
+
+- timestamps
+- prices
+- OHLC
+- volume
+- spreads
+- bid
+- ask
+- symbol
+- exchange
+- market type
+- sequence
+- freshness
+
+Reject invalid data.
+
+6.2 Stale data protection
+
+Implement explicit states:
+
+LIVE
+AGING
+STALE
+OFFLINE
+ERROR
+
+Ensure the UI clearly distinguishes each state.
+
+When data is stale:
+
+- disable new trading
+- disable automated execution
+- notify the user
+- record the event
+
+6.3 WebSocket reliability
+
+Audit:
+
+- reconnect
+- heartbeat
+- sequence gaps
+- duplicate events
+- reconnect backoff
+- feed state
+- connection monitoring
+- recovery
+
+Do not falsely display LIVE status.
+
+6.4 Cross-venue validation
+
+Implement appropriate:
+
+- peer validation
+- liquidity validation
+- freshness validation
+- outlier detection
+- market type validation
+- quote currency validation
+- symbol normalization
+
+Do not combine incompatible prices.
+
+6.5 Market data provenance
+
+Every important signal must be traceable to:
+
+- source
+- timestamp
+- market
+- symbol
+- price
+- data quality status
+
+---
+
+PHASE 7 — EXCHANGE INTEGRATION & EXECUTION
+
+7.1 Exchange architecture
+
+Create a modular exchange adapter architecture.
+
+Separate:
+
+- market data
+- authentication
+- account data
+- balances
+- positions
+- order creation
+- order cancellation
+- order status
+- execution reconciliation
+
+7.2 Paper mode
+
+Paper trading remains the default.
+
+Clearly label:
+
+PAPER
+SIMULATED
+NOT REAL EXCHANGE EXECUTION
+
+Do not allow paper execution to be mistaken for live execution.
+
+7.3 Live mode
+
+Do not activate live trading automatically.
+
+Do not send real exchange orders during development or repair.
+
+Live execution must remain disabled until the user explicitly enables it and the implementation has passed all required validation.
+
+Implement:
+
+- explicit live mode configuration
+- secure credential storage
+- permission verification
+- exchange-specific validation
+- order validation
+- risk validation
+- idempotency
+- reconciliation
+- execution tracking
+- monitoring
+- emergency stop
+
+7.4 Order state machine
+
+Implement a robust order state machine.
+
+Possible states:
+
+CREATED
+VALIDATING
+RISK_REJECTED
+SUBMITTED
+ACKNOWLEDGED
+PARTIALLY_FILLED
+FILLED
+CANCEL_PENDING
+CANCELLED
+REJECTED
+EXPIRED
+ERROR
+RECONCILIATION_REQUIRED
+
+Adapt states to actual exchange semantics.
+
+Ensure transitions are valid.
+
+7.5 Idempotency
+
+Prevent duplicate orders.
+
+Use persistent idempotency keys.
+
+Ensure concurrent requests cannot duplicate execution.
+
+Implement recovery for ambiguous exchange responses.
+
+7.6 Exchange reconciliation
+
+Implement reconciliation between:
+
+- local orders
+- exchange orders
+- local positions
+- exchange positions
+- balances
+- executions
+- fees
+
+Do not silently overwrite inconsistencies.
+
+Create reconciliation alerts.
+
+7.7 Live execution safety
+
+Never assume an exchange request succeeded because the local database recorded it.
+
+Never assume an order failed because a request timed out.
+
+Use reconciliation to resolve ambiguous states.
+
+---
+
+PHASE 8 — AUTO-EXECUTION ARCHITECTURE
+
+Audit and redesign Auto-Execution if necessary.
+
+Do not rely on serverless setInterval for critical scheduling.
+
+Implement a reliable architecture using:
+
+- persistent jobs
+- scheduler
+- queue
+- workers
+- distributed locks
+- idempotency
+- retry policy
+- timeout
+- dead-letter handling
+- execution monitoring
+
+8.1 Auto-Execution controls
+
+Implement:
+
+- explicit enable/disable
+- persistent configuration
+- persistent state
+- execution history
+- maximum execution frequency
+- maximum daily executions
+- maximum daily loss
+- maximum risk
+- cooldown
+- emergency stop
+
+8.2 Auto-Execution safety
+
+Automatic execution must not bypass:
+
+- authentication
+- authorization
+- Risk Engine
+- market data validation
+- execution validation
+- account validation
+
+8.3 Failure handling
+
+When critical components fail:
+
+- halt execution
+- record failure
+- alert the user
+- prevent unsafe retries
+
+---
+
+PHASE 9 — AI & MULTI-AGENT SYSTEM
+
+Audit the entire AI architecture.
+
+9.1 Agent roles
+
+Review and improve agents for:
+
+- market structure
+- technical analysis
+- risk analysis
+- macro analysis
+- news analysis
+- microstructure
+- strategy evaluation
+- signal validation
+
+Do not create agents merely for appearance.
+
+Each agent must have:
+
+- clear purpose
+- defined inputs
+- defined outputs
+- constraints
+- timeout
+- cost budget
+- error handling
+- validation
+
+9.2 Independent evidence
+
+Avoid correlated reasoning errors.
+
+Where practical, use different data sources, methodologies and validation approaches.
+
+Do not claim agent independence when agents share identical inputs and reasoning.
+
+9.3 Prompt injection
+
+Protect:
+
+- AI prompts
+- tool calls
+- retrieved data
+- external news
+- documents
+- user inputs
+
+Treat external content as untrusted.
+
+External content must never be allowed to redefine system policy.
+
+9.4 Tool permissions
+
+Implement least privilege.
+
+Agents must not receive unrestricted execution privileges.
+
+Require authorization and validation for sensitive operations.
+
+9.5 AI reliability
+
+Implement:
+
+- timeout
+- retry
+- fallback
+- structured output
+- schema validation
+- hallucination-resistant grounding
+- provenance
+- uncertainty
+- confidence calibration
+- cost control
+
+9.6 AI decision output
+
+Each decision must include:
+
+- symbol
+- market
+- timeframe
+- direction
+- rationale
+- supporting evidence
+- data sources
+- timestamps
+- confidence
+- uncertainty
+- risk evaluation
+- invalidation conditions
+- decision status
+
+Do not equate AI confidence with statistical probability unless properly calibrated.
+
+---
+
+PHASE 10 — PWA & MOBILE UX
+
+Maintain a high-quality mobile-first experience.
+
+Optimize for:
+
+- Android
+- mobile browsers
+- PWA
+- small screens
+- tablet
+- desktop
+
+Review:
+
+- navigation
+- responsiveness
+- loading
+- errors
+- empty states
+- accessibility
+- performance
+- installation
+- offline behavior
+- cache
+- service worker
+
+10.1 Offline behavior
+
+Clearly distinguish:
+
+- live
+- cached
+- stale
+- offline
+
+Never imply that offline data is live.
+
+10.2 Service worker
+
+Audit:
+
+- cache invalidation
+- update lifecycle
+- stale assets
+- offline fallback
+- app version
+- recovery
+
+Prevent stale application state from misleading users.
+
+10.3 UX
+
+Preserve the existing visual identity.
+
+Improve:
+
+- usability
+- clarity
+- hierarchy
+- mobile navigation
+- accessibility
+- performance
+- data visibility
+
+Avoid unnecessary redesign.
+
+---
+
+PHASE 11 — PERFORMANCE & SCALABILITY
+
+Audit and optimize:
+
+- frontend rendering
+- backend latency
+- API performance
+- database queries
+- caching
+- WebSocket
+- AI latency
+- memory
+- CPU
+- concurrency
+
+Implement appropriate:
+
+- caching
+- pagination
+- query optimization
+- lazy loading
+- request deduplication
+- batching
+- timeout
+- backpressure
+- concurrency limits
+
+Do not introduce cache mechanisms that compromise critical financial data integrity.
+
+---
+
+PHASE 12 — TESTING & QUALITY ASSURANCE
+
+Create a comprehensive testing system.
+
+12.1 Unit tests
+
+Test:
+
+- Risk Engine
+- Quant Engine
+- financial calculations
+- validation
+- data integrity
+- crypto vault
+- order state machine
+- idempotency
+- portfolio
+- PnL
+
+12.2 Integration tests
+
+Test:
+
+- APIs
+- authentication
+- authorization
+- database
+- market data
+- agents
+- proposals
+- execution
+- reconciliation
+
+12.3 Security tests
+
+Test:
+
+- unauthorized access
+- authentication bypass
+- authorization bypass
+- IDOR
+- rate limiting
+- validation
+- injection
+- secret exposure
+- CORS
+- CSRF where relevant
+
+12.4 Regression tests
+
+Protect existing functional features.
+
+12.5 Stress tests
+
+Test:
+
+- concurrent requests
+- duplicate requests
+- multiple agents
+- feed reconnects
+- database contention
+- job scheduling
+
+12.6 Build verification
+
+Run all available commands.
+
+At minimum, attempt:
+
+- dependency installation
+- lint
+- typecheck
+- unit tests
+- integration tests
+- build
+
+Do not fabricate results.
+
+If a command fails:
+
+- capture the failure
+- identify the root cause
+- fix it where feasible
+- rerun the command
+
+---
+
+PHASE 13 — CI/CD & DEPLOYMENT
+
+Implement an appropriate CI pipeline.
+
+Pipeline should include:
+
+- dependency installation
+- lint
+- typecheck
+- unit tests
+- security checks
+- build
+
+Prevent deployment if critical verification fails.
+
+Review:
+
+- Vercel
+- serverless limitations
+- environment variables
+- persistent database
+- worker architecture
+- WebSocket reliability
+- deployment configuration
+
+Do not assume Vercel is suitable for all persistent execution workloads.
+
+Document the architecture and deployment limitations.
+
+---
+
+PHASE 14 — DOCUMENTATION
+
+Create or update:
+
+README.md
+SECURITY.md
+ARCHITECTURE.md
+DEPLOYMENT.md
+DATABASE.md
+TESTING.md
+ENVIRONMENT.md
+AUDIT_REPORT.md
+REPAIR_REPORT.md
+
+Documentation must accurately reflect the implemented system.
+
+Include:
+
+- architecture
+- dependencies
+- environment variables
+- deployment
+- database
+- security
+- testing
+- paper mode
+- live mode limitations
+- risk controls
+- known issues
+
+---
+
+PHASE 15 — FINAL VERIFICATION
+
+Before completing:
+
+1. Inspect all changed files.
+2. Review changes for unintended regressions.
+3. Run lint.
+4. Run tests.
+5. Run build.
+6. Run security checks.
+7. Verify environment configuration.
+8. Verify secrets are not exposed.
+9. Verify database migration safety.
+10. Verify authentication.
+11. Verify authorization.
+12. Verify paper trading.
+13. Verify execution safety.
+14. Verify emergency stop.
+15. Verify PWA behavior.
+16. Verify deployment configuration.
+
+Never enable live trading as part of this process.
+
+---
+
+PHASE 16 — FINAL REPORT
+
+Produce a comprehensive report.
+
+Include:
+
+A. Executive Summary
+
+- Overall architecture.
+- Major defects.
+- Major repairs.
+- Remaining risks.
+
+B. Original Defects
+
+List every confirmed defect.
+
+C. Implemented Repairs
+
+For each repair:
+
+- Issue ID
+- File
+- Description
+- Root cause
+- Fix
+- Verification
+
+D. Security
+
+- Security improvements.
+- Remaining vulnerabilities.
+- Unverified areas.
+
+E. Quant & Risk Engine
+
+- Improvements.
+- Formula validation.
+- Test results.
+- Known limitations.
+
+F. Database
+
+- Schema.
+- Migration.
+- Persistence.
+- Integrity.
+- Backup strategy.
+
+G. AI Agents
+
+- Agent architecture.
+- Reliability.
+- Tool permissions.
+- Limitations.
+
+H. Execution
+
+- Paper mode.
+- Live execution status.
+- Exchange integrations.
+- Reconciliation.
+- Safety controls.
+
+I. Build & Tests
+
+Report exact commands and results.
+
+Clearly distinguish:
+
+PASSED
+FAILED
+NOT RUN
+BLOCKED
+
+J. Deployment
+
+- Deployment readiness.
+- Infrastructure requirements.
+- Configuration requirements.
+
+K. Remaining Issues
+
+List every unresolved issue with severity.
+
+L. Final Status
+
+Use one of:
+
+- NOT READY
+- DEVELOPMENT READY
+- TESTING READY
+- STAGING READY
+- PRODUCTION CANDIDATE
+
+Do not declare PRODUCTION READY without sufficient evidence.
+
+---
+
+EXECUTION DIRECTIVE
+
+BEGIN NOW.
+
+Do not stop at the audit report.
+
+Inspect the actual source code.
+
+Implement the highest-priority fixes first.
+
+Continue through the phases in order, but adapt to the actual repository architecture.
+
+Do not create a superficial patch.
+
+Do not merely rewrite documentation.
+
+Do not merely redesign the frontend.
+
+Do not add artificial AI agents.
+
+Do not claim successful verification without execution.
+
+Do not enable live trading.
+
+Work directly on the repository and deliver the strongest technically verifiable repair and upgrade possible.
+
+The ultimate priority is:
+
+SECURITY
+DATA INTEGRITY
+RELIABILITY
+QUANTITATIVE CORRECTNESS
+RISK CONTROL
+EXECUTION SAFETY
+AI RELIABILITY
+PERFORMANCE
+MAINTAINABILITY
+USER EXPERIENCE
+
+Proceed with a full-system engineering repair and upgrade of OMNISENT-AI.

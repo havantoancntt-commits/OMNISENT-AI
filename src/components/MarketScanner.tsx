@@ -22,6 +22,7 @@ import {
   computeCrossVenueBasisBps,
   mergeLiveTickIntoCandles,
 } from '../engine/priceFeedGuard';
+import { apiFetch } from '../lib/apiClient';
 import type {
   Candle,
   ClosePositionResponse,
@@ -186,7 +187,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
       interval,
       exchange: active.exchange,
     });
-    fetch(`/api/market/candles?${params.toString()}`)
+    apiFetch(`/api/market/candles?${params.toString()}`)
       .then((r) => r.json())
       .then((data) => {
         if (cancelled) return;
@@ -346,7 +347,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
           exchange: exchangeFilter,
           limit: '24',
         });
-        const res = await fetch(`/api/market/search?${params.toString()}`);
+        const res = await apiFetch(`/api/market/search?${params.toString()}`);
         if (!res.ok) return;
         const data = await res.json();
         if (!cancelled) {
@@ -376,7 +377,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
       return;
     }
     const timer = setTimeout(() => {
-      fetch('/api/orders/preview', {
+      apiFetch('/api/orders/preview', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -409,7 +410,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
       const idempotencyKey = `UI-${active.symbol}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
       const submittedEntry =
         orderType === 'MARKET' ? active.lastPrice : Number(entryPrice);
-      const res = await fetch('/api/orders', {
+      const res = await apiFetch('/api/orders', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

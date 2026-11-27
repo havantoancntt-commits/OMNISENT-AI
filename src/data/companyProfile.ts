@@ -45,7 +45,7 @@ export const COMPANY_PROFILE: CompanyProfileInfo = {
     'Phòng nghiên cứu và vận hành giao dịch tài sản số chuẩn tổ chức, nơi 19 Robot AI chuyên trách tranh luận phản biện đa chiều trước khi trình tín hiệu qua động cơ Risk Engine xác định độc lập.',
   governanceStatement:
     'Mọi quyết định vào lệnh đều tuân thủ quy trình kiểm định dữ liệu vi mô, đối chứng xác suất định lượng và ràng buộc bảo toàn vốn tuyệt đối — loại bỏ hoàn toàn cảm tính và đòn bẩy mất kiểm soát.',
-  operationalStandard: 'Tự động thông minh (FULL_AUTO) · Risk Gate Độc Lập · Audit Trail Bất Biến',
+  operationalStandard: 'PAPER Simulator Mặc Định · Risk Gate Độc Lập · Audit Trail Bất Biến',
 };
 
 export const COMPANY_SPECIFICATIONS: Array<{
@@ -173,7 +173,7 @@ const COMPANY_PROFILE_EN: CompanyProfileInfo = {
     'An institutional-grade digital asset research and execution lab where 19 specialized AI agents run structured adversarial debate before any trade intent is audited by a deterministic Risk Engine.',
   governanceStatement:
     'Every execution proposal enforces microstructure validation, quantitative expectancy verification, and strict capital-preservation constraints — eliminating emotional discretion and uncontrolled leverage.',
-  operationalStandard: 'Autonomous Precision (FULL_AUTO) · Deterministic Risk Gate · Immutable Audit Trail',
+  operationalStandard: 'PAPER Simulator Default · Deterministic Risk Gate · Immutable Audit Trail',
 };
 
 const COMPANY_SPECIFICATIONS_EN: Array<{

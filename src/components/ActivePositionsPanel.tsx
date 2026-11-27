@@ -651,9 +651,15 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                     <p className="font-sans text-[11px] text-slate-500">{t('pos.col.marginLiq')}</p>
                     <p className="mt-0.5 font-semibold text-slate-200">
                       ${p.marginUsd.toLocaleString('en-US', { maximumFractionDigits: 2 })}{' '}
-                      <span className="text-[11px] font-normal text-amber-300 whitespace-nowrap">
+                      <span
+                        className="text-[11px] font-normal text-amber-300 whitespace-nowrap"
+                        title={
+                          p.liquidationDisclaimer ??
+                          'Isolated-margin liquidation estimate; real exchange maintenance margin tiers and funding may differ.'
+                        }
+                      >
                         {p.liquidationPrice
-                          ? `· Liq $${formatPrice(p.liquidationPrice, tel.priceDecimals)}`
+                          ? `· Est. Liq (Iso) $${formatPrice(p.liquidationPrice, tel.priceDecimals)}`
                           : p.marketType === 'SPOT'
                             ? '· Spot'
                             : `· ${t('pos.noLiq')}`}

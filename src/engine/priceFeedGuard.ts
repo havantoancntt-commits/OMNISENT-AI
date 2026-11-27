@@ -1,4 +1,4 @@
-import type { Candle, MarketTicker } from './types.ts';
+import type { Candle, MarketTicker, StandardizedFeedHealthState } from './types.ts';
 
 export type FeedFreshnessTier = 'REALTIME' | 'LIVE' | 'AGING' | 'STALE' | 'UNAVAILABLE';
 
@@ -8,10 +8,6 @@ export interface LiveQuoteValidationResult {
   spreadBps: number;
 }
 
-/**
- * Validates an incoming real-time price tick against crossed-book corruption,
- * extreme spreads, and flash-glitch outliers (>14% instantaneous jump in <3s).
- */
 export function validateLiveQuoteTick(params: {
   lastPrice: number;
   bidPrice?: number;
@@ -64,6 +60,42 @@ export function classifyFeedFreshness(
   return { ageMs, tier: 'STALE' };
 }
 
+export function mapTierToStandardFeedHealth(
+  tier: FeedFreshnessTier,
+  hasError = false,
+): StandardizedFeedHealthState {
+  if (hasError) return 'ERROR';
+  switch (tier) {
+    case 'REALTIME':
+    case 'LIVE':
+      return 'LIVE';
+    case 'AGING':
+      return 'AGING';
+    case 'STALE':
+      return 'STALE';
+    case 'UNAVAILABLE':
+    default:
+      return 'OFFLINE';
+  }
+}
+
+export function resolveTickerFeedHealthState(
+  ticker: MarketTicker | null | undefined,
+  nowMs = Date.now(),
+): StandardizedFeedHealthState {
+  if (!ticker) return 'OFFLINE';
+  if (ticker.dataStatus === 'UNAVAILABLE' || ticker.lastPrice <= 0) {
+    return ticker.sourceLabel.toUpperCase().includes('ERROR') ? 'ERROR' : 'OFFLINE';
+  }
+  if (ticker.bidPrice > 0 && ticker.askPrice > 0 && ticker.bidPrice > ticker.askPrice * 1.0001) {
+    return 'ERROR';
+  }
+  if (ticker.dataStatus === 'UNKNOWN') return 'ERROR';
+  if (ticker.dataStatus === 'STALE') return 'STALE';
+  const { tier } = classifyFeedFreshness(ticker.timestampUtc, nowMs);
+  return mapTierToStandardFeedHealth(tier, false);
+}
+
 export function intervalToMs(interval: string): number {
   switch (interval) {
     case '1m':
@@ -72,6 +104,8 @@ export function intervalToMs(interval: string): number {
       return 5 * 60_000;
     case '15m':
       return 15 * 60_000;
+    case '30m':
+      return 30 * 60_000;
     case '4h':
       return 4 * 3600_000;
     case '1d':
@@ -82,11 +116,6 @@ export function intervalToMs(interval: string): number {
   }
 }
 
-/**
- * Stitches the newest live quote tick onto the active OHLCV candle array without mutating inputs.
- * Updates the active bar's close/high/low, or opens a fresh chronological bar when timestamp
- * crosses into the next bucket.
- */
 export function mergeLiveTickIntoCandles(
   candles: Candle[],
   livePrice: number,
@@ -122,9 +151,6 @@ export function mergeLiveTickIntoCandles(
   return [...candles.slice(0, -1), updatedLast];
 }
 
-/**
- * Computes cross-venue fair reference price and basis divergence (bps) against same-symbol peers.
- */
 export function computeCrossVenueBasisBps(
   tickers: MarketTicker[],
   target: MarketTicker,
@@ -164,14 +190,16 @@ export interface FeedHealthSummary {
   medianLatencyMs: number;
   medianAgeMs: number;
   freshness: FeedFreshnessTier;
+  healthState: StandardizedFeedHealthState;
 }
 
 export function computeFeedHealthMetrics(
   tickers: MarketTicker[],
   nowMs = Date.now(),
 ): FeedHealthSummary {
-  const live = tickers.filter((t) => t.dataStatus === 'LIVE_EXCHANGE' && t.lastPrice > 0);
+  const live = tickers.filter((t) => t.dataStatus === 'LIVE_EXCHANGE' && t.lastPrice > 0 && t.timestampUtc > 0);
   if (live.length === 0) {
+    const anyError = tickers.some((t) => t.dataStatus === 'UNKNOWN' || (t.bidPrice > 0 && t.askPrice > 0 && t.bidPrice > t.askPrice * 1.0001));
     return {
       liveCount: 0,
       totalCount: tickers.length,
@@ -179,6 +207,7 @@ export function computeFeedHealthMetrics(
       medianLatencyMs: 0,
       medianAgeMs: 0,
       freshness: 'UNAVAILABLE',
+      healthState: anyError ? 'ERROR' : 'OFFLINE',
     };
   }
   const latencies = live.map((t) => t.latencyMs).sort((a, b) => a - b);
@@ -195,5 +224,6 @@ export function computeFeedHealthMetrics(
     medianLatencyMs: latencies[mid] ?? 0,
     medianAgeMs,
     freshness,
+    healthState: mapTierToStandardFeedHealth(freshness, false),
   };
 }

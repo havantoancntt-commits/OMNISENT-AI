@@ -5,7 +5,9 @@ import {
   Cpu,
   FlaskConical,
   Globe,
+  KeyRound,
   LayoutDashboard,
+  LogOut,
   Menu,
   OctagonAlert,
   Search,
@@ -14,6 +16,15 @@ import {
   X,
 } from 'lucide-react';
 import { useI18n } from './i18n/I18nContext';
+import {
+  apiFetch,
+  buildAuthenticatedWsUrl,
+  clearAuthSession,
+  setAuthSession,
+  subscribeAuthRequired,
+  subscribeAuthSession,
+  type AuthSessionState,
+} from './lib/apiClient';
 import { DEFAULT_RISK_CONFIG } from './engine/riskEngine';
 import type {
   AgentLogEntry,
@@ -104,7 +115,7 @@ const NAV_ITEM_DEFS: Array<{
 ];
 
 const INITIAL_PORTFOLIO: PortfolioSummary = {
-  mode: 'FULL_AUTO',
+  mode: 'PAPER',
   initialEquityUsd: 100_000,
   totalEquityUsd: 100_000,
   availableBalanceUsd: 100_000,
@@ -186,7 +197,7 @@ export default function App() {
   const [tradingMode, setTradingMode] = useState<TradingMode>(() =>
     cachedHydration?.tradingMode
       ? (cachedHydration.tradingMode as TradingMode)
-      : 'FULL_AUTO',
+      : 'PAPER',
   );
 
   const [agents, setAgents] = useState<AgentState[]>([]);
@@ -204,6 +215,27 @@ export default function App() {
   const [lastRunSummary, setLastRunSummary] = useState<SmartRunSummary | null>(null);
   const [smartOpportunities, setSmartOpportunities] = useState<SmartOpportunityCandidate[]>([]);
   const [emergencyConfirmOpen, setEmergencyConfirmOpen] = useState(false);
+  const [unlockReasonInput, setUnlockReasonInput] = useState('');
+  const [unlockErrorMsg, setUnlockErrorMsg] = useState<string | null>(null);
+  const [pendingUnlockMode, setPendingUnlockMode] = useState<TradingMode>('PAPER');
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authSecretInput, setAuthSecretInput] = useState('');
+  const [authActorInput, setAuthActorInput] = useState('SYSTEM_OPERATOR');
+  const [authErrorMsg, setAuthErrorMsg] = useState<string | null>(null);
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authSession, setAuthSessionState] = useState<AuthSessionState>({
+    token: null,
+    actor: null,
+    role: null,
+    expiresAtUtc: null,
+  });
+  const [authStatus, setAuthStatus] = useState<{
+    authEnforced: boolean;
+    hasClaimedCredential: boolean;
+    authenticated: boolean;
+    role: string | null;
+    actor: string | null;
+  } | null>(null);
   const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [autoExecutionStatus, setAutoExecutionStatus] = useState<AutoExecutionEngineStatus | null>(
     () =>
@@ -354,13 +386,13 @@ export default function App() {
     try {
       const noStoreInit: RequestInit = { cache: 'no-store' };
       const [mktRes, portRes, agRes, sigRes, exRes, audRes, autoRes] = await Promise.all([
-        fetch('/api/market/tickers', noStoreInit),
-        fetch('/api/portfolio', noStoreInit),
-        fetch('/api/agents', noStoreInit),
-        fetch('/api/signals', noStoreInit),
-        fetch('/api/exchanges', noStoreInit),
-        fetch('/api/audit-logs', noStoreInit),
-        fetch('/api/auto-trade/status', noStoreInit),
+        apiFetch('/api/market/tickers', noStoreInit),
+        apiFetch('/api/portfolio', noStoreInit),
+        apiFetch('/api/agents', noStoreInit),
+        apiFetch('/api/signals', noStoreInit),
+        apiFetch('/api/exchanges', noStoreInit),
+        apiFetch('/api/audit-logs', noStoreInit),
+        apiFetch('/api/auto-trade/status', noStoreInit),
       ]);
 
       let incomingTickers: MarketTicker[] | undefined;
@@ -465,7 +497,7 @@ export default function App() {
     }
     const t0 = typeof performance !== 'undefined' ? performance.now() : Date.now();
     try {
-      const res = await fetch('/api/sync/bootstrap', { cache: 'no-store' });
+      const res = await apiFetch('/api/sync/bootstrap', { cache: 'no-store' });
       if (!res.ok) return null;
       const data = await res.json();
       if (typeof data.wsSupported === 'boolean') {
@@ -517,7 +549,7 @@ export default function App() {
       if (reconciled.tickers.length > 0 && reconciled.portfolio) {
         persistTelemetrySnapshotThrottled({
           stateRevision: lastKnownRevisionRef.current,
-          tradingMode: String(data.tradingMode ?? reconciled.portfolio.mode ?? 'FULL_AUTO'),
+          tradingMode: String(data.tradingMode ?? reconciled.portfolio.mode ?? 'PAPER'),
           serverUtc: String(data.serverUtc ?? ''),
           tickers: reconciled.tickers,
           portfolio: reconciled.portfolio,
@@ -534,6 +566,39 @@ export default function App() {
       return null;
     }
   }, [fetchAllState, persistTelemetrySnapshotThrottled, reconcileMarketPortfolioPositions, reportDataSync]);
+
+  const refreshAuthStatus = useCallback(async () => {
+    try {
+      const res = await apiFetch('/api/auth/status');
+      if (!res.ok) return;
+      const data = await res.json();
+      setAuthStatus({
+        authEnforced: Boolean(data.authEnforced),
+        hasClaimedCredential: Boolean(data.hasClaimedCredential),
+        authenticated: Boolean(data.authenticated),
+        role: typeof data.role === 'string' ? data.role : null,
+        actor: typeof data.actor === 'string' ? data.actor : null,
+      });
+    } catch {
+      // non-fatal
+    }
+  }, []);
+
+  useEffect(() => {
+    void refreshAuthStatus();
+    const unsubSession = subscribeAuthSession((next) => {
+      setAuthSessionState(next);
+      void refreshAuthStatus();
+    });
+    const unsubRequired = subscribeAuthRequired((detail) => {
+      setAuthErrorMsg(detail.message ?? null);
+      setAuthModalOpen(true);
+    });
+    return () => {
+      unsubSession();
+      unsubRequired();
+    };
+  }, [refreshAuthStatus]);
 
   // Register unified PWA Sync Now handler
   useEffect(() => {
@@ -680,7 +745,7 @@ export default function App() {
 
           persistTelemetrySnapshotThrottled({
             stateRevision: lastKnownRevisionRef.current,
-            tradingMode: repriced.portfolio.mode ?? 'FULL_AUTO',
+            tradingMode: repriced.portfolio.mode ?? 'PAPER',
             serverUtc: utc,
             tickers: updatedTickers,
             portfolio: repriced.portfolio,
@@ -745,7 +810,7 @@ export default function App() {
         return;
       }
       try {
-        ws = new WebSocket(wsUrl);
+        ws = new WebSocket(buildAuthenticatedWsUrl(wsUrl));
         ws.onerror = () => {
           // handled on close
         };
@@ -780,7 +845,7 @@ export default function App() {
               if (reconciled.tickers.length > 0 && reconciled.portfolio) {
                 persistTelemetrySnapshotThrottled({
                   stateRevision: lastKnownRevisionRef.current,
-                  tradingMode: reconciled.portfolio.mode ?? 'FULL_AUTO',
+                  tradingMode: reconciled.portfolio.mode ?? 'PAPER',
                   serverUtc: msg.serverUtc ?? '',
                   tickers: reconciled.tickers,
                   portfolio: reconciled.portfolio,
@@ -843,7 +908,7 @@ export default function App() {
               if (reconciled.tickers.length > 0 && reconciled.portfolio) {
                 persistTelemetrySnapshotThrottled({
                   stateRevision: lastKnownRevisionRef.current,
-                  tradingMode: String(msg.tradingMode ?? reconciled.portfolio.mode ?? 'FULL_AUTO'),
+                  tradingMode: String(msg.tradingMode ?? reconciled.portfolio.mode ?? 'PAPER'),
                   serverUtc: msg.serverUtc ?? '',
                   tickers: reconciled.tickers,
                   portfolio: reconciled.portfolio,
@@ -1003,7 +1068,7 @@ export default function App() {
         marketType: selectedMarketType,
       });
       if (selectedExchange) params.set('exchange', selectedExchange);
-      fetch(`/api/market/orderbook?${params.toString()}`)
+      apiFetch(`/api/market/orderbook?${params.toString()}`)
         .then((r) => r.json())
         .then((d) => {
           if (!cancelled && d.bids) setOrderBook(d);
@@ -1074,7 +1139,7 @@ export default function App() {
     exchange: string,
     options?: { runAi?: boolean },
   ) => {
-    const res = await fetch('/api/market/select', {
+    const res = await apiFetch('/api/market/select', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ symbol, marketType, exchange }),
@@ -1122,7 +1187,7 @@ export default function App() {
     const t2 = window.setTimeout(() => setRunStage(2), 180);
     const t3 = window.setTimeout(() => setRunStage(3), 420);
     try {
-      const res = await fetch('/api/run/smart', {
+      const res = await apiFetch('/api/run/smart', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1186,7 +1251,7 @@ export default function App() {
   const handleResetSession = async () => {
     setActionError(null);
     try {
-      const res = await fetch('/api/session/reset', { method: 'POST' });
+      const res = await apiFetch('/api/session/reset', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (res.ok) {
         setLastRunSummary(null);
@@ -1207,7 +1272,7 @@ export default function App() {
   ) => {
     setActionError(null);
     try {
-      const res = await fetch(`/api/agents/${encodeURIComponent(agentId)}/action`, {
+      const res = await apiFetch(`/api/agents/${encodeURIComponent(agentId)}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -1227,7 +1292,7 @@ export default function App() {
   const handleClosePosition = async (id: string): Promise<ClosePositionResponse> => {
     setActionError(null);
     try {
-      const res = await fetch(`/api/positions/${encodeURIComponent(id)}/close`, { method: 'POST' });
+      const res = await apiFetch(`/api/positions/${encodeURIComponent(id)}/close`, { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const errMsg = data.error || t('app.error.actionFailed');
@@ -1268,7 +1333,7 @@ export default function App() {
     takeProfit: number,
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch(`/api/positions/${encodeURIComponent(id)}`, {
+      const res = await apiFetch(`/api/positions/${encodeURIComponent(id)}`, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ stopLoss, takeProfit }),
@@ -1288,7 +1353,7 @@ export default function App() {
   const handleSaveRiskConfig = async (cfg: RiskConfig): Promise<boolean> => {
     setActionError(null);
     try {
-      const res = await fetch('/api/risk/config', {
+      const res = await apiFetch('/api/risk/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(cfg),
@@ -1310,19 +1375,45 @@ export default function App() {
     }
   };
 
-  const handleChangeMode = async (mode: TradingMode) => {
+  const handleChangeMode = async (
+    mode: TradingMode,
+    unlockGovernance?: { confirmEmergencyReset: boolean; unlockReason: string },
+  ) => {
+    if (tradingMode === 'EMERGENCY_STOP' && mode !== 'EMERGENCY_STOP' && !unlockGovernance) {
+      setPendingUnlockMode(mode);
+      setUnlockReasonInput('');
+      setUnlockErrorMsg(null);
+      setEmergencyConfirmOpen(true);
+      return;
+    }
     setActionError(null);
     try {
-      const res = await fetch('/api/mode', {
+      const payload = unlockGovernance
+        ? {
+            mode,
+            confirmEmergencyReset: unlockGovernance.confirmEmergencyReset,
+            unlockReason: unlockGovernance.unlockReason,
+          }
+        : { mode };
+      const res = await apiFetch('/api/mode', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ mode }),
+        body: JSON.stringify(payload),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
+        if (data?.code === 'EMERGENCY_UNLOCK_GOVERNANCE_REQUIRED') {
+          setPendingUnlockMode(mode);
+          setUnlockErrorMsg(data.error || t('app.emergency.unlockReasonMinErr'));
+          setEmergencyConfirmOpen(true);
+          return;
+        }
         setActionError(data.error || t('app.error.actionFailed'));
         return;
       }
+      setEmergencyConfirmOpen(false);
+      setUnlockReasonInput('');
+      setUnlockErrorMsg(null);
       await fetchAllState();
       broadcastSyncEvent('DATA_MUTATED');
     } catch {
@@ -1333,7 +1424,7 @@ export default function App() {
   const handleEmergencyStop = async () => {
     setActionError(null);
     try {
-      const res = await fetch('/api/emergency-stop', { method: 'POST' });
+      const res = await apiFetch('/api/emergency-stop', { method: 'POST' });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         setActionError(data.error || t('app.error.actionFailed'));
@@ -1347,11 +1438,62 @@ export default function App() {
     }
   };
 
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthErrorMsg(null);
+    const cleanSecret = authSecretInput.trim();
+    if (!cleanSecret) {
+      setAuthErrorMsg(t('app.auth.secretPlaceholder'));
+      return;
+    }
+    const isClaimFlow = Boolean(authStatus && !authStatus.authEnforced && !authStatus.hasClaimedCredential);
+    setAuthSubmitting(true);
+    try {
+      const endpoint = isClaimFlow ? '/api/auth/claim' : '/api/auth/login';
+      const bodyPayload = isClaimFlow
+        ? { actor: authActorInput.trim() || 'SYSTEM_OPERATOR', passphrase: cleanSecret }
+        : { token: cleanSecret, passphrase: cleanSecret };
+      const res = await apiFetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyPayload),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.token) {
+        setAuthErrorMsg(data.error || t('app.error.actionFailed'));
+        return;
+      }
+      setAuthSession({
+        token: String(data.token),
+        actor: typeof data.actor === 'string' ? data.actor : null,
+        role: typeof data.role === 'string' ? data.role : null,
+        expiresAtUtc: typeof data.expiresAtUtc === 'string' ? data.expiresAtUtc : null,
+      });
+      setAuthSecretInput('');
+      setAuthModalOpen(false);
+      await fetchAllState();
+    } catch {
+      setAuthErrorMsg(t('app.error.actionFailed'));
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleAuthLogout = async () => {
+    try {
+      await apiFetch('/api/auth/logout', { method: 'POST' });
+    } catch {
+      // ignore network failures on logout
+    }
+    clearAuthSession();
+    await refreshAuthStatus();
+  };
+
   const handleUpdateAutoConfig = async (
     partial: Partial<AutoExecutionConfig>,
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch('/api/auto-trade/config', {
+      const res = await apiFetch('/api/auto-trade/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(partial),
@@ -1371,7 +1513,7 @@ export default function App() {
 
   const handleRunAutoCycle = async (): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch('/api/auto-trade/cycle', { method: 'POST' });
+      const res = await apiFetch('/api/auto-trade/cycle', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         return { ok: false, error: data.error || t('auto.err.actionFailed') };
@@ -1389,7 +1531,7 @@ export default function App() {
     id: string,
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch(`/api/auto-trade/proposals/${encodeURIComponent(id)}/approve`, {
+      const res = await apiFetch(`/api/auto-trade/proposals/${encodeURIComponent(id)}/approve`, {
         method: 'POST',
       });
       const data = await res.json();
@@ -1409,7 +1551,7 @@ export default function App() {
     id: string,
   ): Promise<{ ok: boolean; error?: string }> => {
     try {
-      const res = await fetch(`/api/auto-trade/proposals/${encodeURIComponent(id)}/reject`, {
+      const res = await apiFetch(`/api/auto-trade/proposals/${encodeURIComponent(id)}/reject`, {
         method: 'POST',
       });
       const data = await res.json();
@@ -1591,6 +1733,53 @@ export default function App() {
                 >
                   EN · English
                 </button>
+              </div>
+            </div>
+
+            <div className="mt-3 border-t border-slate-800/80 pt-3">
+              <p className="text-[11px] text-slate-400">{t('app.sidebar.authLabel')}</p>
+              <p
+                className={`mt-0.5 font-mono text-[11px] ${
+                  authSession.token || authStatus?.authenticated
+                    ? 'text-emerald-400'
+                    : authStatus?.authEnforced
+                      ? 'text-amber-400'
+                      : 'text-slate-400'
+                }`}
+              >
+                {authSession.token || authStatus?.authenticated
+                  ? t('app.sidebar.authActive', {
+                      role: authSession.role ?? authStatus?.role ?? 'OPERATOR',
+                    })
+                  : authStatus?.authEnforced
+                    ? t('app.sidebar.authRequired')
+                    : t('app.sidebar.authPublicDev')}
+              </p>
+              <div className="mt-1.5 flex gap-1.5">
+                {authSession.token ? (
+                  <button
+                    type="button"
+                    onClick={handleAuthLogout}
+                    data-testid="auth-logout-btn"
+                    className="flex min-h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-[#070B12] px-2 text-[11px] font-medium text-slate-300 hover:border-slate-500"
+                  >
+                    <LogOut className="h-3 w-3" />
+                    <span>{t('app.sidebar.authBtnLogout')}</span>
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthErrorMsg(null);
+                      setAuthModalOpen(true);
+                    }}
+                    data-testid="auth-open-btn"
+                    className="flex min-h-[30px] flex-1 items-center justify-center gap-1.5 rounded-lg border border-cyan-500/30 bg-cyan-500/10 px-2 text-[11px] font-medium text-cyan-300 hover:bg-cyan-500/20"
+                  >
+                    <KeyRound className="h-3 w-3" />
+                    <span>{t('app.sidebar.authBtnLogin')}</span>
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -1925,7 +2114,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Emergency Stop Confirmation Dialog */}
+      {/* Emergency Stop Confirmation / Unlock Governance Dialog */}
       {emergencyConfirmOpen && (
         <div
           role="dialog"
@@ -1937,16 +2126,47 @@ export default function App() {
             <div className="flex items-center gap-2 text-rose-400">
               <OctagonAlert className="h-5 w-5" />
               <h2 id="em-stop-title" className="font-display text-base font-semibold">
-                {t('app.emergency.dialogTitle')}
+                {tradingMode === 'EMERGENCY_STOP'
+                  ? t('app.emergency.unlockTitle')
+                  : t('app.emergency.dialogTitle')}
               </h2>
             </div>
             <p className="mt-2 text-xs leading-relaxed text-slate-300">
-              {t('app.emergency.dialogDesc')}
+              {tradingMode === 'EMERGENCY_STOP'
+                ? t('app.emergency.unlockDesc')
+                : t('app.emergency.dialogDesc')}
             </p>
+            {tradingMode === 'EMERGENCY_STOP' && (
+              <div className="mt-3 space-y-1.5">
+                <label
+                  htmlFor="em-unlock-reason"
+                  className="block text-[11px] font-medium text-slate-300"
+                >
+                  {t('app.emergency.unlockReasonLabel')}
+                </label>
+                <input
+                  id="em-unlock-reason"
+                  type="text"
+                  value={unlockReasonInput}
+                  onChange={(e) => {
+                    setUnlockReasonInput(e.target.value);
+                    if (unlockErrorMsg) setUnlockErrorMsg(null);
+                  }}
+                  placeholder={t('app.emergency.unlockReasonPlaceholder')}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#070B12] px-3 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none"
+                />
+                {unlockErrorMsg && (
+                  <p className="text-[11px] text-rose-400">{unlockErrorMsg}</p>
+                )}
+              </div>
+            )}
             <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:justify-end">
               <button
                 type="button"
-                onClick={() => setEmergencyConfirmOpen(false)}
+                onClick={() => {
+                  setEmergencyConfirmOpen(false);
+                  setUnlockErrorMsg(null);
+                }}
                 className="min-h-[44px] rounded-lg border border-slate-700 px-4 text-xs font-medium text-slate-300 hover:bg-slate-800"
               >
                 {t('app.emergency.cancelBtn')}
@@ -1955,12 +2175,19 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => {
-                    handleChangeMode('PAPER');
-                    setEmergencyConfirmOpen(false);
+                    const clean = unlockReasonInput.trim();
+                    if (clean.length < 3) {
+                      setUnlockErrorMsg(t('app.emergency.unlockReasonMinErr'));
+                      return;
+                    }
+                    void handleChangeMode(pendingUnlockMode, {
+                      confirmEmergencyReset: true,
+                      unlockReason: clean,
+                    });
                   }}
                   className="min-h-[44px] rounded-lg bg-cyan-600 px-4 text-xs font-semibold text-white hover:bg-cyan-500"
                 >
-                  {t('app.emergency.restorePaperBtn')}
+                  {t('app.emergency.restoreTargetBtn', { mode: pendingUnlockMode })}
                 </button>
               ) : (
                 <button
@@ -1975,6 +2202,100 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {/* Operator In-Memory Authentication Modal */}
+      {authModalOpen && (
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="auth-modal-title"
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4"
+        >
+          <form
+            onSubmit={handleAuthSubmit}
+            className="w-full max-w-md rounded-2xl border border-cyan-500/35 bg-[#0E1522] p-5 shadow-2xl"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <div className="flex items-center gap-2 text-cyan-300">
+                <KeyRound className="h-5 w-5" />
+                <h2 id="auth-modal-title" className="font-display text-base font-semibold text-slate-100">
+                  {t('app.auth.modalTitle')}
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => setAuthModalOpen(false)}
+                className="flex h-8 w-8 items-center justify-center rounded-lg text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <p className="mt-2 text-xs leading-relaxed text-slate-300">
+              {authStatus && !authStatus.authEnforced && !authStatus.hasClaimedCredential
+                ? t('app.auth.claimDesc')
+                : t('app.auth.loginDesc')}
+            </p>
+            <p className="mt-1.5 text-[11px] text-slate-400">
+              {t('app.auth.modalDesc')}
+            </p>
+
+            {authStatus && !authStatus.authEnforced && !authStatus.hasClaimedCredential && (
+              <div className="mt-3 space-y-1">
+                <label htmlFor="auth-actor-input" className="block text-[11px] font-medium text-slate-300">
+                  {t('app.auth.actorLabel')}
+                </label>
+                <input
+                  id="auth-actor-input"
+                  type="text"
+                  value={authActorInput}
+                  onChange={(e) => setAuthActorInput(e.target.value)}
+                  className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#070B12] px-3 text-xs text-slate-100 focus:border-cyan-500 focus:outline-none"
+                />
+              </div>
+            )}
+
+            <div className="mt-3 space-y-1">
+              <label htmlFor="auth-secret-input" className="block text-[11px] font-medium text-slate-300">
+                {t('app.auth.secretLabel')}
+              </label>
+              <input
+                id="auth-secret-input"
+                type="password"
+                value={authSecretInput}
+                onChange={(e) => setAuthSecretInput(e.target.value)}
+                placeholder={t('app.auth.secretPlaceholder')}
+                className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#070B12] px-3 text-xs text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none"
+              />
+            </div>
+
+            {authErrorMsg && (
+              <p className="mt-2 text-xs text-rose-400">{authErrorMsg}</p>
+            )}
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setAuthModalOpen(false)}
+                className="min-h-[40px] rounded-lg border border-slate-700 px-4 text-xs font-medium text-slate-300 hover:bg-slate-800"
+              >
+                {t('app.auth.cancel')}
+              </button>
+              <button
+                type="submit"
+                disabled={authSubmitting}
+                className="min-h-[40px] rounded-lg bg-cyan-600 px-4 text-xs font-semibold text-white hover:bg-cyan-500 disabled:opacity-60"
+              >
+                {authSubmitting
+                  ? t('app.auth.submitting')
+                  : authStatus && !authStatus.authEnforced && !authStatus.hasClaimedCredential
+                    ? t('app.auth.claimSubmit')
+                    : t('app.auth.loginSubmit')}
+              </button>
+            </div>
+          </form>
+        </div>
+      )}
+
       {/* Global Command-K Coin Search Modal */}
       <CoinSearchModal
         open={searchModalOpen}

@@ -21,6 +21,21 @@ import type {
   OrderBookSnapshot,
 } from '../src/engine/types.ts';
 
+const ALLOWED_CANDLE_INTERVALS = new Set(['1m', '5m', '15m', '30m', '1h', '4h', '1d']);
+const VALID_SYMBOL_PATTERN = /^[A-Z0-9]{1,12}(?:[/-][A-Z0-9]{1,10})?$/;
+
+export function isValidMarketInterval(interval: string): boolean {
+  return ALLOWED_CANDLE_INTERVALS.has(interval.trim().toLowerCase());
+}
+
+export function sanitizeMarketSymbolInput(raw: string): string | null {
+  const cleaned = raw.trim().toUpperCase();
+  if (!cleaned || cleaned.length > 24) return null;
+  if (/[?#&%\\\s]|(\.\.)/.test(cleaned)) return null;
+  if (!VALID_SYMBOL_PATTERN.test(cleaned)) return null;
+  return normalizeSymbolInput(cleaned);
+}
+
 interface UniversePairConfig {
   symbol: string;
   base: string;
@@ -2087,7 +2102,8 @@ export class MarketFeedManager {
     marketType?: MarketType,
     exchange?: string,
   ): Promise<MarketTicker | null> {
-    const symbol = normalizeSymbolInput(rawSymbol);
+    const symbol = sanitizeMarketSymbolInput(rawSymbol);
+    if (!symbol) return null;
     const existing = this.getTicker(symbol, marketType, exchange);
     if (existing && existing.lastPrice > 0 && (!exchange || existing.exchange.toUpperCase() === exchange.trim().toUpperCase())) {
       if (existing.rsi14 === null) {
@@ -2273,15 +2289,27 @@ export class MarketFeedManager {
     interval = '1h',
     exchange?: string,
   ): Promise<{ candles: Candle[]; status: DataSourceStatus; source: string }> {
-    const cfg = this.findUniverseConfig(symbol, marketType, exchange);
+    const cleanSymbol = sanitizeMarketSymbolInput(symbol);
+    const normalizedInterval = interval.trim();
+    const safeInterval =
+      normalizedInterval === '1D' ? '1d' : normalizedInterval.toLowerCase();
+    if (!cleanSymbol || !ALLOWED_CANDLE_INTERVALS.has(safeInterval)) {
+      return {
+        candles: [],
+        status: 'UNAVAILABLE',
+        source: 'Invalid symbol or interval parameter',
+      };
+    }
+
+    const cfg = this.findUniverseConfig(cleanSymbol, marketType, exchange);
     const resolvedExchange = (cfg?.exchange ?? exchange ?? '').toUpperCase();
-    const key = `${symbol.toUpperCase()}|${marketType}|${resolvedExchange}|${interval}`;
-    const liveTicker = this.getTicker(symbol, marketType, cfg?.exchange ?? exchange);
+    const key = `${cleanSymbol.toUpperCase()}|${marketType}|${resolvedExchange}|${safeInterval}`;
+    const liveTicker = this.getTicker(cleanSymbol, marketType, cfg?.exchange ?? exchange);
     const cached = this.candleCache.get(key);
     if (cached && cached.candles.length > 0 && Date.now() - cached.fetchedAt < 30_000) {
       const stitched =
         liveTicker && liveTicker.dataStatus === 'LIVE_EXCHANGE' && liveTicker.lastPrice > 0
-          ? mergeLiveTickIntoCandles(cached.candles, liveTicker.lastPrice, liveTicker.timestampUtc, interval)
+          ? mergeLiveTickIntoCandles(cached.candles, liveTicker.lastPrice, liveTicker.timestampUtc, safeInterval)
           : cached.candles;
       return { candles: stitched, status: cached.status, source: cached.source };
     }
@@ -2296,7 +2324,7 @@ export class MarketFeedManager {
             ? 'https://fapi.binance.com/fapi/v1/klines'
             : 'https://api.binance.com/api/v3/klines';
         const res = await fetchJsonWithTimeout<Array<[number, string, string, string, string, string]>>(
-          `${baseUrl}?symbol=${encodeURIComponent(cfg.nativeSymbol)}&interval=${encodeURIComponent(interval)}&limit=160`,
+          `${baseUrl}?symbol=${encodeURIComponent(cfg.nativeSymbol)}&interval=${encodeURIComponent(safeInterval)}&limit=160`,
           3500,
         );
         if (res.ok && Array.isArray(res.data)) {
@@ -2313,7 +2341,19 @@ export class MarketFeedManager {
         }
       } else if (cfg.exchangeId === 'bybit') {
         const bybitIv =
-          interval === '15m' ? '15' : interval === '4h' ? '240' : interval === '1d' ? 'D' : '60';
+          safeInterval === '1m'
+            ? '1'
+            : safeInterval === '5m'
+              ? '5'
+              : safeInterval === '15m'
+                ? '15'
+                : safeInterval === '30m'
+                  ? '30'
+                  : safeInterval === '4h'
+                    ? '240'
+                    : safeInterval === '1d'
+                      ? 'D'
+                      : '60';
         const res = await fetchJsonWithTimeout<{
           retCode: number;
           result?: { list?: Array<[string, string, string, string, string, string]> };
@@ -2336,7 +2376,19 @@ export class MarketFeedManager {
         }
       } else if (cfg.exchangeId === 'okx') {
         const okxBar =
-          interval === '15m' ? '15m' : interval === '4h' ? '4H' : interval === '1d' ? '1D' : '1H';
+          safeInterval === '1m'
+            ? '1m'
+            : safeInterval === '5m'
+              ? '5m'
+              : safeInterval === '15m'
+                ? '15m'
+                : safeInterval === '30m'
+                  ? '30m'
+                  : safeInterval === '4h'
+                    ? '4H'
+                    : safeInterval === '1d'
+                      ? '1D'
+                      : '1H';
         const res = await fetchJsonWithTimeout<{
           code: string;
           data?: Array<[string, string, string, string, string, string]>;
@@ -2359,7 +2411,19 @@ export class MarketFeedManager {
         }
       } else if (cfg.exchangeId === 'kraken') {
         const krIv =
-          interval === '15m' ? 15 : interval === '4h' ? 240 : interval === '1d' ? 1440 : 60;
+          safeInterval === '1m'
+            ? 1
+            : safeInterval === '5m'
+              ? 5
+              : safeInterval === '15m'
+                ? 15
+                : safeInterval === '30m'
+                  ? 30
+                  : safeInterval === '4h'
+                    ? 240
+                    : safeInterval === '1d'
+                      ? 1440
+                      : 60;
         const res = await fetchJsonWithTimeout<{
           error: string[];
           result?: Record<string, Array<[number, string, string, string, string, string, string]>>;
@@ -2381,7 +2445,19 @@ export class MarketFeedManager {
         }
       } else if (cfg.exchangeId === 'coinbase') {
         const gran =
-          interval === '15m' ? 900 : interval === '4h' ? 14400 : interval === '1d' ? 86400 : 3600;
+          safeInterval === '1m'
+            ? 60
+            : safeInterval === '5m'
+              ? 300
+              : safeInterval === '15m'
+                ? 900
+                : safeInterval === '30m'
+                  ? 1800
+                  : safeInterval === '4h'
+                    ? 14400
+                    : safeInterval === '1d'
+                      ? 86400
+                      : 3600;
         const res = await fetchJsonWithTimeout<Array<[number, number, number, number, number, number]>>(
           `https://api.exchange.coinbase.com/products/${encodeURIComponent(cfg.nativeSymbol)}/candles?granularity=${gran}`,
           3500,
@@ -2406,13 +2482,25 @@ export class MarketFeedManager {
     // Authentic Cross-Venue Fallback: if the primary exchange endpoint timed out or is regionally blocked (e.g. HTTP 451),
     // try live OKX / Bybit / Coinbase klines for the exact same normalized asset before reporting unavailable.
     if (candles.length < 20) {
-      const [rawBase, rawQuote = 'USDT'] = symbol.toUpperCase().split('/');
+      const [rawBase, rawQuote = 'USDT'] = cleanSymbol.toUpperCase().split('/');
       const base = rawBase.trim();
       const quote = rawQuote.trim() || 'USDT';
 
       if (candles.length < 20 && cfg?.exchangeId !== 'okx') {
         const okxBar =
-          interval === '15m' ? '15m' : interval === '4h' ? '4H' : interval === '1d' ? '1D' : '1H';
+          safeInterval === '1m'
+            ? '1m'
+            : safeInterval === '5m'
+              ? '5m'
+              : safeInterval === '15m'
+                ? '15m'
+                : safeInterval === '30m'
+                  ? '30m'
+                  : safeInterval === '4h'
+                    ? '4H'
+                    : safeInterval === '1d'
+                      ? '1D'
+                      : '1H';
         const okxInstId =
           marketType === 'PERPETUAL' ? `${base}-${quote}-SWAP` : `${base}-${quote}`;
         const res = await fetchJsonWithTimeout<{
@@ -2439,7 +2527,19 @@ export class MarketFeedManager {
 
       if (candles.length < 20 && cfg?.exchangeId !== 'bybit') {
         const bybitIv =
-          interval === '15m' ? '15' : interval === '4h' ? '240' : interval === '1d' ? 'D' : '60';
+          safeInterval === '1m'
+            ? '1'
+            : safeInterval === '5m'
+              ? '5'
+              : safeInterval === '15m'
+                ? '15'
+                : safeInterval === '30m'
+                  ? '30'
+                  : safeInterval === '4h'
+                    ? '240'
+                    : safeInterval === '1d'
+                      ? 'D'
+                      : '60';
         const bybitCategory = marketType === 'PERPETUAL' ? 'linear' : 'spot';
         const res = await fetchJsonWithTimeout<{
           retCode: number;
@@ -2470,7 +2570,19 @@ export class MarketFeedManager {
 
       if (candles.length < 20 && cfg?.exchangeId !== 'coinbase') {
         const gran =
-          interval === '15m' ? 900 : interval === '4h' ? 14400 : interval === '1d' ? 86400 : 3600;
+          safeInterval === '1m'
+            ? 60
+            : safeInterval === '5m'
+              ? 300
+              : safeInterval === '15m'
+                ? 900
+                : safeInterval === '30m'
+                  ? 1800
+                  : safeInterval === '4h'
+                    ? 14400
+                    : safeInterval === '1d'
+                      ? 86400
+                      : 3600;
         const cbProduct = `${base}-${quote === 'USDT' ? 'USD' : quote}`;
         const res = await fetchJsonWithTimeout<Array<[number, number, number, number, number, number]>>(
           `https://api.exchange.coinbase.com/products/${encodeURIComponent(cbProduct)}/candles?granularity=${gran}`,
@@ -2516,7 +2628,7 @@ export class MarketFeedManager {
     if (cleanCandles.length >= 20) {
       const stitchedCandles =
         liveTicker && liveTicker.dataStatus === 'LIVE_EXCHANGE' && liveTicker.lastPrice > 0
-          ? mergeLiveTickIntoCandles(cleanCandles, liveTicker.lastPrice, liveTicker.timestampUtc, interval)
+          ? mergeLiveTickIntoCandles(cleanCandles, liveTicker.lastPrice, liveTicker.timestampUtc, safeInterval)
           : cleanCandles;
       this.candleCache.set(key, {
         candles: stitchedCandles,
@@ -2526,7 +2638,7 @@ export class MarketFeedManager {
       });
 
       // Keep ticker RSI(14) & Market Regime synchronized with live 1h OHLCV
-      if (interval === '1h' && cfg) {
+      if (safeInterval === '1h' && cfg) {
         const tk = this.getTicker(cfg.symbol, cfg.marketType, cfg.exchange);
         if (tk && tk.lastPrice > 0) {
           const ind = computeAllIndicators(stitchedCandles);
@@ -2558,10 +2670,23 @@ export class MarketFeedManager {
     marketType: MarketType = 'PERPETUAL',
     exchange?: string,
   ): Promise<OrderBookSnapshot> {
-    const cfg = this.findUniverseConfig(symbol, marketType, exchange);
-    const ticker = this.getTicker(symbol, marketType, cfg?.exchange ?? exchange);
+    const cleanSymbol = sanitizeMarketSymbolInput(symbol);
+    if (!cleanSymbol) {
+      return {
+        symbol: 'INVALID',
+        exchange: exchange ?? 'Exchange',
+        timestampUtc: Date.now(),
+        bids: [],
+        asks: [],
+        spreadBps: 0,
+        imbalanceRatio: 0,
+        dataStatus: 'UNAVAILABLE',
+      };
+    }
+    const cfg = this.findUniverseConfig(cleanSymbol, marketType, exchange);
+    const ticker = this.getTicker(cleanSymbol, marketType, cfg?.exchange ?? exchange);
     const resolvedExchange = (cfg?.exchange ?? ticker?.exchange ?? exchange ?? '').toUpperCase();
-    const cacheKey = `${symbol.toUpperCase()}|${marketType}|${resolvedExchange}`;
+    const cacheKey = `${cleanSymbol.toUpperCase()}|${marketType}|${resolvedExchange}`;
     const cached = this.orderBookCache.get(cacheKey);
     if (cached && Date.now() - cached.fetchedAt < 2000) {
       return cached.book;

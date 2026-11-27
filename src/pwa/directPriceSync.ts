@@ -255,10 +255,22 @@ export function repricePortfolioAndPositions(
     ) {
       return { portfolio, positions: [...positions] };
     }
+    const dailyBase =
+      portfolio.dailyBaselineEquityUsd && portfolio.dailyBaselineEquityUsd > 0
+        ? portfolio.dailyBaselineEquityUsd
+        : portfolio.initialEquityUsd;
+    const weeklyBase =
+      portfolio.weeklyBaselineEquityUsd && portfolio.weeklyBaselineEquityUsd > 0
+        ? portfolio.weeklyBaselineEquityUsd
+        : portfolio.initialEquityUsd;
     const dailyPnlPct =
-      portfolio.initialEquityUsd > 0
-        ? Number((((exactEquity - portfolio.initialEquityUsd) / portfolio.initialEquityUsd) * 100).toFixed(2))
+      dailyBase > 0
+        ? Number((((exactEquity - dailyBase) / dailyBase) * 100).toFixed(2))
         : portfolio.dailyPnlPct;
+    const weeklyPnlPct =
+      weeklyBase > 0
+        ? Number((((exactEquity - weeklyBase) / weeklyBase) * 100).toFixed(2))
+        : portfolio.weeklyPnlPct;
     const peakEquityUsd = Math.max(portfolio.peakEquityUsd, exactEquity);
     const currentDrawdownPct =
       peakEquityUsd > 0
@@ -273,7 +285,7 @@ export function repricePortfolioAndPositions(
         totalEquityUsd: exactEquity,
         availableBalanceUsd: exactAvail,
         dailyPnlPct,
-        weeklyPnlPct: dailyPnlPct,
+        weeklyPnlPct,
         peakEquityUsd,
         currentDrawdownPct,
       },
@@ -334,12 +346,22 @@ export function repricePortfolioAndPositions(
     (portfolio.initialEquityUsd + portfolio.realizedPnlUsd + roundedUnrealized).toFixed(2),
   );
   const availableBalanceUsd = Number(Math.max(0, totalEquityUsd - roundedUsedMargin).toFixed(2));
+  const dailyBase =
+    portfolio.dailyBaselineEquityUsd && portfolio.dailyBaselineEquityUsd > 0
+      ? portfolio.dailyBaselineEquityUsd
+      : portfolio.initialEquityUsd;
+  const weeklyBase =
+    portfolio.weeklyBaselineEquityUsd && portfolio.weeklyBaselineEquityUsd > 0
+      ? portfolio.weeklyBaselineEquityUsd
+      : portfolio.initialEquityUsd;
   const dailyPnlPct =
-    portfolio.initialEquityUsd > 0
-      ? Number(
-          (((totalEquityUsd - portfolio.initialEquityUsd) / portfolio.initialEquityUsd) * 100).toFixed(2),
-        )
+    dailyBase > 0
+      ? Number((((totalEquityUsd - dailyBase) / dailyBase) * 100).toFixed(2))
       : portfolio.dailyPnlPct;
+  const weeklyPnlPct =
+    weeklyBase > 0
+      ? Number((((totalEquityUsd - weeklyBase) / weeklyBase) * 100).toFixed(2))
+      : portfolio.weeklyPnlPct;
   const peakEquityUsd = Math.max(portfolio.peakEquityUsd, totalEquityUsd);
   const currentDrawdownPct =
     peakEquityUsd > 0
@@ -352,7 +374,7 @@ export function repricePortfolioAndPositions(
     portfolio.totalEquityUsd !== totalEquityUsd ||
     portfolio.availableBalanceUsd !== availableBalanceUsd ||
     portfolio.dailyPnlPct !== dailyPnlPct ||
-    portfolio.weeklyPnlPct !== dailyPnlPct ||
+    portfolio.weeklyPnlPct !== weeklyPnlPct ||
     portfolio.peakEquityUsd !== peakEquityUsd ||
     portfolio.currentDrawdownPct !== currentDrawdownPct;
 
@@ -370,7 +392,7 @@ export function repricePortfolioAndPositions(
           totalEquityUsd,
           availableBalanceUsd,
           dailyPnlPct,
-          weeklyPnlPct: dailyPnlPct,
+          weeklyPnlPct,
           peakEquityUsd,
           currentDrawdownPct,
         }

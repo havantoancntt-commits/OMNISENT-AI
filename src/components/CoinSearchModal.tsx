@@ -16,6 +16,7 @@ import {
 } from '../engine/symbolSearch';
 import type { MarketType } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
+import { apiFetch } from '../lib/apiClient';
 
 export interface CoinSearchModalProps {
   open: boolean;
@@ -87,7 +88,7 @@ export const CoinSearchModal: React.FC<CoinSearchModalProps> = ({
           sort: effectiveSort,
           limit: '32',
         });
-        const res = await fetch(`/api/market/search?${params.toString()}`);
+        const res = await apiFetch(`/api/market/search?${params.toString()}`);
         if (!res.ok) throw new Error('Search request failed');
         const data = await res.json();
         if (!cancelled) {

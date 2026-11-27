@@ -260,8 +260,8 @@ export function evaluateLivePositionLifecycle(params: {
     const realizedGrossUsd = isLong
       ? (closePrice - pos.entryPrice) * pos.quantity
       : (pos.entryPrice - closePrice) * pos.quantity;
-    const closeFeeUsd = pos.quantity * closePrice * feeRate;
-    const realizedNetUsd = realizedGrossUsd - closeFeeUsd;
+    const closeFeeUsd = Number((pos.quantity * closePrice * feeRate).toFixed(2));
+    const realizedNetUsd = Number((realizedGrossUsd - closeFeeUsd).toFixed(2));
     const closeReason = hitTP
       ? 'TAKE_PROFIT'
       : realizedNetUsd >= 0

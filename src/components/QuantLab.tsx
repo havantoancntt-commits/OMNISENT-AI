@@ -18,6 +18,7 @@ import type {
   StrategyBenchmarkResult,
 } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
+import { apiFetch } from '../lib/apiClient';
 import { EquityChart } from './EquityChart';
 
 interface QuantLabProps {
@@ -183,7 +184,7 @@ export const QuantLab: React.FC<QuantLabProps> = ({
     setError(null);
     try {
       const { payload, resolvedExchange } = buildPayload();
-      const res = await fetch('/api/backtest', {
+      const res = await apiFetch('/api/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -207,7 +208,7 @@ export const QuantLab: React.FC<QuantLabProps> = ({
     setError(null);
     try {
       const { payload, resolvedExchange } = buildPayload();
-      const res = await fetch('/api/backtest/benchmark', {
+      const res = await apiFetch('/api/backtest/benchmark', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -237,7 +238,7 @@ export const QuantLab: React.FC<QuantLabProps> = ({
     setError(null);
     try {
       const { payload, resolvedExchange } = buildPayload();
-      const res = await fetch('/api/backtest/optimize', {
+      const res = await apiFetch('/api/backtest/optimize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

@@ -1,3 +1,9 @@
+import {
+  buildLiquidationEstimate,
+  computeUnifiedOrderCosts,
+  DEFAULT_FEE_MODEL,
+  roundDecimal,
+} from './precision.ts';
 import type {
   OrderRequest,
   RiskCheckResult,
@@ -20,8 +26,8 @@ export const DEFAULT_RISK_CONFIG: RiskConfig = {
   maxSingleAssetExposurePct: 35,
 };
 
-const TAKER_FEE_RATE = 0.0005; // 5 bps
-const ESTIMATED_SLIPPAGE_RATE = 0.0003; // 3 bps
+const TAKER_FEE_RATE = DEFAULT_FEE_MODEL.takerFeeBps / 10_000;
+const ESTIMATED_SLIPPAGE_RATE = DEFAULT_FEE_MODEL.slippageBps / 10_000;
 
 export function calculatePositionSize(params: {
   accountEquityUsd: number;
@@ -48,6 +54,11 @@ export function calculatePositionSize(params: {
   } = params;
 
   if (
+    !Number.isFinite(accountEquityUsd) ||
+    !Number.isFinite(riskPct) ||
+    !Number.isFinite(entryPrice) ||
+    !Number.isFinite(stopLossPrice) ||
+    !Number.isFinite(leverage) ||
     accountEquityUsd <= 0 ||
     riskPct <= 0 ||
     entryPrice <= 0 ||
@@ -63,26 +74,25 @@ export function calculatePositionSize(params: {
   }
 
   const riskBudgetUsd = accountEquityUsd * (riskPct / 100);
-  // Account for round-trip fees and slippage inside the stop distance
   const effectiveStopPerUnit =
     stopDistance + entryPrice * (feeRate * 2 + slippageRate);
   let quantity = riskBudgetUsd / effectiveStopPerUnit;
 
-  // Cap notional by available equity * leverage * 0.95 safety buffer
   const maxNotionalUsd = accountEquityUsd * leverage * 0.95;
   if (quantity * entryPrice > maxNotionalUsd) {
     quantity = maxNotionalUsd / entryPrice;
   }
 
-  const notionalUsd = quantity * entryPrice;
-  const requiredMarginUsd = notionalUsd / leverage;
-  const estimatedRiskUsd = quantity * effectiveStopPerUnit;
+  const roundedQty = roundDecimal(quantity, 6);
+  const notionalUsd = roundDecimal(roundedQty * entryPrice, 2);
+  const requiredMarginUsd = roundDecimal(notionalUsd / leverage, 2);
+  const estimatedRiskUsd = roundDecimal(roundedQty * effectiveStopPerUnit, 2);
 
   return {
-    quantity: Number(quantity.toFixed(6)),
-    notionalUsd: Number(notionalUsd.toFixed(2)),
-    requiredMarginUsd: Number(requiredMarginUsd.toFixed(2)),
-    estimatedRiskUsd: Number(estimatedRiskUsd.toFixed(2)),
+    quantity: roundedQty,
+    notionalUsd,
+    requiredMarginUsd,
+    estimatedRiskUsd,
   };
 }
 
@@ -92,13 +102,7 @@ export function estimateLiquidationPrice(
   leverage: number,
   marketType: string,
 ): number | null {
-  if (marketType === 'SPOT' || leverage <= 1) return null;
-  const maintenanceMarginRate = 0.005;
-  const dec = entryPrice < 0.0001 ? 10 : entryPrice < 0.01 ? 8 : 6;
-  if (side === 'LONG') {
-    return Number((entryPrice * (1 - 1 / leverage + maintenanceMarginRate)).toFixed(dec));
-  }
-  return Number((entryPrice * (1 + 1 / leverage - maintenanceMarginRate)).toFixed(dec));
+  return buildLiquidationEstimate({ side, entryPrice, leverage, marketType }).price;
 }
 
 /**
@@ -125,16 +129,25 @@ export function evaluateOrderRisk(
   if (order.dataStatus !== 'LIVE_EXCHANGE') {
     reasons.push(`Dữ liệu thị trường không phải LIVE_EXCHANGE (${order.dataStatus}) — chặn đặt lệnh.`);
   }
-  if (
-    typeof order.tickerTimestampUtc === 'number' &&
-    Number.isFinite(order.tickerTimestampUtc)
-  ) {
-    const evalNow = typeof order.nowMs === 'number' && Number.isFinite(order.nowMs) ? order.nowMs : Date.now();
-    const ageMs = evalNow - order.tickerTimestampUtc;
-    if (ageMs > 30_000) {
+  const hasTimestampField = order.tickerTimestampUtc !== undefined;
+  if (hasTimestampField || order.requireFreshTimestamp) {
+    if (
+      typeof order.tickerTimestampUtc !== 'number' ||
+      !Number.isFinite(order.tickerTimestampUtc) ||
+      order.tickerTimestampUtc <= 0
+    ) {
       reasons.push(
-        `Dữ liệu giá thị trường đã cũ (${Math.round(ageMs / 1000)}s > 30s) — chặn đặt lệnh để tránh trượt giá.`,
+        'Thiếu hoặc sai định dạng dấu thời gian quote (tickerTimestampUtc <= 0) — chặn đặt lệnh fail-closed.',
       );
+    } else {
+      const evalNow =
+        typeof order.nowMs === 'number' && Number.isFinite(order.nowMs) ? order.nowMs : Date.now();
+      const ageMs = evalNow - order.tickerTimestampUtc;
+      if (ageMs > 30_000) {
+        reasons.push(
+          `Dữ liệu giá thị trường đã cũ (${Math.round(ageMs / 1000)}s > 30s) — chặn đặt lệnh để tránh trượt giá.`,
+        );
+      }
     }
   }
   if (order.tradingStatus && order.tradingStatus !== 'TRADING') {
@@ -235,7 +248,7 @@ export function evaluateOrderRisk(
 
   const riskDist = Math.abs(order.entryPrice - order.stopLoss);
   const rewardDist = Math.abs(order.takeProfit - order.entryPrice);
-  const riskRewardRatio = riskDist > 0 ? Number((rewardDist / riskDist).toFixed(2)) : 0;
+  const riskRewardRatio = riskDist > 0 ? roundDecimal(rewardDist / riskDist, 2) : 0;
 
   if (riskRewardRatio < config.minRiskReward) {
     reasons.push(
@@ -266,7 +279,7 @@ export function evaluateOrderRisk(
       finalQty = sized.quantity;
       reduced = true;
     } else {
-      finalQty = order.quantity;
+      finalQty = roundDecimal(order.quantity, 6);
     }
   }
 
@@ -285,7 +298,7 @@ export function evaluateOrderRisk(
     finalQty * order.entryPrice > remainingExposureUsd + 0.01
   ) {
     if (order.quantity === undefined && remainingExposureUsd >= 10) {
-      finalQty = Number((remainingExposureUsd / order.entryPrice).toFixed(6));
+      finalQty = roundDecimal(remainingExposureUsd / order.entryPrice, 6);
       reduced = true;
       warnings.push(
         `Đã giới hạn khối lượng ${order.symbol} về ${finalQty} để không vượt trần phơi nhiễm ${config.maxSingleAssetExposurePct}% Equity.`,
@@ -298,16 +311,22 @@ export function evaluateOrderRisk(
     }
   }
 
-  const notionalValueUsd = Number((finalQty * order.entryPrice).toFixed(2));
-  const requiredMarginUsd = Number((notionalValueUsd / Math.max(1, effectiveLeverage)).toFixed(2));
-  const estimatedFeesUsd = Number((notionalValueUsd * TAKER_FEE_RATE * 2).toFixed(2));
-  const estimatedSlippageUsd = Number((notionalValueUsd * ESTIMATED_SLIPPAGE_RATE).toFixed(2));
-  const estimatedRiskUsd = Number(
-    (finalQty * riskDist + estimatedFeesUsd + estimatedSlippageUsd).toFixed(2),
+  const costs = computeUnifiedOrderCosts({
+    quantity: finalQty,
+    price: order.entryPrice,
+    orderType: order.orderType,
+  });
+  const notionalValueUsd = costs.grossNotionalUsd;
+  const requiredMarginUsd = roundDecimal(notionalValueUsd / Math.max(1, effectiveLeverage), 2);
+  const estimatedFeesUsd = costs.roundTripFeeUsd;
+  const estimatedSlippageUsd = costs.slippageEstUsd;
+  const estimatedRiskUsd = roundDecimal(
+    finalQty * riskDist + estimatedFeesUsd + estimatedSlippageUsd,
+    2,
   );
   const estimatedRiskPct =
     ctx.accountEquityUsd > 0
-      ? Number(((estimatedRiskUsd / ctx.accountEquityUsd) * 100).toFixed(3))
+      ? roundDecimal((estimatedRiskUsd / ctx.accountEquityUsd) * 100, 3)
       : 100;
 
   if (estimatedRiskPct > config.maxRiskPerTradePct + 0.05) {
@@ -324,14 +343,14 @@ export function evaluateOrderRisk(
     reasons.push('Giá trị lệnh tối thiểu phải >= $10 USDT.');
   }
 
-  const liquidationPriceEst = estimateLiquidationPrice(
-    order.side,
-    order.entryPrice,
-    effectiveLeverage,
-    order.marketType,
-  );
+  const liqDetail = buildLiquidationEstimate({
+    side: order.side,
+    entryPrice: order.entryPrice,
+    leverage: effectiveLeverage,
+    marketType: order.marketType,
+  });
+  const liquidationPriceEst = liqDetail.price;
 
-  // Check if liquidation price is dangerously close to stop loss
   if (liquidationPriceEst !== null) {
     if (order.side === 'LONG' && liquidationPriceEst >= order.stopLoss) {
       reasons.push(
@@ -368,6 +387,9 @@ export function evaluateOrderRisk(
     estimatedFeesUsd,
     estimatedSlippageUsd,
     liquidationPriceEst,
+    liquidationIsEstimate: true,
+    liquidationMethod: liqDetail.maintenanceMarginMethod,
+    liquidationDisclaimer: liqDetail.disclaimer,
     checkedAtUtc: nowIso,
   };
 }

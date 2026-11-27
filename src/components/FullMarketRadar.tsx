@@ -23,6 +23,7 @@ import type {
   ScannerStrategyFocus,
 } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
+import { apiFetch } from '../lib/apiClient';
 
 function formatArchetypeLabel(
   a: ScannerSetupArchetype,
@@ -90,7 +91,7 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
     else setLoadingFast(true);
 
     try {
-      const res = await fetch('/api/market/scan', {
+      const res = await apiFetch('/api/market/scan', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -133,7 +134,7 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
           assetUniverse,
           limit: '20',
         });
-        const res = await fetch(`/api/market/scan?${params.toString()}`);
+        const res = await apiFetch(`/api/market/scan?${params.toString()}`);
         if (!res.ok) return;
         const data = (await res.json()) as FullMarketScanResponse;
         if (!cancelled) {

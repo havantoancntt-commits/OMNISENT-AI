@@ -20,6 +20,7 @@ import {
   classifyFeedFreshness,
   computeCrossVenueBasisBps,
   computeFeedHealthMetrics,
+  mapTierToStandardFeedHealth,
   mergeLiveTickIntoCandles,
   validateLiveQuoteTick,
 } from './priceFeedGuard.ts';
@@ -3931,6 +3932,179 @@ test('PWA telemetry snapshot preserves selectedPair & secret-free autoExecutionS
   assert.ok(Number.isFinite(hurst.hurstExponent) && hurst.hurstExponent >= 0.15 && hurst.hurstExponent <= 0.92);
   assert.ok(Number.isFinite(hurst.efficiencyRatio) && hurst.efficiencyRatio > 0.8);
 });
+
+test('Precision & Contract Filter helpers quantize prices/lots and unify fee + isolated liquidation estimate', async () => {
+  const {
+    buildLiquidationEstimate,
+    computeSingleLegCloseFee,
+    computeUnifiedOrderCosts,
+    inferContractFilter,
+    roundToStep,
+    roundToTick,
+    validateContractFilters,
+  } = await import('./precision.ts');
+
+  assert.equal(roundToTick(60123.4567, 0.1), 60123.5);
+  assert.equal(roundToStep(0.12349, 0.001), 0.123);
+
+  const filter = inferContractFilter(60_000, 'PERPETUAL');
+  const okCheck = validateContractFilters({ price: 60_000.123, quantity: 0.05129, filter });
+  assert.equal(okCheck.valid, true);
+  assert.equal(okCheck.normalizedPrice, 60_000.12);
+
+  const belowNotional = validateContractFilters({ price: 100, quantity: 0.05, filter: { ...filter, minQty: 0.01, stepSize: 0.01, tickSize: 0.01 } });
+  assert.equal(belowNotional.valid, false);
+
+  const costs = computeUnifiedOrderCosts({ quantity: 1, price: 10_000, orderType: 'MARKET' });
+  assert.equal(costs.entryFeeUsd, 5);
+  assert.equal(costs.exitFeeEstUsd, 5);
+  assert.equal(costs.roundTripFeeUsd, 10);
+  assert.equal(costs.slippageEstUsd, 3);
+  assert.equal(costs.totalFrictionUsd, 13);
+
+  assert.equal(computeSingleLegCloseFee({ quantity: 0.1, closePrice: 92_000 }), 4.6);
+
+  const liqEst = buildLiquidationEstimate({
+    side: 'LONG',
+    entryPrice: 60_000,
+    leverage: 2,
+    marketType: 'PERPETUAL',
+  });
+  assert.equal(liqEst.isEstimate, true);
+  assert.equal(liqEst.marginMode, 'ISOLATED');
+  assert.ok(liqEst.price !== null && liqEst.price > 30_000 && liqEst.price < 31_000);
+  assert.ok(liqEst.disclaimer.includes('ESTIMATE'));
+});
+
+test('13-State Order Lifecycle Machine enforces valid transitions and blocks illegal transitions', async () => {
+  const { canTransitionOrderState, transitionOrderState } = await import('./orderStateMachine.ts');
+
+  assert.equal(canTransitionOrderState(null, 'CREATED'), true);
+  assert.equal(canTransitionOrderState(null, 'FILLED'), false);
+  assert.equal(canTransitionOrderState('CREATED', 'VALIDATING'), true);
+  assert.equal(canTransitionOrderState('VALIDATING', 'SUBMITTED'), true);
+  assert.equal(canTransitionOrderState('SUBMITTED', 'FILLED'), true);
+  assert.equal(canTransitionOrderState('FILLED', 'CANCELLED'), false);
+
+  const evt = transitionOrderState({
+    orderId: 'ORD-SM-1',
+    fromState: 'SUBMITTED',
+    toState: 'FILLED',
+    reason: 'Paper simulator fill',
+    actor: 'SYSTEM',
+  });
+  assert.equal(evt.toState, 'FILLED');
+  assert.throws(() =>
+    transitionOrderState({
+      orderId: 'ORD-SM-1',
+      fromState: 'FILLED',
+      toState: 'CANCELLED',
+      reason: 'Illegal double cancel',
+      actor: 'SYSTEM',
+    }),
+  );
+});
+
+test('Risk Engine requireFreshTimestamp rejects zero/missing timestamps and 5-state feed health maps all states', () => {
+  const missingTs = evaluateOrderRisk(
+    {
+      symbol: 'BTC/USDT',
+      exchange: 'Binance',
+      marketType: 'PERPETUAL',
+      side: 'LONG',
+      orderType: 'MARKET',
+      entryPrice: 60_000,
+      stopLoss: 58_500,
+      takeProfit: 63_000,
+      leverage: 2,
+      idempotencyKey: 'fresh-ts-0',
+      dataStatus: 'LIVE_EXCHANGE',
+      tickerTimestampUtc: 0,
+      requireFreshTimestamp: true,
+    },
+    DEFAULT_RISK_CONFIG,
+    makeBaseContext(),
+  );
+  assert.equal(missingTs.approved, false);
+  assert.ok(missingTs.reasons.some((r) => r.includes('tickerTimestampUtc')));
+
+  const now = 1_700_000_100_000;
+  assert.equal(
+    mapTierToStandardFeedHealth(classifyFeedFreshness(now - 1000, now).tier),
+    'LIVE',
+  );
+  assert.equal(
+    mapTierToStandardFeedHealth(classifyFeedFreshness(now - 15_000, now).tier),
+    'AGING',
+  );
+  assert.equal(
+    mapTierToStandardFeedHealth(classifyFeedFreshness(now - 45_000, now).tier),
+    'STALE',
+  );
+  assert.equal(
+    mapTierToStandardFeedHealth(classifyFeedFreshness(0, now).tier),
+    'OFFLINE',
+  );
+  assert.equal(
+    mapTierToStandardFeedHealth(classifyFeedFreshness(now, now).tier, true),
+    'ERROR',
+  );
+});
+
+test('repricePortfolioAndPositions computes distinct dailyPnlPct and weeklyPnlPct from period baselines', () => {
+  const ticker = makeValidTicker({ symbol: 'BTC/USDT', lastPrice: 100_000 });
+  const basePort: PortfolioSummary = {
+    mode: 'PAPER',
+    initialEquityUsd: 100_000,
+    totalEquityUsd: 100_000,
+    availableBalanceUsd: 90_000,
+    usedMarginUsd: 10_000,
+    realizedPnlUsd: 2_000,
+    unrealizedPnlUsd: 0,
+    totalFeesUsd: 10,
+    dailyPnlPct: 0,
+    weeklyPnlPct: 0,
+    dailyBaselineEquityUsd: 102_000,
+    weeklyBaselineEquityUsd: 95_000,
+    peakEquityUsd: 104_000,
+    currentDrawdownPct: 0,
+    winCount: 1,
+    lossCount: 0,
+    totalClosedTrades: 1,
+    winRatePct: 100,
+  };
+  const openPos: Position = {
+    id: 'POS-BASE-1',
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    side: 'LONG',
+    quantity: 0.1,
+    entryPrice: 90_000,
+    markPrice: 90_000,
+    stopLoss: 88_000,
+    takeProfit: 105_000,
+    leverage: 2,
+    marginUsd: 4_500,
+    unrealizedPnlUsd: 0,
+    unrealizedPnlPct: 0,
+    liquidationPrice: 45_450,
+    fundingPaidUsd: 0,
+    strategyName: 'Baseline Test',
+    mode: 'PAPER',
+    openedAtUtc: new Date().toISOString(),
+  };
+
+  // Equity becomes 100_000 + 2_000 + 1_000 unrealized = 103_000
+  const repriced = repricePortfolioAndPositions(basePort, [openPos], [ticker]);
+  assert.equal(repriced.portfolio.totalEquityUsd, 103_000);
+  // Daily baseline 102_000 -> +0.98%
+  assert.equal(repriced.portfolio.dailyPnlPct, 0.98);
+  // Weekly baseline 95_000 -> +8.42%
+  assert.equal(repriced.portfolio.weeklyPnlPct, 8.42);
+  assert.notEqual(repriced.portfolio.dailyPnlPct, repriced.portfolio.weeklyPnlPct);
+});
+
 
 
 

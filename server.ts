@@ -5,24 +5,33 @@ import express from 'express';
 import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
+  acquireAutoJobLock,
+  activateEmergencyStopState,
   appendAgentLog,
   appendAuditLog,
+  appendOrderStateEvent,
+  applyPortfolioPeriodBaselines,
   checkpointDatabase,
   closePositionAtomically,
+  completeAutoJob,
   deletePosition,
   disconnectExchange,
   expireStaleAutoProposals,
+  failAutoJob,
   getAgentLogs,
   getAgents,
   getAuditLogs,
   getAutoExecutionConfig,
+  getAutoExecutionRuntimeState,
   getAutoProposals,
   getDatabaseDiagnostics,
+  getEmergencyStopState,
   getExchanges,
   getExchangeEncryptedCredentials,
   getLatestPnlSnapshot,
   getOpenPositions,
   getOrders,
+  getOrderStateEvents,
   getPnlHistory,
   getPortfolioSummary,
   getRecentIdempotencyKeys,
@@ -30,18 +39,23 @@ import {
   getSignals,
   getStateRevision,
   getTradingMode,
+  hasClaimedAuthCredential,
   bumpStateRevision,
   initDatabase,
   insertOrder,
+  listAuthCredentials,
   openPositionAtomically,
   recordPnlSnapshot,
   resetTradingSession,
+  saveAuthCredential,
   saveAutoExecutionConfig,
+  saveAutoExecutionRuntimeState,
   saveExchangeCredentials,
   savePortfolioSummary,
   saveRiskConfig,
   saveSignal,
   setTradingMode,
+  unlockEmergencyStopState,
   updateAgent,
   updateExchangeVerificationStatus,
   upsertAutoProposal,
@@ -55,8 +69,35 @@ import {
   maskApiKey,
 } from './server/cryptoVault.ts';
 import { verifyExchangeCredentials } from './server/exchangeAuth.ts';
-import { marketFeed } from './server/marketFeed.ts';
+import {
+  isValidMarketInterval,
+  marketFeed,
+} from './server/marketFeed.ts';
 import { streamQuantCopilot, synthesizeWithGemini } from './server/geminiService.ts';
+import {
+  apiCorsMiddleware,
+  createRateLimiter,
+  extractBearerOrAdminToken,
+  getConfiguredEnvTokens,
+  globalErrorMiddleware,
+  hashPasswordScrypt,
+  isAuthEnforced,
+  issueInMemorySessionToken,
+  requestContextMiddleware,
+  requireRole,
+  resolveAuthFromHeaders,
+  resolveRateLimitStore,
+  revokeInMemorySessionToken,
+  securityHeadersMiddleware,
+  validateSecurityStartupConfig,
+  verifyPasswordScrypt,
+  type AuthenticatedRequest,
+} from './server/security.ts';
+import {
+  isLiveExecutionEnabled,
+  PaperSimulatedExecutionAdapter,
+  reconcileExecutionState,
+} from './server/executionAdapter.ts';
 import { computeAllIndicators, detectMarketRegime } from './src/engine/indicators.ts';
 import { validateTickerIntegrity } from './src/engine/dataIntegrity.ts';
 import {
@@ -77,8 +118,8 @@ import {
   computeFeedHealthMetrics,
   mergeLiveTickIntoCandles,
 } from './src/engine/priceFeedGuard.ts';
+import { transitionOrderState } from './src/engine/orderStateMachine.ts';
 import {
-  estimateLiquidationPrice,
   evaluateOrderRisk,
 } from './src/engine/riskEngine.ts';
 import {
@@ -100,7 +141,7 @@ import {
   validatePositionSlTpUpdate,
 } from './src/engine/positionMetrics.ts';
 import { findMatchingSignal } from './src/engine/pairSelection.ts';
-import { getSmartPriceDecimals, type MarketDirectoryEntry } from './src/engine/symbolSearch.ts';
+import type { MarketDirectoryEntry } from './src/engine/symbolSearch.ts';
 import type {
   AutoExecutionActivityEntry,
   AutoExecutionConfig,
@@ -131,148 +172,62 @@ import type {
 dotenv.config();
 initDatabase();
 
+if (process.env.OMNISENT_SKIP_LISTEN !== '1') {
+  const startupSec = validateSecurityStartupConfig();
+  for (const w of startupSec.warnings) {
+    console.warn(`[SECURITY NOTICE] ${w}`);
+  }
+}
+
 export const app = express();
+export { createRateLimiter };
+const paperExecutionAdapter = new PaperSimulatedExecutionAdapter();
+
 app.disable('x-powered-by');
 app.set('trust proxy', 1);
+app.use(requestContextMiddleware());
+app.use(securityHeadersMiddleware());
+app.use('/api', apiCorsMiddleware());
 app.use(express.json({ limit: '512kb' }));
 
-// Security Headers (compatible with AI Studio preview iframe)
-app.use((_req, res, next) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  res.setHeader('X-DNS-Prefetch-Control', 'off');
-  next();
-});
+const rateLimitBackend = resolveRateLimitStore();
+const aiRateLimiter = createRateLimiter({ maxRequests: 24, windowMs: 60_000, namespace: 'ai', store: rateLimitBackend.store });
+const exchangeRateLimiter = createRateLimiter({ maxRequests: 30, windowMs: 60_000, namespace: 'exchange', store: rateLimitBackend.store });
+const executionRateLimiter = createRateLimiter({ maxRequests: 45, windowMs: 60_000, namespace: 'exec', store: rateLimitBackend.store });
+const scanBacktestRateLimiter = createRateLimiter({ maxRequests: 36, windowMs: 60_000, namespace: 'scan', store: rateLimitBackend.store });
+const authRateLimiter = createRateLimiter({ maxRequests: 15, windowMs: 60_000, namespace: 'auth', store: rateLimitBackend.store });
 
-function buildAllowedOrigins(): Set<string> {
-  const origins = new Set<string>([
-    'http://localhost:3000',
-    'http://127.0.0.1:3000',
-  ]);
-  for (const raw of [process.env.APP_URL, process.env.ALLOWED_ORIGIN]) {
-    if (!raw) continue;
-    for (const part of raw.split(',')) {
-      const trimmed = part.trim().replace(/\/+$/, '');
-      if (trimmed && trimmed !== 'MY_APP_URL') {
-        origins.add(trimmed);
-      }
-    }
-  }
-  return origins;
-}
+const requireTrader = requireRole('TRADER', hasClaimedAuthCredential);
+const requireRiskOfficer = requireRole('RISK_OFFICER', hasClaimedAuthCredential);
+const requireExchangeAdmin = requireRole('EXCHANGE_ADMIN', hasClaimedAuthCredential);
+const requireSystemAdmin = requireRole('SYSTEM_ADMIN', hasClaimedAuthCredential);
 
-// Strict Origin/CORS policy for /api routes
-app.use('/api', (req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin) {
-    const allowed = buildAllowedOrigins();
-    const hostHeader = req.headers.host;
-    const isSameHost =
-      Boolean(hostHeader) &&
-      (origin === `https://${hostHeader}` || origin === `http://${hostHeader}`);
-    const isCloudRunPreview = /^https:\/\/[a-z0-9.-]+\.run\.app$/i.test(origin);
-    if (isSameHost || allowed.has(origin) || isCloudRunPreview) {
-      res.setHeader('Access-Control-Allow-Origin', origin);
-      res.setHeader('Vary', 'Origin');
-      res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Admin-Token');
-    } else {
-      if (req.method === 'OPTIONS') {
-        res.status(403).end();
-        return;
-      }
-    }
-  }
-  if (req.method === 'OPTIONS') {
-    res.status(204).end();
-    return;
-  }
-  next();
-});
-
-// Sliding-window per-IP rate limiter for sensitive / compute-heavy routes
-export function createRateLimiter(options: { maxRequests: number; windowMs: number }) {
-  const hits = new Map<string, number[]>();
-  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    const now = Date.now();
-    const clientIp = String(req.ip || req.socket?.remoteAddress || 'unknown');
-    const cutoff = now - options.windowMs;
-    const prev = (hits.get(clientIp) ?? []).filter((ts) => ts > cutoff);
-    if (prev.length >= options.maxRequests) {
-      const retryAfterSec = Math.max(1, Math.ceil((prev[0] + options.windowMs - now) / 1000));
-      res.setHeader('Retry-After', String(retryAfterSec));
-      res.status(429).json({
-        error: `Quá nhiều yêu cầu trong thời gian ngắn. Vui lòng thử lại sau ${retryAfterSec}s.`,
-      });
-      return;
-    }
-    prev.push(now);
-    hits.set(clientIp, prev);
-    if (hits.size > 2000) {
-      for (const [k, list] of hits.entries()) {
-        const fresh = list.filter((ts) => ts > cutoff);
-        if (fresh.length === 0) hits.delete(k);
-        else hits.set(k, fresh);
-      }
-    }
-    next();
-  };
-}
-
-// Optional timing-safe bearer/header auth when OMNISENT_ADMIN_TOKEN is configured
-export function requireAdminAuth(
-  req: express.Request,
-  res: express.Response,
-  next: express.NextFunction,
-): void {
-  const expected = process.env.OMNISENT_ADMIN_TOKEN?.trim();
-  if (!expected) {
-    next();
-    return;
-  }
-  const authHeader = typeof req.headers.authorization === 'string' ? req.headers.authorization : '';
-  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : '';
-  const headerToken = typeof req.headers['x-admin-token'] === 'string' ? req.headers['x-admin-token'].trim() : '';
-  const supplied = bearerToken || headerToken;
-  const expectedBuf = Buffer.from(expected, 'utf8');
-  const suppliedBuf = Buffer.from(supplied, 'utf8');
-  if (
-    supplied.length === 0 ||
-    expectedBuf.length !== suppliedBuf.length ||
-    !crypto.timingSafeEqual(expectedBuf, suppliedBuf)
-  ) {
-    res.status(401).json({
-      error: 'Yêu cầu xác thực quản trị (Authorization: Bearer <OMNISENT_ADMIN_TOKEN> hoặc X-Admin-Token).',
-    });
-    return;
-  }
-  next();
-}
-
-const aiRateLimiter = createRateLimiter({ maxRequests: 24, windowMs: 60_000 });
-const exchangeRateLimiter = createRateLimiter({ maxRequests: 30, windowMs: 60_000 });
-const executionRateLimiter = createRateLimiter({ maxRequests: 45, windowMs: 60_000 });
-const scanBacktestRateLimiter = createRateLimiter({ maxRequests: 36, windowMs: 60_000 });
-
-app.use('/api/ai', aiRateLimiter);
-app.use('/api/exchanges/test', exchangeRateLimiter, requireAdminAuth);
-app.use('/api/exchanges/connect', exchangeRateLimiter, requireAdminAuth);
-app.use('/api/exchanges/:id/verify', exchangeRateLimiter, requireAdminAuth);
-app.use('/api/exchanges/verify-all', exchangeRateLimiter, requireAdminAuth);
-app.use('/api/exchanges/:id/disconnect', requireAdminAuth);
-app.use('/api/orders', executionRateLimiter, requireAdminAuth);
-app.use('/api/positions', executionRateLimiter, requireAdminAuth);
-app.use('/api/mode', requireAdminAuth);
-app.use('/api/emergency-stop', requireAdminAuth);
-app.use('/api/session/reset', requireAdminAuth);
-app.use('/api/risk/config', requireAdminAuth);
-app.use('/api/auto-trade/config', requireAdminAuth);
-app.use('/api/auto-trade/cycle', requireAdminAuth);
-app.use('/api/auto-trade/proposals', requireAdminAuth);
-app.use('/api/agents/:id/action', requireAdminAuth);
+app.use('/api/auth/login', authRateLimiter);
+app.use('/api/auth/claim', authRateLimiter);
+app.use('/api/ai', aiRateLimiter, requireTrader);
+app.use('/api/exchanges/test', exchangeRateLimiter, requireExchangeAdmin);
+app.use('/api/exchanges/connect', exchangeRateLimiter, requireExchangeAdmin);
+app.use('/api/exchanges/:id/verify', exchangeRateLimiter, requireExchangeAdmin);
+app.use('/api/exchanges/verify-all', exchangeRateLimiter, requireExchangeAdmin);
+app.use('/api/exchanges/:id/disconnect', exchangeRateLimiter, requireExchangeAdmin);
+app.use('/api/orders/preview', executionRateLimiter, requireTrader);
+app.use('/api/orders', executionRateLimiter, requireTrader);
+app.use('/api/positions', executionRateLimiter, requireTrader);
+app.use('/api/run/smart', executionRateLimiter, requireTrader);
+app.use('/api/pipeline/run', scanBacktestRateLimiter, requireTrader);
+app.use('/api/market/select', scanBacktestRateLimiter, requireTrader);
+app.use('/api/mode', requireRiskOfficer);
+app.use('/api/emergency-stop', requireRiskOfficer);
+app.use('/api/risk/config', requireRiskOfficer);
+app.use('/api/execution/reconcile', requireRiskOfficer);
+app.use('/api/session/reset', requireSystemAdmin);
+app.use('/api/auto-trade/config', requireRiskOfficer);
+app.use('/api/auto-trade/cycle', requireTrader);
+app.use('/api/auto-trade/proposals', requireTrader);
+app.use('/api/agents/:id/action', requireSystemAdmin);
 app.use('/api/market/scan', scanBacktestRateLimiter);
 app.use('/api/backtest', scanBacktestRateLimiter);
+app.use('/api/audit-logs', scanBacktestRateLimiter);
 
 let initialBenchmarkCandlesWarmed = false;
 async function ensureFreshServerFeed(options?: { allowStaleRefresh?: boolean }): Promise<void> {
@@ -366,7 +321,7 @@ function syncPortfolioAndPositions(options?: {
     const hasLiveMark = Boolean(ticker && ticker.lastPrice > 0);
     const markPrice = hasLiveMark && ticker ? ticker.lastPrice : pos.markPrice;
     const isFreshQuote = Boolean(
-      ticker && (ticker.timestampUtc === 0 || nowCheckMs - ticker.timestampUtc <= 45_000),
+      ticker && ticker.timestampUtc > 0 && nowCheckMs - ticker.timestampUtc <= 45_000,
     );
     const isNonCrossedBook = Boolean(
       ticker && (ticker.bidPrice <= 0 || ticker.askPrice <= 0 || ticker.askPrice >= ticker.bidPrice),
@@ -475,10 +430,7 @@ function syncPortfolioAndPositions(options?: {
       ? ((portfolio.peakEquityUsd - totalEquity) / portfolio.peakEquityUsd) * 100
       : 0;
   portfolio.currentDrawdownPct = Number(Math.max(0, dd).toFixed(2));
-  portfolio.dailyPnlPct = Number(
-    (((totalEquity - portfolio.initialEquityUsd) / portfolio.initialEquityUsd) * 100).toFixed(2),
-  );
-  portfolio.weeklyPnlPct = portfolio.dailyPnlPct;
+  applyPortfolioPeriodBaselines(portfolio, nowCheckMs);
 
   // Automatic Drawdown Circuit Breaker
   let circuitBreakerTripped = false;
@@ -487,18 +439,20 @@ function syncPortfolioAndPositions(options?: {
     getTradingMode() !== 'EMERGENCY_STOP'
   ) {
     circuitBreakerTripped = true;
-    setTradingMode('EMERGENCY_STOP');
+    const reason = `Drawdown ${portfolio.currentDrawdownPct}% đạt ngưỡng ${riskConfig.maxDrawdownPct}% — tự động kích hoạt EMERGENCY_STOP.`;
+    activateEmergencyStopState(reason, 'RISK_MANAGEMENT');
     portfolio.mode = 'EMERGENCY_STOP';
     saveAutoExecutionConfig(
       syncAutoConfigWithTradingMode('EMERGENCY_STOP', getAutoExecutionConfig()),
     );
     autoExecRuntime.lastSummary = `Circuit Breaker kích hoạt tại Drawdown ${portfolio.currentDrawdownPct}% (>= ${riskConfig.maxDrawdownPct}%) — đã tự động khóa Auto-Execution.`;
+    persistAutoRuntimeState();
     appendAuditLog({
       category: 'EMERGENCY',
       severity: 'CRITICAL',
       actor: 'RISK_MANAGEMENT',
       action: 'DRAWDOWN_CIRCUIT_BREAKER',
-      details: `Drawdown ${portfolio.currentDrawdownPct}% đạt ngưỡng ${riskConfig.maxDrawdownPct}% — tự động kích hoạt EMERGENCY_STOP và tắt Auto-Execution.`,
+      details: `${reason} Đã tắt Auto-Execution.`,
     });
   }
 
@@ -572,6 +526,112 @@ function syncPortfolioAndPositions(options?: {
 
 // --- API Routes ---
 
+app.get('/api/auth/status', (req, res) => {
+  const auth = resolveAuthFromHeaders(req.headers, hasClaimedAuthCredential);
+  res.json({
+    authEnforced: isAuthEnforced(hasClaimedAuthCredential),
+    hasClaimedCredential: hasClaimedAuthCredential(),
+    strictProduction: isStrictProductionRuntime(),
+    liveExecutionEnabled: isLiveExecutionEnabled(),
+    authenticated: auth.authenticated,
+    role: auth.role,
+    actor: auth.actor,
+    method: auth.method,
+  });
+});
+
+app.post('/api/auth/claim', (req, res) => {
+  if (getConfiguredEnvTokens().length > 0 || hasClaimedAuthCredential()) {
+    res.status(409).json({
+      error: 'Hệ thống đã được cấu hình khóa xác thực điều hành. Vui lòng sử dụng /api/auth/login.',
+    });
+    return;
+  }
+  const passphrase = String(req.body?.passphrase || '').trim();
+  const actor = String(req.body?.actor || 'SYSTEM_OPERATOR')
+    .trim()
+    .slice(0, 48) || 'SYSTEM_OPERATOR';
+  if (passphrase.length < 10) {
+    res.status(400).json({
+      error: 'Mật khẩu quản trị phải có tối thiểu 10 ký tự.',
+    });
+    return;
+  }
+  const passwordHash = hashPasswordScrypt(passphrase);
+  saveAuthCredential({
+    id: `CRED-${Date.now()}`,
+    actor,
+    role: 'SYSTEM_ADMIN',
+    passwordHash,
+  });
+  const session = issueInMemorySessionToken(actor, 'SYSTEM_ADMIN');
+  appendAuditLog({
+    category: 'SECURITY',
+    severity: 'INFO',
+    actor,
+    action: 'AUTH_CLAIM_INITIAL_ADMIN',
+    details: `Khởi tạo thông tin xác thực SYSTEM_ADMIN (scrypt) cho ${actor}.`,
+  });
+  res.json({ ok: true, ...session });
+});
+
+app.post('/api/auth/login', (req, res) => {
+  const secret = String(req.body?.token ?? req.body?.passphrase ?? '').trim();
+  if (!secret) {
+    res.status(400).json({ error: 'Vui lòng nhập Token hoặc mật khẩu điều hành.' });
+    return;
+  }
+
+  for (const envEntry of getConfiguredEnvTokens()) {
+    if (
+      envEntry.token.length === secret.length &&
+      crypto.timingSafeEqual(Buffer.from(envEntry.token, 'utf8'), Buffer.from(secret, 'utf8'))
+    ) {
+      const session = issueInMemorySessionToken(envEntry.actor, envEntry.role);
+      appendAuditLog({
+        category: 'SECURITY',
+        severity: 'INFO',
+        actor: envEntry.actor,
+        action: 'AUTH_SESSION_ISSUED',
+        details: `Đăng nhập phiên điều hành bằng env token (${envEntry.role}).`,
+      });
+      res.json({ ok: true, ...session });
+      return;
+    }
+  }
+
+  const creds = listAuthCredentials();
+  for (const cred of creds) {
+    if (verifyPasswordScrypt(secret, cred.passwordHash)) {
+      const role =
+        cred.role === 'RISK_OFFICER' ||
+        cred.role === 'EXCHANGE_ADMIN' ||
+        cred.role === 'TRADER' ||
+        cred.role === 'SYSTEM_ADMIN'
+          ? cred.role
+          : 'SYSTEM_ADMIN';
+      const session = issueInMemorySessionToken(cred.actor, role);
+      appendAuditLog({
+        category: 'SECURITY',
+        severity: 'INFO',
+        actor: cred.actor,
+        action: 'AUTH_SESSION_ISSUED',
+        details: `Đăng nhập phiên điều hành (${role}).`,
+      });
+      res.json({ ok: true, ...session });
+      return;
+    }
+  }
+
+  res.status(401).json({ error: 'Token hoặc mật khẩu điều hành không chính xác.' });
+});
+
+app.post('/api/auth/logout', (req, res) => {
+  const supplied = extractBearerOrAdminToken(req.headers);
+  const revoked = revokeInMemorySessionToken(supplied);
+  res.json({ ok: true, revoked });
+});
+
 app.get('/api/health', (_req, res) => {
   const mode = getTradingMode();
   const tickers = marketFeed.getTickers();
@@ -581,6 +641,7 @@ app.get('/api/health', (_req, res) => {
     status: 'OK',
     tradingMode: mode,
     liveExchangeFeed: marketFeed.isLiveFeedActive(),
+    liveExecutionEnabled: isLiveExecutionEnabled(),
     wsSupported: !isVercelRuntime,
     feedAgeMs: Number.isFinite(marketFeed.getFeedAgeMs()) ? marketFeed.getFeedAgeMs() : null,
     dataIntegrityHealthy: validCount === integrityReports.length,
@@ -591,7 +652,10 @@ app.get('/api/health', (_req, res) => {
       process.env.GEMINI_API_KEY !== 'MY_GEMINI_API_KEY',
     vaultPersistentKeyConfigured: isPersistentVaultKeyConfigured(),
     strictVaultProduction: isStrictProductionRuntime(),
-    adminAuthEnabled: Boolean(process.env.OMNISENT_ADMIN_TOKEN?.trim()),
+    adminAuthEnabled: isAuthEnforced(hasClaimedAuthCredential),
+    authEnforced: isAuthEnforced(hasClaimedAuthCredential),
+    rateLimitBackend: rateLimitBackend.modeLabel,
+    emergencyStop: getEmergencyStopState(),
     database: getDatabaseDiagnostics(),
     timestampUtc: new Date().toISOString(),
   });
@@ -606,6 +670,9 @@ app.get('/api/sync/bootstrap', (_req, res) => {
     stateRevision: getStateRevision(),
     tradingMode: getTradingMode(),
     liveFeedActive: marketFeed.isLiveFeedActive(),
+    liveExecutionEnabled: isLiveExecutionEnabled(),
+    authEnforced: isAuthEnforced(hasClaimedAuthCredential),
+    emergencyStop: getEmergencyStopState(),
     wsSupported: !isVercelRuntime,
     feedAgeMs: Number.isFinite(marketFeed.getFeedAgeMs()) ? marketFeed.getFeedAgeMs() : null,
     feedHealth: computeFeedHealthMetrics(tickers),
@@ -716,6 +783,10 @@ app.get('/api/market/candles', async (req, res) => {
   const symbol = String(req.query.symbol || 'BTC/USDT');
   const marketType = (String(req.query.marketType || 'PERPETUAL') as MarketType);
   const interval = String(req.query.interval || '1h');
+  if (!isValidMarketInterval(interval)) {
+    res.status(400).json({ error: `Khung thời gian '${interval}' không được hỗ trợ.` });
+    return;
+  }
   const exchange = req.query.exchange ? String(req.query.exchange) : undefined;
   const [{ candles, status, source }, book] = await Promise.all([
     marketFeed.getCandles(symbol, marketType, interval, exchange),
@@ -1526,6 +1597,8 @@ app.post('/api/ai/copilot/stream', async (req, res) => {
 
 // --- Autonomous 9-Gate Auto-Execution Engine ---
 
+const persistedAutoState = getAutoExecutionRuntimeState();
+
 const autoExecRuntime: {
   cycleInProgress: boolean;
   lastCycleAtMs: number | null;
@@ -1539,16 +1612,31 @@ const autoExecRuntime: {
   replenishTimer: ReturnType<typeof setTimeout> | null;
 } = {
   cycleInProgress: false,
-  lastCycleAtMs: null,
-  lastScanDurationMs: null,
-  lastSummary: 'Hệ thống Auto-Execution FULL_AUTO sẵn sàng duy trì vị thế thông minh.',
-  recentExecutionTimestampsMs: [],
-  symbolCooldowns: {},
+  lastCycleAtMs: persistedAutoState.lastCycleAtUtc
+    ? Date.parse(persistedAutoState.lastCycleAtUtc) || null
+    : null,
+  lastScanDurationMs: persistedAutoState.lastScanDurationMs,
+  lastSummary: persistedAutoState.lastSummary,
+  recentExecutionTimestampsMs: [...persistedAutoState.hourlyTradeTimestamps],
+  symbolCooldowns: { ...persistedAutoState.symbolCooldowns },
   recentActivity: [],
-  autoTradesTotalCount: 0,
+  autoTradesTotalCount: persistedAutoState.autoTradesTotalCount,
   broadcastAutoStatus: null,
   replenishTimer: null,
 };
+
+function persistAutoRuntimeState(): void {
+  saveAutoExecutionRuntimeState({
+    lastCycleAtUtc: autoExecRuntime.lastCycleAtMs
+      ? new Date(autoExecRuntime.lastCycleAtMs).toISOString()
+      : null,
+    lastScanDurationMs: autoExecRuntime.lastScanDurationMs,
+    lastSummary: autoExecRuntime.lastSummary,
+    autoTradesTotalCount: autoExecRuntime.autoTradesTotalCount,
+    hourlyTradeTimestamps: autoExecRuntime.recentExecutionTimestampsMs.slice(-100),
+    symbolCooldowns: autoExecRuntime.symbolCooldowns,
+  });
+}
 
 let isBroadcastingTick = false;
 
@@ -1591,83 +1679,75 @@ function recordAutoActivity(entry: Omit<AutoExecutionActivityEntry, 'id' | 'time
 
 function executeRiskVerifiedPaperOrder(params: {
   orderReq: OrderRequest;
+  riskConfig?: RiskConfig;
+  riskContext?: import('./src/engine/types.ts').RiskContext;
   riskCheck: RiskCheckResult;
   markPrice: number;
   actor: string;
   auditAction: string;
-}): { orderId: string; position: Position; execPrice: number; feeUsd: number } {
-  const { orderReq, riskCheck, markPrice, actor, auditAction } = params;
-  const nowIso = new Date().toISOString();
-  const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
-  const slippageAdj = orderReq.orderType === 'MARKET' ? 0.0003 : 0;
-  const pxDec = getSmartPriceDecimals(orderReq.entryPrice);
-  const execPrice =
-    orderReq.side === 'LONG'
-      ? Number((orderReq.entryPrice * (1 + slippageAdj)).toFixed(pxDec))
-      : Number((orderReq.entryPrice * (1 - slippageAdj)).toFixed(pxDec));
+}): {
+  orderId: string;
+  position: Position;
+  execPrice: number;
+  feeUsd: number;
+  lifecycleState: string;
+} {
+  const { orderReq, markPrice, actor, auditAction } = params;
+  const portfolioState = getPortfolioSummary();
+  const riskConfig = params.riskConfig ?? getRiskConfig();
+  const riskContext = params.riskContext ?? {
+    tradingMode: getTradingMode(),
+    accountEquityUsd: portfolioState.totalEquityUsd,
+    availableBalanceUsd: portfolioState.availableBalanceUsd,
+    dailyPnlPct: portfolioState.dailyPnlPct,
+    weeklyPnlPct: portfolioState.weeklyPnlPct,
+    currentDrawdownPct: portfolioState.currentDrawdownPct,
+    openPositions: getOpenPositions(),
+    recentIdempotencyKeys: getRecentIdempotencyKeys(200),
+  };
 
-  const feeUsd = Number((riskCheck.recommendedQuantity * execPrice * 0.0005).toFixed(2));
-  const slipUsd = Number((riskCheck.recommendedQuantity * orderReq.entryPrice * slippageAdj).toFixed(2));
-  const effLev = orderReq.marketType === 'SPOT' ? 1 : orderReq.leverage;
+  const fill = paperExecutionAdapter.executeOrder({
+    orderRequest: {
+      ...orderReq,
+      requireFreshTimestamp: orderReq.requireFreshTimestamp ?? true,
+    },
+    riskConfig,
+    riskContext,
+    actor,
+  });
 
-  const newPos: Position = {
-    id: `POS-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
-    symbol: orderReq.symbol,
-    exchange: orderReq.exchange,
-    marketType: orderReq.marketType,
-    side: orderReq.side,
-    quantity: riskCheck.recommendedQuantity,
-    entryPrice: execPrice,
-    markPrice: markPrice > 0 ? markPrice : execPrice,
-    stopLoss: orderReq.stopLoss,
-    initialStopLoss: orderReq.stopLoss,
-    takeProfit: orderReq.takeProfit,
-    leverage: effLev,
-    marginUsd: riskCheck.requiredMarginUsd,
-    unrealizedPnlUsd: 0,
-    unrealizedPnlPct: 0,
-    liquidationPrice: estimateLiquidationPrice(
-      orderReq.side,
-      execPrice,
-      effLev,
-      orderReq.marketType,
-    ),
-    fundingPaidUsd: 0,
-    strategyName: orderReq.strategyName || 'Autonomous Alpha',
-    mode: 'PAPER',
-    openedAtUtc: nowIso,
+  if (!fill.ok || !fill.position) {
+    insertOrder(fill.orderRecord);
+    for (const evt of fill.events) {
+      appendOrderStateEvent(evt);
+    }
+    throw new Error(fill.error || 'Paper Simulated Execution Adapter rejected order.');
+  }
+
+  const finalPosition: Position = {
+    ...fill.position,
+    markPrice: markPrice > 0 ? markPrice : fill.executedPrice,
   };
 
   openPositionAtomically({
-    order: {
-      id: orderId,
-      idempotencyKey: orderReq.idempotencyKey,
-      symbol: orderReq.symbol,
-      exchange: orderReq.exchange,
-      marketType: orderReq.marketType,
-      side: orderReq.side,
-      orderType: orderReq.orderType,
-      quantity: riskCheck.recommendedQuantity,
-      price: execPrice,
-      stopLoss: orderReq.stopLoss,
-      takeProfit: orderReq.takeProfit,
-      leverage: effLev,
-      feesUsd: feeUsd,
-      slippageUsd: slipUsd,
-      status: 'FILLED',
-      mode: 'PAPER',
-      strategyName: orderReq.strategyName || 'Autonomous Alpha',
-      riskDecision: riskCheck.decision,
-      createdAtUtc: nowIso,
-    },
-    position: newPos,
-    feeUsd,
+    order: fill.orderRecord,
+    position: finalPosition,
+    feeUsd: fill.feeUsd,
     auditActor: actor,
     auditAction,
-    auditDetails: `Khớp lệnh tự động ${orderReq.side} ${riskCheck.recommendedQuantity} ${orderReq.symbol} @ $${execPrice} (R:R ${riskCheck.riskRewardRatio}, Fee $${feeUsd}).`,
+    auditDetails: `Khớp lệnh PAPER_SIMULATOR ${orderReq.side} ${fill.executedQty} ${orderReq.symbol} @ $${fill.executedPrice} (R:R ${fill.riskCheck.riskRewardRatio}, Fee $${fill.feeUsd}).`,
   });
+  for (const evt of fill.events) {
+    appendOrderStateEvent(evt);
+  }
 
-  return { orderId, position: newPos, execPrice, feeUsd };
+  return {
+    orderId: fill.orderId,
+    position: finalPosition,
+    execPrice: fill.executedPrice,
+    feeUsd: fill.feeUsd,
+    lifecycleState: fill.lifecycleState,
+  };
 }
 
 function buildAutoExecutionStatus(): AutoExecutionEngineStatus {
@@ -1908,16 +1988,49 @@ async function runAutonomousExecutionCycle(
           .activatePair(item.ticker.symbol, item.ticker.marketType, item.ticker.exchange)
           .catch(() => null);
 
-        const filled = executeRiskVerifiedPaperOrder({
-          orderReq: evalResult.orderRequest,
-          riskCheck: evalResult.riskCheck,
-          markPrice: item.ticker.lastPrice,
-          actor: 'AUTO_EXECUTION_ENGINE',
-          auditAction:
-            evalResult.executionTier === 'CORE_9_GATE'
-              ? 'AUTO_EXEC_ORDER_FILLED'
-              : 'AUTO_TACTICAL_ORDER_FILLED',
+        const jobLock = acquireAutoJobLock({
+          idempotencyKey: evalResult.orderRequest.idempotencyKey,
+          lockOwner: 'AUTO_EXECUTION_ENGINE',
+          leaseMs: 20_000,
+          payload: { symbol: item.ticker.symbol, side: evalResult.orderRequest.side },
         });
+        if (!jobLock.acquired) {
+          return 'SKIPPED';
+        }
+
+        let filled;
+        try {
+          filled = executeRiskVerifiedPaperOrder({
+            orderReq: {
+              ...evalResult.orderRequest,
+              tickerTimestampUtc: item.ticker.timestampUtc,
+              requireFreshTimestamp: true,
+              nowMs: Date.now(),
+            },
+            riskConfig,
+            riskContext: {
+              tradingMode: effectiveEvalMode,
+              accountEquityUsd: latestPortfolio.totalEquityUsd,
+              availableBalanceUsd: latestPortfolio.availableBalanceUsd,
+              dailyPnlPct: latestPortfolio.dailyPnlPct,
+              weeklyPnlPct: latestPortfolio.weeklyPnlPct,
+              currentDrawdownPct: latestPortfolio.currentDrawdownPct,
+              openPositions: currentOpen,
+              recentIdempotencyKeys: getRecentIdempotencyKeys(200),
+            },
+            riskCheck: evalResult.riskCheck,
+            markPrice: item.ticker.lastPrice,
+            actor: 'AUTO_EXECUTION_ENGINE',
+            auditAction:
+              evalResult.executionTier === 'CORE_9_GATE'
+                ? 'AUTO_EXEC_ORDER_FILLED'
+                : 'AUTO_TACTICAL_ORDER_FILLED',
+          });
+          completeAutoJob(jobLock.jobId);
+        } catch (execErr) {
+          failAutoJob(jobLock.jobId, execErr instanceof Error ? execErr.message : 'Execution failed');
+          return 'SKIPPED';
+        }
 
         const execNowMs = Date.now();
         autoExecRuntime.recentExecutionTimestampsMs.push(execNowMs);
@@ -1929,6 +2042,7 @@ async function runAutonomousExecutionCycle(
         const tierLabel = evalResult.executionTier === 'CORE_9_GATE' ? '9-Gate Core' : 'Tactical Continuity';
         const msg = `Auto FULL_AUTO [${tierLabel}] khớp ${evalResult.orderRequest.side} ${evalResult.riskCheck.recommendedQuantity} ${item.ticker.symbol} @ $${filled.execPrice} (Alpha ${item.opp.compositeAlphaScore.toFixed(1)}, EV +${item.opp.expectedValueR.toFixed(2)}R, Risk ${evalResult.effectiveRiskPct}%).`;
         autoExecRuntime.lastSummary = msg;
+        persistAutoRuntimeState();
 
         recordAutoActivity({
           symbol: item.ticker.symbol,
@@ -2067,6 +2181,7 @@ async function runAutonomousExecutionCycle(
     autoExecRuntime.cycleInProgress = false;
     autoExecRuntime.lastCycleAtMs = Date.now();
     autoExecRuntime.lastScanDurationMs = Math.max(1, Date.now() - t0);
+    persistAutoRuntimeState();
     autoExecRuntime.broadcastAutoStatus?.();
   }
 
@@ -2200,9 +2315,11 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
     tickerTimestampUtc: ticker.timestampUtc,
+    requireFreshTimestamp: true,
+    nowMs: Date.now(),
   };
 
-  const riskCheck = evaluateOrderRisk(orderReq, riskConfig, {
+  const riskContext = {
     tradingMode: getTradingMode(),
     accountEquityUsd: portfolio.totalEquityUsd,
     availableBalanceUsd: portfolio.availableBalanceUsd,
@@ -2211,7 +2328,9 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     currentDrawdownPct: portfolio.currentDrawdownPct,
     openPositions: positions,
     recentIdempotencyKeys: getRecentIdempotencyKeys(200),
-  });
+  };
+
+  const riskCheck = evaluateOrderRisk(orderReq, riskConfig, riskContext);
 
   if (!riskCheck.approved) {
     res.status(400).json({ error: riskCheck.reasons[0] || 'Risk Engine từ chối khớp đề xuất.' });
@@ -2220,6 +2339,8 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
 
   const filled = executeRiskVerifiedPaperOrder({
     orderReq,
+    riskConfig,
+    riskContext,
     riskCheck,
     markPrice: ticker.lastPrice,
     actor: 'SEMI_AUTO_APPROVAL',
@@ -2241,6 +2362,7 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
 
   const msg = `Đã duyệt SEMI_AUTO & khớp ${proposal.side} ${riskCheck.recommendedQuantity} ${proposal.symbol} @ $${filled.execPrice}.`;
   autoExecRuntime.lastSummary = msg;
+  persistAutoRuntimeState();
   recordAutoActivity({
     symbol: proposal.symbol,
     exchange: proposal.exchange,
@@ -2255,6 +2377,9 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
   autoExecRuntime.broadcastAutoStatus?.();
   res.json({
     orderId: filled.orderId,
+    executionVenue: 'PAPER_SIMULATOR',
+    isSimulated: true,
+    lifecycleState: filled.lifecycleState,
     status: buildAutoExecutionStatus(),
     portfolio: synced.portfolio,
     positions: synced.positions,
@@ -2298,7 +2423,7 @@ app.post('/api/session/reset', (req, res) => {
     requestedMode === 'SEMI_AUTO' ||
     requestedMode === 'FULL_AUTO'
       ? requestedMode
-      : 'FULL_AUTO';
+      : 'PAPER';
 
   resetTradingSession(targetMode);
   autoExecRuntime.recentExecutionTimestampsMs = [];
@@ -2311,6 +2436,7 @@ app.post('/api/session/reset', (req, res) => {
     targetMode === 'FULL_AUTO'
       ? 'Đã reset phiên làm việc ($100,000) — FULL_AUTO đang quét thị trường để mở lệnh tối ưu.'
       : `Đã reset phiên làm việc sạch ($100,000 · ${targetMode}).`;
+  persistAutoRuntimeState();
 
   const { portfolio, positions } = syncPortfolioAndPositions();
   autoExecRuntime.broadcastAutoStatus?.();
@@ -2566,9 +2692,12 @@ app.post('/api/run/smart', async (req, res) => {
         idempotencyKey,
         dataStatus: chosenTicker.dataStatus,
         tradingStatus: chosenTicker.tradingStatus,
+        tickerTimestampUtc: chosenTicker.timestampUtc,
+        requireFreshTimestamp: true,
+        nowMs: Date.now(),
       };
       const freshPortfolioState = syncPortfolioAndPositions();
-      const riskCheck = evaluateOrderRisk(orderReq, riskConfig, {
+      const smartRiskCtx = {
         tradingMode: effectiveMode,
         accountEquityUsd: freshPortfolioState.portfolio.totalEquityUsd,
         availableBalanceUsd: freshPortfolioState.portfolio.availableBalanceUsd,
@@ -2577,11 +2706,14 @@ app.post('/api/run/smart', async (req, res) => {
         currentDrawdownPct: freshPortfolioState.portfolio.currentDrawdownPct,
         openPositions: freshPortfolioState.positions,
         recentIdempotencyKeys: getRecentIdempotencyKeys(200),
-      });
+      };
+      const riskCheck = evaluateOrderRisk(orderReq, riskConfig, smartRiskCtx);
 
       if (riskCheck.approved) {
         const filled = executeRiskVerifiedPaperOrder({
           orderReq,
+          riskConfig,
+          riskContext: smartRiskCtx,
           riskCheck,
           markPrice: chosenTicker.lastPrice,
           actor: 'SMART_RUN',
@@ -2593,6 +2725,7 @@ app.post('/api/run/smart', async (req, res) => {
         autoExecRuntime.recentExecutionTimestampsMs.push(smartExecNow);
         autoExecRuntime.symbolCooldowns[chosenTicker.symbol] =
           smartExecNow + autoCfg.cooldownMinutesPerSymbol * 60_000;
+        persistAutoRuntimeState();
 
         autoExecuted = true;
         executedOrderId = filled.orderId;
@@ -2742,6 +2875,9 @@ app.post('/api/orders/preview', async (req, res) => {
     idempotencyKey: String(body.idempotencyKey || `PREVIEW-${Date.now()}`),
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
+    tickerTimestampUtc: ticker.timestampUtc,
+    requireFreshTimestamp: true,
+    nowMs: Date.now(),
   };
 
   const check = evaluateOrderRisk(orderReq, riskConfig, {
@@ -2758,6 +2894,39 @@ app.post('/api/orders/preview', async (req, res) => {
   res.json({ riskCheck: check, order: orderReq });
 });
 
+app.get('/api/orders/:id/events', (req, res) => {
+  const orderId = String(req.params.id || '').trim();
+  if (!orderId) {
+    res.status(400).json({ error: 'Order ID is required.' });
+    return;
+  }
+  res.json({
+    orderId,
+    events: getOrderStateEvents(orderId),
+  });
+});
+
+app.get('/api/execution/reconcile', (_req, res) => {
+  const { portfolio, positions } = syncPortfolioAndPositions({ skipSnapshotWriteIfUnchanged: true });
+  const orders = getOrders(100);
+  res.json(reconcileExecutionState({ portfolio, positions, orders }));
+});
+
+app.post('/api/execution/reconcile', (req, res) => {
+  const actor = (req as AuthenticatedRequest).auth?.actor ?? 'RISK_OFFICER';
+  const { portfolio, positions } = syncPortfolioAndPositions({ forceRecord: false });
+  const orders = getOrders(100);
+  const report = reconcileExecutionState({ portfolio, positions, orders });
+  appendAuditLog({
+    category: 'RISK',
+    severity: report.status === 'CLEAN' ? 'INFO' : 'WARNING',
+    actor,
+    action: 'EXECUTION_RECONCILIATION',
+    details: `${report.status}: delta=$${report.equityDeltaUsd}, open=${report.openPositionsCount}, reconRequired=${report.reconciliationRequiredOrderIds.length}.`,
+  });
+  res.json(report);
+});
+
 app.post('/api/orders', async (req, res) => {
   const body = req.body as Partial<OrderRequest>;
   const sym = String(body.symbol || '');
@@ -2772,6 +2941,7 @@ app.post('/api/orders', async (req, res) => {
   const mode = getTradingMode();
   const { portfolio, positions } = syncPortfolioAndPositions();
   const riskConfig = getRiskConfig();
+  const actor = (req as AuthenticatedRequest).auth?.actor ?? 'EXECUTION_AGENT';
 
   const idempotencyKey = String(
     body.idempotencyKey || `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
@@ -2806,9 +2976,11 @@ app.post('/api/orders', async (req, res) => {
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
     tickerTimestampUtc: ticker.timestampUtc,
+    requireFreshTimestamp: true,
+    nowMs: Date.now(),
   };
 
-  const riskCheck = evaluateOrderRisk(orderReq, riskConfig, {
+  const riskContext = {
     tradingMode: mode,
     accountEquityUsd: portfolio.totalEquityUsd,
     availableBalanceUsd: portfolio.availableBalanceUsd,
@@ -2817,14 +2989,15 @@ app.post('/api/orders', async (req, res) => {
     currentDrawdownPct: portfolio.currentDrawdownPct,
     openPositions: positions,
     recentIdempotencyKeys: getRecentIdempotencyKeys(200),
-  });
+  };
 
+  const riskCheck = evaluateOrderRisk(orderReq, riskConfig, riskContext);
   const nowIso = new Date().toISOString();
-  const orderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
 
   if (!riskCheck.approved) {
+    const rejOrderId = `ORD-${Date.now()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
     insertOrder({
-      id: orderId,
+      id: rejOrderId,
       idempotencyKey,
       symbol: orderReq.symbol,
       exchange: orderReq.exchange,
@@ -2839,11 +3012,42 @@ app.post('/api/orders', async (req, res) => {
       feesUsd: 0,
       slippageUsd: 0,
       status: 'REJECTED',
+      lifecycleState: 'RISK_REJECTED',
       mode: 'PAPER',
       strategyName: orderReq.strategyName || 'Manual',
       riskDecision: riskCheck.decision,
       createdAtUtc: nowIso,
     });
+    appendOrderStateEvent(
+      transitionOrderState({
+        orderId: rejOrderId,
+        fromState: null,
+        toState: 'CREATED',
+        reason: 'Khởi tạo lệnh PAPER_SIMULATOR',
+        actor,
+        nowIso,
+      }),
+    );
+    appendOrderStateEvent(
+      transitionOrderState({
+        orderId: rejOrderId,
+        fromState: 'CREATED',
+        toState: 'VALIDATING',
+        reason: 'Kiểm định Deterministic Risk Engine',
+        actor: 'RISK_MANAGEMENT',
+        nowIso,
+      }),
+    );
+    appendOrderStateEvent(
+      transitionOrderState({
+        orderId: rejOrderId,
+        fromState: 'VALIDATING',
+        toState: 'RISK_REJECTED',
+        reason: riskCheck.reasons[0] || 'Risk Engine từ chối lệnh.',
+        actor: 'RISK_MANAGEMENT',
+        nowIso,
+      }),
+    );
     appendAuditLog({
       category: 'RISK',
       severity: 'WARNING',
@@ -2851,16 +3055,18 @@ app.post('/api/orders', async (req, res) => {
       action: 'ORDER_REJECTED',
       details: `Từ chối lệnh ${orderReq.symbol} ${orderReq.side}: ${riskCheck.reasons.join(' ')}`,
     });
-    res.status(400).json({ error: riskCheck.reasons[0] || 'Risk Engine từ chối lệnh.', riskCheck });
+    res.status(400).json({ error: riskCheck.reasons[0] || 'Risk Engine từ chối lệnh.', riskCheck, orderId: rejOrderId });
     return;
   }
 
   // Execute in Paper Ledger via unified risk-verified executor
   const filled = executeRiskVerifiedPaperOrder({
     orderReq,
+    riskConfig,
+    riskContext,
     riskCheck,
     markPrice: ticker.lastPrice,
-    actor: 'EXECUTION_AGENT',
+    actor,
     auditAction: 'PAPER_ORDER_FILLED',
   });
 
@@ -2868,6 +3074,9 @@ app.post('/api/orders', async (req, res) => {
   autoExecRuntime.broadcastAutoStatus?.();
   res.json({
     orderId: filled.orderId,
+    executionVenue: 'PAPER_SIMULATOR',
+    isSimulated: true,
+    lifecycleState: filled.lifecycleState,
     position: filled.position,
     riskCheck,
     portfolio: synced.portfolio,
@@ -3106,6 +3315,33 @@ app.post('/api/mode', (req, res) => {
     return;
   }
 
+  const currentMode = getTradingMode();
+  const emergencyState = getEmergencyStopState();
+  const actor = (req as AuthenticatedRequest).auth?.actor ?? 'USER';
+
+  // Emergency-Stop Unlock Governance: cannot leave EMERGENCY_STOP without explicit confirmation & unlock reason
+  if ((currentMode === 'EMERGENCY_STOP' || emergencyState.active) && requested !== 'EMERGENCY_STOP') {
+    const confirmEmergencyReset = req.body?.confirmEmergencyReset === true;
+    const unlockReason = String(req.body?.unlockReason || '').trim();
+    if (!confirmEmergencyReset || unlockReason.length < 3) {
+      res.status(400).json({
+        error:
+          'Đang khóa EMERGENCY_STOP: yêu cầu confirmEmergencyReset=true và lý do mở khóa (unlockReason >= 3 ký tự).',
+        code: 'EMERGENCY_UNLOCK_GOVERNANCE_REQUIRED',
+        emergencyStop: emergencyState,
+      });
+      return;
+    }
+    unlockEmergencyStopState(unlockReason, actor);
+    appendAuditLog({
+      category: 'EMERGENCY',
+      severity: 'WARNING',
+      actor,
+      action: 'EMERGENCY_STOP_UNLOCKED',
+      details: `Mở khóa EMERGENCY_STOP chuyển sang ${requested}. Lý do: ${unlockReason}`,
+    });
+  }
+
   if (requested === 'FULL_AUTO') {
     const tickers = marketFeed.getTickers();
     const healthy =
@@ -3116,7 +3352,13 @@ app.post('/api/mode', (req, res) => {
     }
   }
 
-  setTradingMode(requested);
+  if (requested === 'EMERGENCY_STOP') {
+    const reason = String(req.body?.reason || 'Chuyển chế độ sang EMERGENCY_STOP').trim();
+    activateEmergencyStopState(reason, actor);
+  } else {
+    setTradingMode(requested);
+  }
+
   const syncedAuto = syncAutoConfigWithTradingMode(requested, getAutoExecutionConfig());
   saveAutoExecutionConfig(syncedAuto);
   if (requested === 'FULL_AUTO' || requested === 'SEMI_AUTO') {
@@ -3126,11 +3368,12 @@ app.post('/api/mode', (req, res) => {
   } else {
     autoExecRuntime.lastSummary = `Đã chuyển chế độ sang ${requested} — Auto-Execution tạm dừng ở Standby.`;
   }
+  persistAutoRuntimeState();
 
   appendAuditLog({
     category: requested === 'EMERGENCY_STOP' ? 'EMERGENCY' : 'SYSTEM',
     severity: requested === 'EMERGENCY_STOP' ? 'CRITICAL' : 'INFO',
-    actor: 'USER',
+    actor,
     action: 'SET_TRADING_MODE',
     details: `Chuyển chế độ hệ thống sang ${requested}.`,
   });
@@ -3140,26 +3383,33 @@ app.post('/api/mode', (req, res) => {
   }
   res.json({
     tradingMode: requested,
+    emergencyStop: getEmergencyStopState(),
     autoExecutionStatus: buildAutoExecutionStatus(),
     stateRevision: getStateRevision(),
   });
 });
 
-app.post('/api/emergency-stop', (_req, res) => {
-  setTradingMode('EMERGENCY_STOP');
+app.post('/api/emergency-stop', (req, res) => {
+  const actor = (req as AuthenticatedRequest).auth?.actor ?? 'USER';
+  const reason =
+    String(req.body?.reason || '').trim() ||
+    'Người dùng kích hoạt EMERGENCY STOP — khóa toàn bộ lệnh mới.';
+  const emergencyStop = activateEmergencyStopState(reason, actor);
   const currentAuto = getAutoExecutionConfig();
   saveAutoExecutionConfig({ ...currentAuto, enabled: false });
   autoExecRuntime.lastSummary = 'EMERGENCY STOP đã kích hoạt — khóa toàn bộ Auto-Execution.';
+  persistAutoRuntimeState();
   appendAuditLog({
     category: 'EMERGENCY',
     severity: 'CRITICAL',
-    actor: 'USER',
+    actor,
     action: 'EMERGENCY_STOP_TRIGGERED',
-    details: 'Người dùng kích hoạt EMERGENCY STOP — khóa toàn bộ lệnh mới, giữ giám sát các vị thế hiện hữu.',
+    details: `${reason} Khóa toàn bộ lệnh mới, giữ giám sát các vị thế hiện hữu.`,
   });
   autoExecRuntime.broadcastAutoStatus?.();
   res.json({
     tradingMode: 'EMERGENCY_STOP',
+    emergencyStop,
     portfolio: getPortfolioSummary(),
     autoExecutionStatus: buildAutoExecutionStatus(),
     stateRevision: getStateRevision(),
@@ -3759,6 +4009,8 @@ app.get('/api/audit-logs', (_req, res) => {
   res.json({ logs: getAuditLogs(80) });
 });
 
+app.use(globalErrorMiddleware());
+
 // --- Server & Vite Middleware Setup ---
 
 async function startServer() {
@@ -3776,6 +4028,18 @@ async function startServer() {
     try {
       const reqUrl = new URL(req.url || '/', 'http://localhost');
       if (reqUrl.pathname === '/ws') {
+        if (isAuthEnforced(hasClaimedAuthCredential)) {
+          const queryToken = reqUrl.searchParams.get('token')?.trim();
+          const headersWithToken = queryToken
+            ? { ...req.headers, authorization: `Bearer ${queryToken}` }
+            : req.headers;
+          const auth = resolveAuthFromHeaders(headersWithToken, hasClaimedAuthCredential);
+          if (!auth.authenticated) {
+            socket.write('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+            socket.destroy();
+            return;
+          }
+        }
         wss.handleUpgrade(req, socket, head, (ws) => {
           wss.emit('connection', ws, req);
         });

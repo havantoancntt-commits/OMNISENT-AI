@@ -20,6 +20,7 @@ import type {
   ExchangeVerificationStatus,
 } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
+import { apiFetch } from '../lib/apiClient';
 
 interface ExchangeSecurityHubProps {
   exchanges: ExchangeInfo[];
@@ -159,7 +160,7 @@ export const ExchangeSecurityHub: React.FC<ExchangeSecurityHubProps> = ({
     setFeedback(null);
     setCanStageUnverified(false);
     try {
-      const res = await fetch('/api/exchanges/test', {
+      const res = await apiFetch('/api/exchanges/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -219,7 +220,7 @@ export const ExchangeSecurityHub: React.FC<ExchangeSecurityHubProps> = ({
     setSaving(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/exchanges/connect', {
+      const res = await apiFetch('/api/exchanges/connect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -282,7 +283,7 @@ export const ExchangeSecurityHub: React.FC<ExchangeSecurityHubProps> = ({
   const handleVerifyOne = async (id: string) => {
     setVerifyingId(id);
     try {
-      const res = await fetch(`/api/exchanges/${id}/verify`, { method: 'POST' });
+      const res = await apiFetch(`/api/exchanges/${id}/verify`, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         setFeedback({
@@ -319,7 +320,7 @@ export const ExchangeSecurityHub: React.FC<ExchangeSecurityHubProps> = ({
   const handleVerifyAll = async () => {
     setBatchVerifying(true);
     try {
-      const res = await fetch('/api/exchanges/verify-all', { method: 'POST' });
+      const res = await apiFetch('/api/exchanges/verify-all', { method: 'POST' });
       const data = await res.json();
       if (!res.ok) {
         setFeedback({ tone: 'error', text: data.error || t('sec.msg.batchFail') });
@@ -339,7 +340,12 @@ export const ExchangeSecurityHub: React.FC<ExchangeSecurityHubProps> = ({
   };
 
   const handleDisconnect = async (id: string) => {
-    await fetch(`/api/exchanges/${id}/disconnect`, { method: 'POST' });
+    const res = await apiFetch(`/api/exchanges/${id}/disconnect`, { method: 'POST' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      setFeedback({ tone: 'error', text: data.error || t('sec.msg.connectFailed') });
+      return;
+    }
     setFeedback({
       tone: 'success',
       text: t('sec.msg.disconnected', { name: getLocalizedExchangeSpec(id, locale).name }),

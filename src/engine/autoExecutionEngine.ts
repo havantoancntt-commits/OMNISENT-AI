@@ -16,8 +16,8 @@ import type {
 } from './types.ts';
 
 export const DEFAULT_AUTO_EXECUTION_CONFIG: AutoExecutionConfig = {
-  enabled: true,
-  executionMode: 'FULL_AUTO',
+  enabled: false,
+  executionMode: 'SEMI_AUTO',
   scanIntervalSeconds: 25,
   minConfluenceScore: 72,
   minExpectedValueR: 0.18,
@@ -402,6 +402,9 @@ export function evaluateAutoExecutionCandidate(
     idempotencyKey,
     dataStatus: ticker.dataStatus,
     tradingStatus: ticker.tradingStatus,
+    tickerTimestampUtc: ticker.timestampUtc,
+    requireFreshTimestamp: true,
+    nowMs,
   };
 
   const riskCheck = evaluateOrderRisk(orderRequest, riskConfig, {

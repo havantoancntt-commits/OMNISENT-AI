@@ -29,6 +29,7 @@ import type {
   TradingSignal,
 } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
+import { apiFetch } from '../lib/apiClient';
 
 const AGENT_CATEGORY_KEYS = {
   ALL: 'agents.cat.ALL',
@@ -125,7 +126,7 @@ export const AgentControlCenter: React.FC<AgentControlCenterProps> = ({
     if (!activeTicker) return;
     setGeminiLoading(true);
     try {
-      const res = await fetch('/api/ai/synthesize', {
+      const res = await apiFetch('/api/ai/synthesize', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -175,7 +176,7 @@ export const AgentControlCenter: React.FC<AgentControlCenterProps> = ({
     ]);
 
     try {
-      const res = await fetch('/api/ai/copilot/stream', {
+      const res = await apiFetch('/api/ai/copilot/stream', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

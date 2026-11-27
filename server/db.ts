@@ -8,8 +8,11 @@ import {
   syncAutoConfigWithTradingMode,
 } from '../src/engine/autoExecutionEngine.ts';
 import { createInitialAgentRegistry } from '../src/engine/multiAgentPipeline.ts';
+import type { OrderStateEvent } from '../src/engine/orderStateMachine.ts';
 import { dedupeSignalsByPair } from '../src/engine/pairSelection.ts';
+import { computeSingleLegCloseFee } from '../src/engine/precision.ts';
 import { DEFAULT_RISK_CONFIG } from '../src/engine/riskEngine.ts';
+import { resolveStorageBackendStatus, type StorageBackendStatus } from './dbAdapter.ts';
 import type {
   AgentLogEntry,
   AgentState,
@@ -155,13 +158,33 @@ export function getDatabaseDiagnostics(): {
   journalMode: string;
   isEphemeralStorage: boolean;
   dataDir: string;
+  schemaVersion: number;
   openPositions: number;
   totalOrders: number;
+  deadLetterJobs: number;
+  storageBackend: StorageBackendStatus;
 } {
   const check = db.prepare('PRAGMA quick_check;').get() as { quick_check?: string } | undefined;
   const journal = db.prepare('PRAGMA journal_mode;').get() as { journal_mode?: string } | undefined;
   const posCount = (db.prepare('SELECT COUNT(*) as c FROM positions').get() as { c: number }).c;
   const ordCount = (db.prepare('SELECT COUNT(*) as c FROM orders').get() as { c: number }).c;
+  let schemaVersion = 0;
+  let deadLetterJobs = 0;
+  try {
+    const verRow = db.prepare('SELECT MAX(version) as v FROM schema_migrations').get() as
+      | { v?: number | null }
+      | undefined;
+    schemaVersion = Number(verRow?.v ?? 0);
+  } catch {
+    schemaVersion = 0;
+  }
+  try {
+    deadLetterJobs = (
+      db.prepare("SELECT COUNT(*) as c FROM auto_jobs WHERE status = 'DEAD_LETTER'").get() as { c: number }
+    ).c;
+  } catch {
+    deadLetterJobs = 0;
+  }
   const normalizedTmp = path.resolve(os.tmpdir());
   const isEphemeralStorage =
     Boolean(process.env.VERCEL || process.env.VERCEL_ENV) ||
@@ -171,8 +194,11 @@ export function getDatabaseDiagnostics(): {
     journalMode: journal?.journal_mode ?? 'unknown',
     isEphemeralStorage,
     dataDir: DATA_DIR,
+    schemaVersion,
     openPositions: posCount,
     totalOrders: ordCount,
+    deadLetterJobs,
+    storageBackend: resolveStorageBackendStatus(),
   };
 }
 
@@ -249,6 +275,7 @@ export function initDatabase(): void {
       fees_usd REAL NOT NULL,
       slippage_usd REAL NOT NULL,
       status TEXT NOT NULL,
+      lifecycle_state TEXT NOT NULL DEFAULT 'FILLED',
       mode TEXT NOT NULL,
       strategy_name TEXT NOT NULL,
       risk_decision TEXT NOT NULL,
@@ -323,12 +350,14 @@ export function initDatabase(): void {
   }
 
   const nowIso = new Date().toISOString();
+  const todayUtc = getUtcDateKey();
+  const weekUtc = getIsoWeekKey();
 
   const existingMode = db.prepare('SELECT value FROM app_state WHERE key = ?').get('trading_mode');
   if (!existingMode) {
     db.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
       'trading_mode',
-      JSON.stringify('FULL_AUTO'),
+      JSON.stringify('PAPER'),
       nowIso,
     );
   }
@@ -356,7 +385,7 @@ export function initDatabase(): void {
     .get('portfolio_summary');
   if (!existingPortfolio) {
     const initialPortfolio: PortfolioSummary = {
-      mode: 'FULL_AUTO',
+      mode: 'PAPER',
       initialEquityUsd: 100_000,
       totalEquityUsd: 100_000,
       availableBalanceUsd: 100_000,
@@ -366,6 +395,10 @@ export function initDatabase(): void {
       totalFeesUsd: 0,
       dailyPnlPct: 0,
       weeklyPnlPct: 0,
+      dailyBaselineEquityUsd: 100_000,
+      dailyBaselineDateUtc: todayUtc,
+      weeklyBaselineEquityUsd: 100_000,
+      weeklyBaselineIsoWeek: weekUtc,
       peakEquityUsd: 100_000,
       currentDrawdownPct: 0,
       winCount: 0,
@@ -430,13 +463,21 @@ export function initDatabase(): void {
     }
   }
 
-  // Safe SQLite migration for positions.initial_stop_loss
+  // Safe SQLite migration for positions.initial_stop_loss and orders.lifecycle_state
   const posColumns = db
     .prepare('PRAGMA table_info(positions)')
     .all() as Array<{ name: string }>;
   if (!posColumns.some((c) => c.name === 'initial_stop_loss')) {
     db.exec('ALTER TABLE positions ADD COLUMN initial_stop_loss REAL');
   }
+  const orderColumns = db
+    .prepare('PRAGMA table_info(orders)')
+    .all() as Array<{ name: string }>;
+  if (!orderColumns.some((c) => c.name === 'lifecycle_state')) {
+    db.exec("ALTER TABLE orders ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'FILLED'");
+  }
+
+  runEnterpriseSqliteMigrations(nowIso);
 
   // Seed Exchange Registry
   const exCount = db.prepare('SELECT COUNT(*) as c FROM exchange_registry').get() as { c: number };
@@ -673,7 +714,7 @@ export function getTradingMode(): TradingMode {
   const row = db.prepare('SELECT value FROM app_state WHERE key = ?').get('trading_mode') as
     | { value: string }
     | undefined;
-  return row ? safeJsonParse<TradingMode>(row.value, 'FULL_AUTO') : 'FULL_AUTO';
+  return row ? safeJsonParse<TradingMode>(row.value, 'PAPER') : 'PAPER';
 }
 
 export function setTradingMode(mode: TradingMode): void {
@@ -685,18 +726,30 @@ export function setTradingMode(mode: TradingMode): void {
   bumpStateRevision();
 }
 
-export function resetTradingSession(initialMode: TradingMode = 'FULL_AUTO'): void {
+export function resetTradingSession(initialMode: TradingMode = 'PAPER'): void {
   runInTransaction(() => {
     const nowMs = Date.now();
     const nowIso = new Date(nowMs).toISOString();
+    const todayUtc = getUtcDateKey(nowMs);
+    const weekUtc = getIsoWeekKey(nowMs);
     db.exec(`
+      DELETE FROM order_state_events;
       DELETE FROM positions;
       DELETE FROM orders;
       DELETE FROM signals;
       DELETE FROM agent_logs;
       DELETE FROM pnl_snapshots;
       DELETE FROM auto_proposals;
+      DELETE FROM auto_jobs;
+      DELETE FROM auto_execution_state;
     `);
+    try {
+      db.prepare(
+        'UPDATE emergency_stop_state SET active = 0, unlocked_at_utc = ?, unlocked_by = ? WHERE id = 1',
+      ).run(nowIso, 'SESSION_RESET');
+    } catch {
+      // table guaranteed after migration
+    }
 
     setTradingMode(initialMode);
     saveAutoExecutionConfig(syncAutoConfigWithTradingMode(initialMode, DEFAULT_AUTO_EXECUTION_CONFIG));
@@ -712,6 +765,10 @@ export function resetTradingSession(initialMode: TradingMode = 'FULL_AUTO'): voi
       totalFeesUsd: 0,
       dailyPnlPct: 0,
       weeklyPnlPct: 0,
+      dailyBaselineEquityUsd: 100_000,
+      dailyBaselineDateUtc: todayUtc,
+      weeklyBaselineEquityUsd: 100_000,
+      weeklyBaselineIsoWeek: weekUtc,
       peakEquityUsd: 100_000,
       currentDrawdownPct: 0,
       winCount: 0,
@@ -950,7 +1007,10 @@ export function closePositionAtomically(params: {
         : (pos.entryPrice - closePrice) * pos.quantity
       ).toFixed(2),
     );
-    const closeFeeUsd = Number((pos.quantity * closePrice * 0.0005).toFixed(2));
+    const closeFeeUsd = computeSingleLegCloseFee({
+      quantity: pos.quantity,
+      closePrice,
+    });
     const realizedNetUsd = Number((grossPnlUsd - closeFeeUsd).toFixed(2));
     const initialRiskPerUnit = Math.abs(pos.entryPrice - (pos.initialStopLoss ?? pos.stopLoss));
     const initialRiskUsd = initialRiskPerUnit * pos.quantity;
@@ -971,8 +1031,9 @@ export function closePositionAtomically(params: {
     savePortfolioSummary(portfolio);
 
     try {
+      const closeOrderId = `ORD-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`;
       insertOrder({
-        id: `ORD-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`,
+        id: closeOrderId,
         idempotencyKey: `${params.idempotencyPrefix}-${pos.id}`,
         symbol: pos.symbol,
         exchange: pos.exchange,
@@ -987,10 +1048,20 @@ export function closePositionAtomically(params: {
         feesUsd: closeFeeUsd,
         slippageUsd: 0,
         status: 'FILLED',
+        lifecycleState: 'FILLED',
         mode: pos.mode,
         strategyName: `${pos.strategyName} [${params.closeReason}]`,
         riskDecision: 'APPROVE',
         createdAtUtc: closedAtUtc,
+      });
+      appendOrderStateEvent({
+        id: `OSE-CLS-${Date.now()}-${Math.random().toString(36).slice(2, 5).toUpperCase()}`,
+        orderId: closeOrderId,
+        fromState: 'SUBMITTED',
+        toState: 'FILLED',
+        reason: `Đóng vị thế ${pos.symbol} (${params.closeReason})`,
+        actor: params.actor,
+        timestampUtc: closedAtUtc,
       });
     } catch {
       // Ignore duplicate close idempotency key inside same transaction boundary
@@ -1022,8 +1093,8 @@ export function insertOrder(order: OrderRecord): void {
     INSERT INTO orders (
       id, idempotency_key, symbol, exchange, market_type, side, order_type,
       quantity, price, stop_loss, take_profit, leverage, fees_usd, slippage_usd,
-      status, mode, strategy_name, risk_decision, created_at_utc
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      status, lifecycle_state, mode, strategy_name, risk_decision, created_at_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     order.id,
     order.idempotencyKey,
@@ -1040,6 +1111,7 @@ export function insertOrder(order: OrderRecord): void {
     order.feesUsd,
     order.slippageUsd,
     order.status,
+    order.lifecycleState ?? (order.status === 'FILLED' ? 'FILLED' : order.status === 'REJECTED' ? 'REJECTED' : 'CREATED'),
     order.mode,
     order.strategyName,
     order.riskDecision,
@@ -1067,6 +1139,7 @@ export function getOrders(limit = 50): OrderRecord[] {
     fees_usd: number;
     slippage_usd: number;
     status: string;
+    lifecycle_state?: string | null;
     mode: string;
     strategy_name: string;
     risk_decision: string;
@@ -1089,6 +1162,7 @@ export function getOrders(limit = 50): OrderRecord[] {
     feesUsd: r.fees_usd,
     slippageUsd: r.slippage_usd,
     status: r.status as OrderRecord['status'],
+    lifecycleState: r.lifecycle_state ?? undefined,
     mode: r.mode as OrderRecord['mode'],
     strategyName: r.strategy_name,
     riskDecision: r.risk_decision as OrderRecord['riskDecision'],
@@ -1597,5 +1671,448 @@ export function expireStaleAutoProposals(nowIso: string): void {
     }
   }
 }
+
+// --- UTC Period Baselines, Enterprise Migrations, Order Events, Auto Jobs & Governance ---
+
+export function getUtcDateKey(ms = Date.now()): string {
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+export function getIsoWeekKey(ms = Date.now()): string {
+  const d = new Date(ms);
+  const utc = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
+  const dayNum = utc.getUTCDay() || 7;
+  utc.setUTCDate(utc.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(utc.getUTCFullYear(), 0, 1));
+  const weekNo = Math.ceil(((utc.getTime() - yearStart.getTime()) / 86_400_000 + 1) / 7);
+  return `${utc.getUTCFullYear()}-W${String(weekNo).padStart(2, '0')}`;
+}
+
+export function applyPortfolioPeriodBaselines(
+  portfolio: PortfolioSummary,
+  nowMs = Date.now(),
+): PortfolioSummary {
+  const todayUtc = getUtcDateKey(nowMs);
+  const weekUtc = getIsoWeekKey(nowMs);
+  const currentEq = portfolio.totalEquityUsd > 0 ? portfolio.totalEquityUsd : portfolio.initialEquityUsd;
+
+  const dailyBaselineDateUtc = portfolio.dailyBaselineDateUtc ?? todayUtc;
+  const dailyBaselineEquityUsd =
+    dailyBaselineDateUtc === todayUtc &&
+    typeof portfolio.dailyBaselineEquityUsd === 'number' &&
+    portfolio.dailyBaselineEquityUsd > 0
+      ? portfolio.dailyBaselineEquityUsd
+      : currentEq;
+
+  const weeklyBaselineIsoWeek = portfolio.weeklyBaselineIsoWeek ?? weekUtc;
+  const weeklyBaselineEquityUsd =
+    weeklyBaselineIsoWeek === weekUtc &&
+    typeof portfolio.weeklyBaselineEquityUsd === 'number' &&
+    portfolio.weeklyBaselineEquityUsd > 0
+      ? portfolio.weeklyBaselineEquityUsd
+      : currentEq;
+
+  const dailyPnlPct =
+    dailyBaselineEquityUsd > 0
+      ? Number((((currentEq - dailyBaselineEquityUsd) / dailyBaselineEquityUsd) * 100).toFixed(2))
+      : 0;
+  const weeklyPnlPct =
+    weeklyBaselineEquityUsd > 0
+      ? Number((((currentEq - weeklyBaselineEquityUsd) / weeklyBaselineEquityUsd) * 100).toFixed(2))
+      : 0;
+
+  return {
+    ...portfolio,
+    dailyBaselineDateUtc: todayUtc,
+    dailyBaselineEquityUsd,
+    weeklyBaselineIsoWeek: weekUtc,
+    weeklyBaselineEquityUsd,
+    dailyPnlPct,
+    weeklyPnlPct,
+  };
+}
+
+function createPreMigrationBackupIfNeeded(versionTarget: number): void {
+  if (!fs.existsSync(DB_PATH)) return;
+  try {
+    checkpointDatabase('TRUNCATE');
+    const backupPath = `${DB_PATH}.bak.v${versionTarget}.${Date.now()}`;
+    fs.copyFileSync(DB_PATH, backupPath);
+  } catch (err) {
+    console.warn(
+      '[DB] Pre-migration backup skipped:',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+}
+
+const SQLITE_V2_FALLBACK_SQL = `
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS order_state_events (
+  id TEXT PRIMARY KEY,
+  order_id TEXT NOT NULL,
+  from_state TEXT,
+  to_state TEXT NOT NULL,
+  reason TEXT NOT NULL,
+  actor TEXT NOT NULL,
+  metadata_json TEXT,
+  timestamp_utc TEXT NOT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_order_state_events_order_id ON order_state_events (order_id, timestamp_utc);
+CREATE TABLE IF NOT EXISTS auto_execution_state (
+  key TEXT PRIMARY KEY,
+  payload_json TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS auto_jobs (
+  id TEXT PRIMARY KEY,
+  idempotency_key TEXT UNIQUE NOT NULL,
+  status TEXT NOT NULL,
+  lock_owner TEXT,
+  locked_until_ms INTEGER,
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 3,
+  dead_letter_reason TEXT,
+  payload_json TEXT,
+  created_at_utc TEXT NOT NULL,
+  updated_at_utc TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_auto_jobs_status ON auto_jobs (status, locked_until_ms);
+CREATE TABLE IF NOT EXISTS emergency_stop_state (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  active INTEGER NOT NULL DEFAULT 0,
+  locked_at_utc TEXT,
+  reason TEXT,
+  triggered_by TEXT,
+  unlocked_at_utc TEXT,
+  unlocked_by TEXT
+);
+CREATE TABLE IF NOT EXISTS auth_credentials (
+  id TEXT PRIMARY KEY,
+  actor TEXT NOT NULL,
+  role TEXT NOT NULL,
+  password_hash TEXT NOT NULL,
+  created_at_utc TEXT NOT NULL
+);
+`;
+
+function runEnterpriseSqliteMigrations(nowIso: string): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS schema_migrations (
+      version INTEGER PRIMARY KEY,
+      name TEXT NOT NULL,
+      applied_at_utc TEXT NOT NULL
+    );
+  `);
+
+  const applied = db.prepare('SELECT version FROM schema_migrations WHERE version = 1').get() as
+    | { version: number }
+    | undefined;
+  if (!applied) {
+    createPreMigrationBackupIfNeeded(1);
+    const migPath = path.resolve(process.cwd(), 'server/migrations/sqlite/001_v2_enterprise_schema.sql');
+    const sql = fs.existsSync(migPath) ? fs.readFileSync(migPath, 'utf8') : SQLITE_V2_FALLBACK_SQL;
+    runInTransaction(() => {
+      db.exec(sql);
+      db.prepare('INSERT OR REPLACE INTO schema_migrations (version, name, applied_at_utc) VALUES (?, ?, ?)').run(
+        1,
+        '001_v2_enterprise_schema',
+        nowIso,
+      );
+    });
+  }
+
+  db.prepare(
+    'INSERT OR IGNORE INTO emergency_stop_state (id, active, locked_at_utc, reason, triggered_by) VALUES (1, ?, ?, ?, ?)',
+  ).run(0, null, null, null);
+}
+
+export function appendOrderStateEvent(event: OrderStateEvent): void {
+  db.prepare(`
+    INSERT INTO order_state_events (
+      id, order_id, from_state, to_state, reason, actor, metadata_json, timestamp_utc
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    event.id,
+    event.orderId,
+    event.fromState,
+    event.toState,
+    event.reason,
+    event.actor,
+    event.metadataJson ?? null,
+    event.timestampUtc,
+  );
+}
+
+export function getOrderStateEvents(orderId: string): OrderStateEvent[] {
+  const rows = db
+    .prepare('SELECT * FROM order_state_events WHERE order_id = ? ORDER BY timestamp_utc ASC')
+    .all(orderId) as Array<{
+    id: string;
+    order_id: string;
+    from_state: string | null;
+    to_state: string;
+    reason: string;
+    actor: string;
+    metadata_json: string | null;
+    timestamp_utc: string;
+  }>;
+  return rows.map((r) => ({
+    id: r.id,
+    orderId: r.order_id,
+    fromState: (r.from_state as OrderStateEvent['fromState']) ?? null,
+    toState: r.to_state as OrderStateEvent['toState'],
+    reason: r.reason,
+    actor: r.actor,
+    metadataJson: r.metadata_json ?? undefined,
+    timestampUtc: r.timestamp_utc,
+  }));
+}
+
+export interface PersistedAutoRuntimeState {
+  lastCycleAtUtc: string | null;
+  lastScanDurationMs: number | null;
+  lastSummary: string;
+  autoTradesTotalCount: number;
+  hourlyTradeTimestamps: number[];
+  symbolCooldowns: Record<string, number>;
+}
+
+const DEFAULT_PERSISTED_AUTO_RUNTIME: PersistedAutoRuntimeState = {
+  lastCycleAtUtc: null,
+  lastScanDurationMs: null,
+  lastSummary: 'Hệ thống PAPER Simulator sẵn sàng — bật Auto-Execution khi cần tự động hóa.',
+  autoTradesTotalCount: 0,
+  hourlyTradeTimestamps: [],
+  symbolCooldowns: {},
+};
+
+export function getAutoExecutionRuntimeState(): PersistedAutoRuntimeState {
+  try {
+    const row = db
+      .prepare('SELECT payload_json FROM auto_execution_state WHERE key = ?')
+      .get('runtime') as { payload_json: string } | undefined;
+    if (!row) return { ...DEFAULT_PERSISTED_AUTO_RUNTIME, hourlyTradeTimestamps: [], symbolCooldowns: {} };
+    const parsed = safeJsonParse<Partial<PersistedAutoRuntimeState>>(row.payload_json, {});
+    return {
+      ...DEFAULT_PERSISTED_AUTO_RUNTIME,
+      ...parsed,
+      hourlyTradeTimestamps: Array.isArray(parsed.hourlyTradeTimestamps) ? parsed.hourlyTradeTimestamps : [],
+      symbolCooldowns:
+        parsed.symbolCooldowns && typeof parsed.symbolCooldowns === 'object' ? parsed.symbolCooldowns : {},
+    };
+  } catch {
+    return { ...DEFAULT_PERSISTED_AUTO_RUNTIME, hourlyTradeTimestamps: [], symbolCooldowns: {} };
+  }
+}
+
+export function saveAutoExecutionRuntimeState(state: PersistedAutoRuntimeState): void {
+  db.prepare('INSERT OR REPLACE INTO auto_execution_state (key, payload_json, updated_at_utc) VALUES (?, ?, ?)').run(
+    'runtime',
+    JSON.stringify(state),
+    new Date().toISOString(),
+  );
+}
+
+export function acquireAutoJobLock(params: {
+  idempotencyKey: string;
+  lockOwner: string;
+  leaseMs?: number;
+  maxAttempts?: number;
+  payload?: unknown;
+}): { acquired: boolean; jobId: string; status: string } {
+  const nowMs = Date.now();
+  const nowIso = new Date(nowMs).toISOString();
+  const leaseUntilMs = nowMs + (params.leaseMs ?? 25_000);
+  const jobId = `JOB-${nowMs}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`;
+
+  return runInTransaction(() => {
+    const existing = db
+      .prepare('SELECT * FROM auto_jobs WHERE idempotency_key = ?')
+      .get(params.idempotencyKey) as
+      | { id: string; status: string; locked_until_ms: number | null; attempts: number; max_attempts: number }
+      | undefined;
+
+    if (!existing) {
+      db.prepare(`
+        INSERT INTO auto_jobs (
+          id, idempotency_key, status, lock_owner, locked_until_ms, attempts, max_attempts, payload_json, created_at_utc, updated_at_utc
+        ) VALUES (?, ?, 'RUNNING', ?, ?, 1, ?, ?, ?, ?)
+      `).run(
+        jobId,
+        params.idempotencyKey,
+        params.lockOwner,
+        leaseUntilMs,
+        params.maxAttempts ?? 3,
+        params.payload ? JSON.stringify(params.payload) : null,
+        nowIso,
+        nowIso,
+      );
+      return { acquired: true, jobId, status: 'RUNNING' };
+    }
+
+    if (existing.status === 'COMPLETED' || existing.status === 'DEAD_LETTER') {
+      return { acquired: false, jobId: existing.id, status: existing.status };
+    }
+    if (existing.status === 'RUNNING' && (existing.locked_until_ms ?? 0) > nowMs) {
+      return { acquired: false, jobId: existing.id, status: existing.status };
+    }
+    if (existing.attempts >= existing.max_attempts) {
+      db.prepare(
+        "UPDATE auto_jobs SET status = 'DEAD_LETTER', dead_letter_reason = ?, updated_at_utc = ? WHERE id = ?",
+      ).run('Max retry attempts exceeded', nowIso, existing.id);
+      return { acquired: false, jobId: existing.id, status: 'DEAD_LETTER' };
+    }
+
+    db.prepare(`
+      UPDATE auto_jobs
+      SET status = 'RUNNING', lock_owner = ?, locked_until_ms = ?, attempts = attempts + 1, updated_at_utc = ?
+      WHERE id = ?
+    `).run(params.lockOwner, leaseUntilMs, nowIso, existing.id);
+    return { acquired: true, jobId: existing.id, status: 'RUNNING' };
+  });
+}
+
+export function completeAutoJob(jobId: string): void {
+  db.prepare("UPDATE auto_jobs SET status = 'COMPLETED', locked_until_ms = NULL, updated_at_utc = ? WHERE id = ?").run(
+    new Date().toISOString(),
+    jobId,
+  );
+}
+
+export function failAutoJob(jobId: string, reason: string): void {
+  const nowIso = new Date().toISOString();
+  const row = db.prepare('SELECT attempts, max_attempts FROM auto_jobs WHERE id = ?').get(jobId) as
+    | { attempts: number; max_attempts: number }
+    | undefined;
+  const dead = Boolean(row && row.attempts >= row.max_attempts);
+  db.prepare(`
+    UPDATE auto_jobs
+    SET status = ?, locked_until_ms = NULL, dead_letter_reason = ?, updated_at_utc = ?
+    WHERE id = ?
+  `).run(dead ? 'DEAD_LETTER' : 'RETRY_WAIT', reason.slice(0, 300), nowIso, jobId);
+}
+
+export interface EmergencyStopRecord {
+  active: boolean;
+  lockedAtUtc: string | null;
+  reason: string | null;
+  triggeredBy: string | null;
+  unlockedAtUtc: string | null;
+  unlockedBy: string | null;
+}
+
+export function getEmergencyStopState(): EmergencyStopRecord {
+  try {
+    const row = db.prepare('SELECT * FROM emergency_stop_state WHERE id = 1').get() as
+      | {
+          active: number;
+          locked_at_utc: string | null;
+          reason: string | null;
+          triggered_by: string | null;
+          unlocked_at_utc: string | null;
+          unlocked_by: string | null;
+        }
+      | undefined;
+    if (!row) {
+      return {
+        active: getTradingMode() === 'EMERGENCY_STOP',
+        lockedAtUtc: null,
+        reason: null,
+        triggeredBy: null,
+        unlockedAtUtc: null,
+        unlockedBy: null,
+      };
+    }
+    return {
+      active: row.active === 1 || getTradingMode() === 'EMERGENCY_STOP',
+      lockedAtUtc: row.locked_at_utc,
+      reason: row.reason,
+      triggeredBy: row.triggered_by,
+      unlockedAtUtc: row.unlocked_at_utc,
+      unlockedBy: row.unlocked_by,
+    };
+  } catch {
+    return {
+      active: getTradingMode() === 'EMERGENCY_STOP',
+      lockedAtUtc: null,
+      reason: null,
+      triggeredBy: null,
+      unlockedAtUtc: null,
+      unlockedBy: null,
+    };
+  }
+}
+
+export function activateEmergencyStopState(reason: string, triggeredBy: string): EmergencyStopRecord {
+  const nowIso = new Date().toISOString();
+  db.prepare(`
+    INSERT OR REPLACE INTO emergency_stop_state (
+      id, active, locked_at_utc, reason, triggered_by, unlocked_at_utc, unlocked_by
+    ) VALUES (1, 1, ?, ?, ?, NULL, NULL)
+  `).run(nowIso, reason.slice(0, 300), triggeredBy);
+  setTradingMode('EMERGENCY_STOP');
+  return getEmergencyStopState();
+}
+
+export function unlockEmergencyStopState(unlockReason: string, unlockedBy: string): EmergencyStopRecord {
+  const nowIso = new Date().toISOString();
+  db.prepare(`
+    UPDATE emergency_stop_state
+    SET active = 0, unlocked_at_utc = ?, unlocked_by = ?, reason = COALESCE(reason, ?)
+    WHERE id = 1
+  `).run(nowIso, unlockedBy, unlockReason.slice(0, 300));
+  return getEmergencyStopState();
+}
+
+export function hasClaimedAuthCredential(): boolean {
+  try {
+    const row = db.prepare('SELECT COUNT(*) as c FROM auth_credentials').get() as { c: number };
+    return row.c > 0;
+  } catch {
+    return false;
+  }
+}
+
+export function saveAuthCredential(params: {
+  id: string;
+  actor: string;
+  role: string;
+  passwordHash: string;
+}): void {
+  db.prepare(`
+    INSERT OR REPLACE INTO auth_credentials (id, actor, role, password_hash, created_at_utc)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(params.id, params.actor, params.role, params.passwordHash, new Date().toISOString());
+}
+
+export function listAuthCredentials(): Array<{
+  id: string;
+  actor: string;
+  role: string;
+  passwordHash: string;
+  createdAtUtc: string;
+}> {
+  const rows = db.prepare('SELECT * FROM auth_credentials ORDER BY created_at_utc ASC').all() as Array<{
+    id: string;
+    actor: string;
+    role: string;
+    password_hash: string;
+    created_at_utc: string;
+  }>;
+  return rows.map((r) => ({
+    id: r.id,
+    actor: r.actor,
+    role: r.role,
+    passwordHash: r.password_hash,
+    createdAtUtc: r.created_at_utc,
+  }));
+}
+
 
 

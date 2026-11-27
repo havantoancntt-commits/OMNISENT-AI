@@ -9,6 +9,7 @@ export type TradingMode =
   | 'EMERGENCY_STOP';
 
 export type DataSourceStatus = 'LIVE_EXCHANGE' | 'UNAVAILABLE' | 'STALE' | 'UNKNOWN';
+export type StandardizedFeedHealthState = 'LIVE' | 'AGING' | 'STALE' | 'OFFLINE' | 'ERROR';
 
 export type MarketRegime =
   | 'STRONG_BULL'
@@ -218,6 +219,7 @@ export interface OrderRequest {
   dataStatus: DataSourceStatus;
   tradingStatus?: 'TRADING' | 'HALTED' | 'DELISTING_RISK';
   tickerTimestampUtc?: number;
+  requireFreshTimestamp?: boolean;
   nowMs?: number;
 }
 
@@ -253,6 +255,9 @@ export interface RiskCheckResult {
   estimatedFeesUsd: number;
   estimatedSlippageUsd: number;
   liquidationPriceEst: number | null;
+  liquidationIsEstimate?: boolean;
+  liquidationMethod?: string;
+  liquidationDisclaimer?: string;
   checkedAtUtc: string;
 }
 
@@ -273,6 +278,9 @@ export interface Position {
   unrealizedPnlUsd: number;
   unrealizedPnlPct: number;
   liquidationPrice: number | null;
+  liquidationIsEstimate?: boolean;
+  liquidationMarginMode?: 'ISOLATED' | 'CROSS';
+  liquidationDisclaimer?: string;
   fundingPaidUsd: number;
   strategyName: string;
   mode: 'PAPER' | 'LIVE';
@@ -321,6 +329,7 @@ export interface OrderRecord {
   feesUsd: number;
   slippageUsd: number;
   status: 'FILLED' | 'REJECTED' | 'CANCELLED' | 'OPEN';
+  lifecycleState?: string;
   mode: 'PAPER' | 'LIVE';
   strategyName: string;
   riskDecision: RiskDecision;
@@ -338,6 +347,10 @@ export interface PortfolioSummary {
   totalFeesUsd: number;
   dailyPnlPct: number;
   weeklyPnlPct: number;
+  dailyBaselineEquityUsd?: number;
+  dailyBaselineDateUtc?: string;
+  weeklyBaselineEquityUsd?: number;
+  weeklyBaselineIsoWeek?: string;
   peakEquityUsd: number;
   currentDrawdownPct: number;
   winCount: number;
@@ -424,6 +437,19 @@ export interface TradingSignal {
   htfAlignment?: HtfAlignment;
   expectedValueR?: number;
   recommendedRiskPct?: number;
+  provenance?: {
+    source: string;
+    exchange: string;
+    marketType: MarketType;
+    symbol: string;
+    price: number;
+    quoteTimestampUtc: number;
+    dataStatus: DataSourceStatus;
+    qualityStatus: 'VERIFIED' | 'DEGRADED' | 'INVALID';
+  };
+  uncertaintyNote?: string;
+  invalidationConditions?: string[];
+  isProbabilisticConfidenceCalibrated?: false;
 }
 
 export type HtfAlignment = 'ALIGNED_BULL' | 'ALIGNED_BEAR' | 'NEUTRAL' | 'COUNTER_TREND';

@@ -523,6 +523,9 @@ export function runMultiAgentDecisionPipeline(params: {
       idempotencyKey: signalId,
       dataStatus: ticker.dataStatus,
       tradingStatus: ticker.tradingStatus,
+      tickerTimestampUtc: ticker.timestampUtc,
+      requireFreshTimestamp: true,
+      nowMs: now.getTime(),
     },
     riskConfig,
     riskContext,
@@ -775,5 +778,32 @@ export function runMultiAgentDecisionPipeline(params: {
     htfAlignment: quantAlpha?.htfAlignment ?? 'NEUTRAL',
     expectedValueR: evR,
     recommendedRiskPct: convictionRiskPct,
+    provenance: {
+      source: ticker.sourceLabel,
+      exchange: ticker.exchange,
+      marketType: ticker.marketType,
+      symbol: ticker.symbol,
+      price: ticker.lastPrice,
+      quoteTimestampUtc: ticker.timestampUtc,
+      dataStatus: ticker.dataStatus,
+      qualityStatus:
+        tickerReport.valid && ohlcvReport.valid
+          ? 'VERIFIED'
+          : ticker.dataStatus === 'LIVE_EXCHANGE'
+            ? 'DEGRADED'
+            : 'INVALID',
+    },
+    uncertaintyNote:
+      'Điểm tin cậy tổng hợp là chỉ số xếp hạng định lượng nội bộ, KHÔNG phải xác suất thắng đã hiệu chuẩn theo thực nghiệm.',
+    invalidationConditions: [
+      direction === 'LONG'
+        ? `Giá đóng nến 1H phá xuống dưới Stop Loss (${formatAssetPrice(stopLoss)})`
+        : direction === 'SHORT'
+          ? `Giá đóng nến 1H vượt lên trên Stop Loss (${formatAssetPrice(stopLoss)})`
+          : 'Không có đồng thuận đa tác nhân — giữ nguyên trạng thái đứng ngoài',
+      'Spread sổ lệnh giãn > 35 bps hoặc feed mất đồng bộ > 30 giây',
+      `Tín hiệu hết hạn vào ${expiresIso}`,
+    ],
+    isProbabilisticConfidenceCalibrated: false,
   };
 }

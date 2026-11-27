@@ -1,8 +1,17 @@
 node_modules/
 build/
 dist/
+dev-dist/
 coverage/
+.data/
+*.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.db.bak.*
+*.corrupt.*
 .DS_Store
 *.log
 .env*
 !.env.example
+
