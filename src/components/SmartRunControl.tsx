@@ -3,13 +3,11 @@ import {
   Bot,
   CheckCircle2,
   ChevronDown,
-  Cpu,
   Pause,
   Play,
   Radar,
   RefreshCw,
   RotateCcw,
-  Search,
   ShieldCheck,
   SlidersHorizontal,
   Sparkles,
@@ -17,12 +15,6 @@ import {
   XCircle,
   Zap,
 } from 'lucide-react';
-import { formatAssetPrice } from '../engine/symbolSearch';
-import {
-  dedupeTickersByPair,
-  parsePairSelection,
-  serializePairSelection,
-} from '../engine/pairSelection';
 import type {
   AutoExecutionConfig,
   AutoExecutionEngineStatus,
@@ -32,7 +24,7 @@ import type {
 } from '../engine/types';
 import { useI18n } from '../i18n/I18nContext';
 
-export type SmartRunMode = 'ANALYZE_SINGLE' | 'SMART_SCAN_BEST' | 'ANALYZE_AND_PAPER_EXECUTE';
+export type SmartRunMode = 'SMART_SCAN_BEST' | 'ANALYZE_AND_PAPER_EXECUTE';
 
 export interface SmartRunSummary {
   chosenSymbol: string;
@@ -48,10 +40,6 @@ export interface SmartRunSummary {
 
 interface SmartRunControlProps {
   tickers: MarketTicker[];
-  selectedTicker?: MarketTicker | null;
-  selectedSymbol: string;
-  selectedMarketType: MarketType;
-  selectedExchange?: string;
   tradingMode: TradingMode;
   runMode: SmartRunMode;
   includeGemini: boolean;
@@ -59,8 +47,6 @@ interface SmartRunControlProps {
   runStage: number; // 0 idle, 1..4 stages
   lastSummary: SmartRunSummary | null;
   onChangeRunMode: (mode: SmartRunMode) => void;
-  onChangeTargetSymbol: (symbol: string, marketType: MarketType, exchange?: string) => void;
-  onOpenGlobalSearch?: () => void;
   onToggleGemini: (val: boolean) => void;
   onExecuteRun: (overrideMode?: SmartRunMode) => void;
   onResetSession: () => Promise<void>;
@@ -78,17 +64,10 @@ interface SmartRunControlProps {
 const MODE_DEFS: Array<{
   id: SmartRunMode;
   shortTag: string;
-  titleKey: 'smartRun.modeAnalyzeTitle' | 'smartRun.modeScanTitle' | 'smartRun.modeExecTitle';
-  descKey: 'smartRun.modeAnalyzeDesc' | 'smartRun.modeScanDesc' | 'smartRun.modeExecDesc';
+  titleKey: 'smartRun.modeScanTitle' | 'smartRun.modeExecTitle';
+  descKey: 'smartRun.modeScanDesc' | 'smartRun.modeExecDesc';
   icon: React.ComponentType<{ className?: string }>;
 }> = [
-  {
-    id: 'ANALYZE_SINGLE',
-    shortTag: 'AI',
-    titleKey: 'smartRun.modeAnalyzeTitle',
-    descKey: 'smartRun.modeAnalyzeDesc',
-    icon: Cpu,
-  },
   {
     id: 'SMART_SCAN_BEST',
     shortTag: 'SCAN',
@@ -107,10 +86,6 @@ const MODE_DEFS: Array<{
 
 export const SmartRunControl: React.FC<SmartRunControlProps> = ({
   tickers,
-  selectedTicker = null,
-  selectedSymbol,
-  selectedMarketType,
-  selectedExchange,
   tradingMode,
   runMode,
   includeGemini,
@@ -118,8 +93,6 @@ export const SmartRunControl: React.FC<SmartRunControlProps> = ({
   runStage,
   lastSummary,
   onChangeRunMode,
-  onChangeTargetSymbol,
-  onOpenGlobalSearch,
   onToggleGemini,
   onExecuteRun,
   onResetSession,
@@ -173,14 +146,6 @@ export const SmartRunControl: React.FC<SmartRunControlProps> = ({
   }, [open]);
 
   const activeModeMeta = modeOptions.find((m) => m.id === runMode) ?? modeOptions[0];
-  const uniqueTickers = dedupeTickersByPair(tickers);
-  const activeSelectValue = selectedTicker
-    ? serializePairSelection(selectedTicker)
-    : serializePairSelection({
-        symbol: selectedSymbol,
-        marketType: selectedMarketType,
-        exchange: selectedExchange ?? uniqueTickers[0]?.exchange ?? '',
-      });
 
   const isEmergency = tradingMode === 'EMERGENCY_STOP';
   const isAutoArmed = Boolean(autoExecutionStatus?.engineRunning && !isEmergency);
@@ -613,54 +578,8 @@ export const SmartRunControl: React.FC<SmartRunControlProps> = ({
               })}
             </div>
 
-            {/* Target Pair + Gemini Toggle */}
+            {/* Gemini Toggle */}
             <div className="mt-3 space-y-2.5 border-t border-slate-800 pt-3">
-              {runMode !== 'SMART_SCAN_BEST' && (
-                <div>
-                  <div className="mb-1 flex items-center justify-between gap-2">
-                    <label
-                      htmlFor="smart-run-symbol"
-                      className="block text-[11px] font-medium text-slate-400"
-                    >
-                      {t('smartRun.targetPairLabel')}
-                    </label>
-                    {onOpenGlobalSearch && (
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setOpen(false);
-                          onOpenGlobalSearch();
-                        }}
-                        className="flex items-center gap-1 text-[11px] font-semibold text-cyan-300 hover:text-cyan-200"
-                      >
-                        <Search className="h-3 w-3" />
-                        <span>{t('smartRun.searchOtherCoin')}</span>
-                      </button>
-                    )}
-                  </div>
-                  <select
-                    id="smart-run-symbol"
-                    value={activeSelectValue}
-                    onChange={(e) => {
-                      const parsed = parsePairSelection(e.target.value);
-                      if (parsed) {
-                        onChangeTargetSymbol(parsed.symbol, parsed.marketType, parsed.exchange);
-                      }
-                    }}
-                    className="min-h-[40px] w-full rounded-lg border border-slate-800 bg-[#070B12] px-3 text-xs text-slate-100"
-                  >
-                    {uniqueTickers.map((tk) => {
-                      const val = serializePairSelection(tk);
-                      return (
-                        <option key={val} value={val}>
-                          {tk.symbol} · {tk.marketType} · {tk.exchange} ({formatAssetPrice(tk.lastPrice)})
-                        </option>
-                      );
-                    })}
-                  </select>
-                </div>
-              )}
-
               <label className="flex min-h-[36px] cursor-pointer items-center justify-between rounded-lg border border-slate-800 bg-[#070B12] px-3 py-2 text-xs text-slate-200">
                 <span>{t('smartRun.geminiToggle')}</span>
                 <input

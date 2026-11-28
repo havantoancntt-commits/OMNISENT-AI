@@ -3,11 +3,13 @@ import type {
   BacktestResult,
   FullMarketOpportunity,
   MarketBreadthStats,
+  MarketTicker,
   MarketType,
   OrderSide,
   ScannerAssetUniverse,
   ScannerSetupArchetype,
   ScannerStrategyFocus,
+  SignalQualityTier,
   TradingSignal,
 } from './types.ts';
 
@@ -107,6 +109,43 @@ export function isTradFiSyntheticPerp(baseAsset: string): boolean {
   return TRADFI_SYNTHETIC_PERP_BASES.has(baseAsset.trim().toUpperCase());
 }
 
+export function isValidMarketDirectoryQuote(
+  entry: MarketDirectoryEntry,
+  options?: { maxAgeMs?: number; nowMs?: number },
+): boolean {
+  if (!Number.isFinite(entry.lastPrice) || entry.lastPrice <= 0) return false;
+  if (!Number.isFinite(entry.volume24hUsd) || entry.volume24hUsd <= 0) return false;
+  if (!Number.isFinite(entry.change24hPct) || Math.abs(entry.change24hPct) > 400) return false;
+
+  const hasBid = Number.isFinite(entry.bidPrice) && entry.bidPrice > 0;
+  const hasAsk = Number.isFinite(entry.askPrice) && entry.askPrice > 0;
+  if (hasBid && hasAsk) {
+    if (entry.bidPrice > entry.askPrice) {
+      return false; // Reject crossed order books
+    }
+    const mid = (entry.bidPrice + entry.askPrice) / 2;
+    if (mid > 0 && Math.abs(entry.lastPrice - mid) / mid > 0.03) {
+      return false; // Reject stale/disconnected lastPrice vs top-of-book mid (>3% skew)
+    }
+  }
+
+  const rawUpdatedAtMs = (entry as MarketDirectoryEntry & { updatedAtMs?: number; timestampUtc?: number }).updatedAtMs
+    ?? (entry as MarketDirectoryEntry & { timestampUtc?: number }).timestampUtc;
+  if (
+    options?.maxAgeMs !== undefined &&
+    options.maxAgeMs > 0 &&
+    typeof rawUpdatedAtMs === 'number' &&
+    Number.isFinite(rawUpdatedAtMs)
+  ) {
+    const now = options.nowMs ?? Date.now();
+    if (now - rawUpdatedAtMs > options.maxAgeMs) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 export function computeDirectorySpreadBps(entry: MarketDirectoryEntry): number {
   if (!(entry.lastPrice > 0) || !(entry.askPrice >= entry.bidPrice) || !(entry.bidPrice > 0)) {
     return 0;
@@ -163,7 +202,7 @@ export function computeDirectoryLiquidityScore(
 
 export function computeMarketBreadth(entries: MarketDirectoryEntry[]): MarketBreadthStats {
   const valid = entries.filter(
-    (e) => e.lastPrice > 0 && e.volume24hUsd > 0 && !isStablecoinBase(e.baseAsset),
+    (e) => isValidMarketDirectoryQuote(e) && !isStablecoinBase(e.baseAsset),
   );
   const uniqueSymbols = new Set<string>();
   const exchanges = new Set<string>();
@@ -252,7 +291,8 @@ export function preScreenMarketDirectory(
   const scored: FullMarketOpportunity[] = [];
 
   for (const entry of entries) {
-    if (!(entry.lastPrice > 0) || !(entry.volume24hUsd >= minVolumeUsd)) continue;
+    if (!isValidMarketDirectoryQuote(entry)) continue;
+    if (entry.volume24hUsd < minVolumeUsd) continue;
     if (isStablecoinBase(entry.baseAsset)) continue;
     if (assetUniverse === 'CRYPTO' && isTradFiSyntheticPerp(entry.baseAsset)) continue;
     if (marketType !== 'ALL' && entry.marketType !== marketType) continue;
@@ -400,12 +440,34 @@ export function preScreenMarketDirectory(
   return deduped;
 }
 
+export function classifySignalQualityTier(params: {
+  signalState: TradingSignal['state'];
+  direction: OrderSide | 'NO_TRADE';
+  confluenceScore: number;
+  expectedValueR: number;
+  htfAlignment: FullMarketOpportunity['htfAlignment'];
+}): SignalQualityTier {
+  const { signalState, direction, confluenceScore, expectedValueR, htfAlignment } = params;
+  if (signalState === 'FAILED' || signalState === 'EXPIRED' || direction === 'NO_TRADE') {
+    return 'REJECTED';
+  }
+  if (signalState === 'APPROVED') {
+    const htfAligned = htfAlignment === 'ALIGNED_BULL' || htfAlignment === 'ALIGNED_BEAR';
+    if (confluenceScore >= 72 && expectedValueR >= 0.25 && htfAligned) {
+      return 'INSTITUTIONAL_A_PLUS';
+    }
+    return 'VALIDATED_A';
+  }
+  return 'WATCHLIST_B';
+}
+
 export function buildDeepVerifiedOpportunity(params: {
   stage1: FullMarketOpportunity;
   signal: TradingSignal;
   backtest: BacktestResult | null;
+  liveTicker?: MarketTicker | null;
 }): FullMarketOpportunity {
-  const { stage1, signal, backtest } = params;
+  const { stage1, signal, backtest, liveTicker } = params;
   const htfAlignment = signal.htfAlignment ?? 'NEUTRAL';
   const confluenceScore = signal.quantAlpha?.confluenceScore ?? signal.quantScore;
   const expectedValueR = signal.expectedValueR ?? 0;
@@ -440,17 +502,47 @@ export function buildDeepVerifiedOpportunity(params: {
     ).toFixed(1),
   );
 
+  const hasFreshLivePrice = Boolean(liveTicker && Number.isFinite(liveTicker.lastPrice) && liveTicker.lastPrice > 0);
+  const resolvedPrice = hasFreshLivePrice ? liveTicker!.lastPrice : stage1.lastPrice;
+  const resolvedBid =
+    hasFreshLivePrice && liveTicker!.bidPrice > 0 ? liveTicker!.bidPrice : stage1.bidPrice;
+  const resolvedAsk =
+    hasFreshLivePrice && liveTicker!.askPrice >= resolvedBid
+      ? liveTicker!.askPrice
+      : stage1.askPrice;
+  const resolvedSpreadBps =
+    hasFreshLivePrice && Number.isFinite(liveTicker!.spreadBps)
+      ? liveTicker!.spreadBps
+      : stage1.spreadBps;
+  const qualityTier = classifySignalQualityTier({
+    signalState: signal.state,
+    direction: signal.direction,
+    confluenceScore,
+    expectedValueR,
+    htfAlignment,
+  });
+
   return {
     ...stage1,
+    lastPrice: resolvedPrice,
+    bidPrice: resolvedBid,
+    askPrice: resolvedAsk,
+    spreadBps: resolvedSpreadBps,
     deepVerified: true,
     direction: signal.direction,
     signalState: signal.state,
+    qualityTier,
+    timeHorizon: signal.timeHorizon,
+    stopHuntRiskScore: signal.quantIntel?.liquidationRadar?.stopHuntRiskScore ?? null,
+    winProbabilityPct: signal.quantIntel
+      ? Number((signal.quantIntel.kelly.winProbabilityUsed * 100).toFixed(1))
+      : null,
     confluenceScore,
     htfAlignment,
     expectedValueR,
     riskReward: signal.riskReward,
     recommendedRiskPct: signal.recommendedRiskPct ?? 0.5,
-    entryPrice: stage1.lastPrice,
+    entryPrice: resolvedPrice,
     stopLoss: signal.stopLoss,
     takeProfit: signal.takeProfitLevels[1] ?? signal.takeProfitLevels[0] ?? 0,
     backtestWinRatePct: btWin,
@@ -465,11 +557,18 @@ export function buildDeepVerifiedOpportunity(params: {
 export function rankDeepOpportunities(
   items: FullMarketOpportunity[],
   directionFilter: OrderSide | 'ALL' = 'ALL',
+  onlyApproved = false,
 ): FullMarketOpportunity[] {
-  const filtered =
+  let filtered =
     directionFilter === 'ALL'
       ? items
       : items.filter((item) => item.direction === directionFilter);
+
+  if (onlyApproved) {
+    filtered = filtered.filter(
+      (item) => item.signalState === 'APPROVED' && item.direction !== 'NO_TRADE',
+    );
+  }
 
   const sorted = [...filtered].sort((a, b) => {
     const aApp = a.signalState === 'APPROVED' && a.direction !== 'NO_TRADE' ? 1 : 0;

@@ -77,8 +77,6 @@ const vi = {
   'app.room3d.title': 'Phòng Trading 3D — Hội Đồng Robot Phản Biện',
   'app.room3d.subtitle':
     '19 nhân viên robot tranh luận đa chiều quanh bàn hologram 3D, hiển thị tín hiệu đã kiểm duyệt Risk Engine.',
-  'app.room3d.searchAria': 'Tìm kiếm bất kỳ coin nào cho Phòng 3D',
-  'app.room3d.searchBtn': 'Tìm coin ⌘K',
   'app.room3d.selectAria': 'Chọn cặp hiển thị phòng trading 3D',
   'app.drawer.title': 'Công cụ & Bảo mật',
   'app.drawer.closeAria': 'Đóng menu',
@@ -92,58 +90,25 @@ const vi = {
   'smartRun.ariaConfig': 'Cấu hình chế độ Smart Run',
   'smartRun.dialogAria': 'Bảng điều khiển Smart Run',
   'smartRun.runningFallback': 'Đang RUN...',
-  'smartRun.modeAnalyzeTitle': 'Phân tích & Phản biện cặp chọn',
-  'smartRun.modeAnalyzeDesc':
-    'Kích hoạt 19 Robot phân tích và tranh luận 7 bước (không tự vào lệnh).',
   'smartRun.modeScanTitle': 'Quét thông minh toàn thị trường',
   'smartRun.modeScanDesc':
-    'Tự động quét top cặp thanh khoản cao, chọn cơ hội đạt chuẩn Risk Engine tốt nhất.',
-  'smartRun.modeExecTitle': 'Phân tích + Tự khớp Paper (Risk Gate)',
+    'Tự động quét đa sàn 2 tầng (1H + 4H + Backtest), chọn cơ hội đạt chuẩn Risk Engine tốt nhất.',
+  'smartRun.modeExecTitle': 'Quét Toàn Sàn + Tự khớp Paper (Risk Gate)',
   'smartRun.modeExecDesc':
-    'Chỉ tự động mở lệnh Paper nếu tín hiệu đạt APPROVED & Risk Engine duyệt.',
-  'smartRun.stage1': 'Dữ liệu',
+    'Quét toàn thị trường trước và chỉ tự động mở lệnh Paper khi tín hiệu đạt APPROVED & Risk Engine duyệt.',
+  'smartRun.stage1': 'Quét sàn',
   'smartRun.stage2': '19 Robot',
   'smartRun.stage3': 'Risk Gate',
   'smartRun.stage4': 'Hoàn tất',
-  'smartRun.targetPairLabel': 'Cặp mục tiêu khi RUN',
-  'smartRun.searchOtherCoin': 'Tìm coin khác (⌘K)',
   'smartRun.geminiToggle': 'Đính kèm Gemini 4 Hydrogen Deep Thesis',
   'smartRun.resettingBtn': 'Đang xóa...',
   'smartRun.resetZeroBtn': 'Reset về 0',
   'smartRun.executeNowBtn': 'Thực thi RUN ngay',
   'smartRun.unifiedTitle': 'Trung tâm Thực thi AI & 9-Gate Auto',
   'smartRun.autoSectionTitle': 'Auto-Pilot 9 Cổng (Đồng bộ trực tiếp)',
-  'smartRun.manualSectionTitle': 'Chế độ RUN Thủ công (19 Robot)',
+  'smartRun.manualSectionTitle': 'Chế độ Quét & Thực thi Thủ công',
   'smartRun.autoActiveBadge': 'AUTO',
   'smartRun.autoStandbyBadge': 'CHỜ',
-
-  // CoinSearchModal
-  'search.title': 'Tìm kiếm bất kỳ coin nào trên thị trường',
-  'search.livePairsCount': '{count} cặp Live',
-  'search.syncingExchanges': 'Đang đồng bộ sàn...',
-  'search.closeAria': 'Đóng tìm kiếm coin',
-  'search.inputPlaceholder':
-    'Nhập mã hoặc tên coin (vd: PEPE, bittensor, TAO, sol perp, eth okx...)',
-  'search.inputAria': 'Ô tìm kiếm coin toàn thị trường',
-  'search.clearAria': 'Xóa từ khóa tìm kiếm',
-  'search.clearBtn': 'Xóa',
-  'search.filterAll': 'Tất cả',
-  'search.filterExchangeAria': 'Lọc theo sàn trong tìm kiếm',
-  'search.filterAllExchanges': 'Mọi sàn',
-  'search.sortVolume': 'Thanh khoản',
-  'search.sortGainer': 'Tăng mạnh',
-  'search.sortLoser': 'Giảm sâu',
-  'search.loadingText':
-    'Đang quét danh mục Live trên Binance, Bybit, OKX, Kraken, Coinbase...',
-  'search.emptyTitle': 'Không tìm thấy cặp giao dịch khớp "{query}"',
-  'search.emptyTip':
-    'Thử nhập mã ticker ngắn gọn hơn (vd: BTC, PEPE, TAO, WIF, ONDO) hoặc đặt lại bộ lọc sàn.',
-  'search.ariaRunAiFor': 'Chọn và RUN AI cho {symbol}',
-  'search.footerSource':
-    'Dữ liệu trực tiếp từ Binance, Bybit, OKX, Kraken & Coinbase Advanced',
-  'search.footerShortcut': '↑↓ Di chuyển · Enter Chọn · Esc Đóng',
-  'search.errorActivate':
-    'Không thể kích hoạt dữ liệu cho {symbol}. Vui lòng thử lại.',
 
   // CommandCenter
   'cmd.ariaOverview': 'Tổng quan tài khoản và hệ thống',
@@ -161,9 +126,9 @@ const vi = {
   'cmd.room3d.title': 'Phòng Trading 3D & Hội đồng Robot Phản Biện',
   'cmd.room3d.desc':
     '19 nhân viên robot phân tích, phản biện chéo quanh bàn hội đồng 3D và kiểm duyệt qua Risk Enforcer.',
-  'cmd.market.title': 'Thị trường & Tìm Coin',
-  'cmd.market.searchAria': 'Tìm kiếm bất kỳ coin nào Command K',
-  'cmd.market.searchBtn': 'Tìm ⌘K',
+  'cmd.market.title': 'Tín hiệu Toàn Thị Trường',
+  'cmd.market.scanAria': 'Quét tín hiệu toàn thị trường',
+  'cmd.market.scanBtn': 'Quét Toàn Sàn',
   'cmd.market.scannerBtn': 'Scanner',
   'cmd.ai.title': 'Phân tích AI',
   'cmd.ai.scanTitle':
@@ -383,6 +348,7 @@ const vi = {
   'radar.filter.cryptoOnly': 'Crypto',
   'radar.filter.allAssets': 'Cả Stock/Hàng hóa',
   'radar.filter.minVolAria': 'Khối lượng 24 giờ tối thiểu',
+  'radar.filter.onlyApproved': 'Chỉ APPROVED',
   'radar.emptyLoading': 'Đang quét và tính điểm định lượng toàn bộ thị trường...',
   'radar.emptyFiltered':
     'Không có cặp nào khớp điều kiện lọc hiện tại. Hãy giảm ngưỡng Vol 24h hoặc chọn "Mọi loại" rồi bấm Quét Sâu.',
@@ -414,25 +380,21 @@ const vi = {
   'radar.err.network': 'Lỗi kết nối máy chủ quét thị trường.',
 
   // MarketScanner & CandlestickChart
-  'scanner.title': 'Universal Market Scanner',
-  'scanner.watchlistCount': 'Watchlist {count} cặp',
+  'scanner.title': 'Luồng Tín Hiệu Toàn Sàn',
+  'scanner.signalStreamCount': '{count} tín hiệu lọc',
   'scanner.indexedSuffix': ' · Toàn sàn {total}',
-  'scanner.quickSearchAria': 'Mở hộp thoại tìm coin nhanh Command K',
-  'scanner.quickSearchBtn': 'Tìm ⌘K',
-  'scanner.searchPlaceholder': 'Nhập bất kỳ coin: PEPE, TAO, bittensor...',
-  'scanner.searchAria': 'Tìm kiếm coin hoặc sàn giao dịch',
-  'scanner.clearSearchAria': 'Xóa bộ lọc tìm kiếm',
   'scanner.filterAll': 'Tất cả',
-  'scanner.filterExchangeAria': 'Lọc theo sàn giao dịch',
+  'scanner.filterApproved': 'APPROVED',
+  'scanner.filterExchangeAria': 'Lọc tín hiệu theo sàn giao dịch',
   'scanner.allExchanges': 'Mọi sàn',
-  'scanner.sortAria': 'Sắp xếp danh sách coin',
-  'scanner.sortDefault': 'Mặc định',
+  'scanner.sortAria': 'Sắp xếp danh sách tín hiệu',
+  'scanner.sortAlpha': 'Alpha Score',
   'scanner.sortVol': 'Vol 24h',
   'scanner.sortChange': '24h %',
-  'scanner.globalExpandHeader': 'Mở rộng toàn thị trường ({count})',
-  'scanner.noMatch':
-    'Không có cặp khớp "{query}". Thử mã ticker khác (vd: PEPE, TAO, WIF, ONDO).',
-  'scanner.clickToAnalyze': 'Nhấn để phân tích',
+  'scanner.activePosLabel': 'Vị thế mở:',
+  'scanner.quickLoadBtn': 'Nạp',
+  'scanner.noSignalMatch':
+    'Chưa có tín hiệu khớp bộ lọc hiện tại. Hãy bấm "Quét Sâu Toàn Thị Trường" ở bảng trên hoặc chuyển về "Tất cả".',
   'scanner.runningAi': 'Đang RUN...',
   'scanner.runAi': 'RUN AI',
   'scanner.chart.loading': 'Đang chờ dữ liệu nến OHLCV...',
@@ -476,8 +438,6 @@ const vi = {
   'agents.syncedLabel': 'Đang đồng bộ: {symbol} · {exchange} · {marketType}',
   'agents.defaultDesc':
     'Tổng hợp đồng thuận, phát hiện xung đột giữa các tác nhân và bắt buộc qua Risk Management.',
-  'agents.searchAria': 'Tìm kiếm bất kỳ coin nào để phân tích AI',
-  'agents.searchBtn': 'Tìm coin ⌘K',
   'agents.selectPairAria': 'Chọn cặp tiền để chạy Multi-Agent Pipeline',
   'agents.runningPipeline': 'Đang phân tích...',
   'agents.runPipeline': 'Chạy Pipeline',
@@ -523,7 +483,6 @@ const vi = {
   'quant.subtitle':
     'Kiểm định tuần tự không look-ahead bias, có tính phí taker, slippage và funding.',
   'quant.pairLabel': 'Cặp giao dịch ({exchange})',
-  'quant.searchOther': 'Tìm coin khác (⌘K)',
   'quant.strategyLabel': 'Chiến lược định lượng',
   'quant.timeframeLabel': 'Khung thời gian',
   'quant.marketLabel': 'Loại thị trường',
@@ -1034,8 +993,6 @@ const en: Record<keyof typeof vi, string> = {
   'app.room3d.title': '3D Trading Floor — Multi-Agent Investment Council',
   'app.room3d.subtitle':
     '19 specialized autonomous agents debating across the 3D holographic desk under deterministic Risk Engine governance.',
-  'app.room3d.searchAria': 'Search any coin for the 3D Trading Floor',
-  'app.room3d.searchBtn': 'Search ⌘K',
   'app.room3d.selectAria': 'Select pair for 3D Trading Floor',
   'app.drawer.title': 'Tools & Security',
   'app.drawer.closeAria': 'Close menu',
@@ -1049,58 +1006,25 @@ const en: Record<keyof typeof vi, string> = {
   'smartRun.ariaConfig': 'Configure Smart Run mode',
   'smartRun.dialogAria': 'Smart Run Command Panel',
   'smartRun.runningFallback': 'Running...',
-  'smartRun.modeAnalyzeTitle': 'Analyze & Debate Selected Pair',
-  'smartRun.modeAnalyzeDesc':
-    'Convenes 19 agents for a 7-step adversarial debate (zero order execution).',
   'smartRun.modeScanTitle': 'Smart Full-Market Alpha Scan',
   'smartRun.modeScanDesc':
-    'Screens high-liquidity venues globally and isolates the highest Risk-Engine-qualified setup.',
-  'smartRun.modeExecTitle': 'Analyze + Auto Paper Fill (Risk Gate)',
+    'Screens multi-exchange pairs in 2 tiers (1H + 4H + Backtest) and isolates the top Risk-Engine-qualified setup.',
+  'smartRun.modeExecTitle': 'Full-Market Scan + Auto Paper Fill (Risk Gate)',
   'smartRun.modeExecDesc':
-    'Routes a Paper order only when consensus is APPROVED and cleared by the Risk Engine.',
-  'smartRun.stage1': 'Feed',
+    'Scans global markets first and routes a Paper fill only when consensus is APPROVED and cleared by the Risk Engine.',
+  'smartRun.stage1': 'Market Scan',
   'smartRun.stage2': '19 Agents',
   'smartRun.stage3': 'Risk Gate',
   'smartRun.stage4': 'Done',
-  'smartRun.targetPairLabel': 'Target Pair on RUN',
-  'smartRun.searchOtherCoin': 'Search Other Pair (⌘K)',
   'smartRun.geminiToggle': 'Attach Gemini 4 Hydrogen Deep Thesis',
   'smartRun.resettingBtn': 'Resetting...',
   'smartRun.resetZeroBtn': 'Reset to Clean',
   'smartRun.executeNowBtn': 'Execute RUN Now',
   'smartRun.unifiedTitle': 'Unified AI & 9-Gate Auto Engine',
   'smartRun.autoSectionTitle': '9-Gate Auto-Pilot (Live Sync)',
-  'smartRun.manualSectionTitle': 'Manual Smart RUN (19 Agents)',
+  'smartRun.manualSectionTitle': 'Manual Market Scan & Execution',
   'smartRun.autoActiveBadge': 'AUTO',
   'smartRun.autoStandbyBadge': 'STBY',
-
-  // CoinSearchModal
-  'search.title': 'Global Multi-Exchange Market Search',
-  'search.livePairsCount': '{count} Live Pairs',
-  'search.syncingExchanges': 'Syncing venues...',
-  'search.closeAria': 'Close market search modal',
-  'search.inputPlaceholder':
-    'Search ticker or asset name (e.g., PEPE, bittensor, TAO, sol perp, eth okx...)',
-  'search.inputAria': 'Global cryptocurrency search input',
-  'search.clearAria': 'Clear search query',
-  'search.clearBtn': 'Clear',
-  'search.filterAll': 'All',
-  'search.filterExchangeAria': 'Filter search results by exchange',
-  'search.filterAllExchanges': 'All Venues',
-  'search.sortVolume': 'Liquidity',
-  'search.sortGainer': 'Top Gainers',
-  'search.sortLoser': 'Top Losers',
-  'search.loadingText':
-    'Indexing live markets across Binance, Bybit, OKX, Kraken & Coinbase...',
-  'search.emptyTitle': 'No market pairs matched "{query}"',
-  'search.emptyTip':
-    'Try a shorter ticker symbol (e.g., BTC, PEPE, TAO, WIF, ONDO) or reset the venue filter.',
-  'search.ariaRunAiFor': 'Select and RUN AI analysis for {symbol}',
-  'search.footerSource':
-    'Live market data from Binance, Bybit, OKX, Kraken & Coinbase Advanced',
-  'search.footerShortcut': '↑↓ Navigate · Enter Select · Esc Close',
-  'search.errorActivate':
-    'Unable to initialize live telemetry for {symbol}. Please try again.',
 
   // CommandCenter
   'cmd.ariaOverview': 'Portfolio and system telemetry overview',
@@ -1118,9 +1042,9 @@ const en: Record<keyof typeof vi, string> = {
   'cmd.room3d.title': '3D Trading Floor & Adversarial AI Council',
   'cmd.room3d.desc':
     '19 specialized autonomous agents debating across the 3D conference table with deterministic Risk Enforcer oversight.',
-  'cmd.market.title': 'Markets & Pair Search',
-  'cmd.market.searchAria': 'Search any cryptocurrency Command K',
-  'cmd.market.searchBtn': 'Search ⌘K',
+  'cmd.market.title': 'Full-Market Signals',
+  'cmd.market.scanAria': 'Scan full-market signals',
+  'cmd.market.scanBtn': 'Scan Market',
   'cmd.market.scannerBtn': 'Scanner',
   'cmd.ai.title': 'AI Assessment',
   'cmd.ai.scanTitle':
@@ -1342,6 +1266,7 @@ const en: Record<keyof typeof vi, string> = {
   'radar.filter.cryptoOnly': 'Crypto Only',
   'radar.filter.allAssets': 'Incl. Equities/Commodities',
   'radar.filter.minVolAria': 'Minimum 24h volume threshold',
+  'radar.filter.onlyApproved': 'Approved Only',
   'radar.emptyLoading': 'Scanning and scoring quantitative breadth across global venues...',
   'radar.emptyFiltered':
     'No markets matched active filters. Lower the Min Volume threshold or switch to "All Types" and run Deep Market Scan.',
@@ -1373,25 +1298,21 @@ const en: Record<keyof typeof vi, string> = {
   'radar.err.network': 'Network error contacting full-market scanner.',
 
   // MarketScanner & CandlestickChart
-  'scanner.title': 'Universal Market Scanner',
-  'scanner.watchlistCount': 'Watchlist {count} pairs',
+  'scanner.title': 'Full-Market Signal Stream',
+  'scanner.signalStreamCount': '{count} filtered signals',
   'scanner.indexedSuffix': ' · {total} indexed',
-  'scanner.quickSearchAria': 'Open quick coin search Command K',
-  'scanner.quickSearchBtn': 'Search ⌘K',
-  'scanner.searchPlaceholder': 'Search any coin: PEPE, TAO, bittensor...',
-  'scanner.searchAria': 'Search ticker or exchange',
-  'scanner.clearSearchAria': 'Clear search filter',
   'scanner.filterAll': 'All',
-  'scanner.filterExchangeAria': 'Filter watchlist by exchange',
+  'scanner.filterApproved': 'APPROVED',
+  'scanner.filterExchangeAria': 'Filter signals by exchange',
   'scanner.allExchanges': 'All Venues',
-  'scanner.sortAria': 'Sort watchlist pairs',
-  'scanner.sortDefault': 'Default',
+  'scanner.sortAria': 'Sort signal stream',
+  'scanner.sortAlpha': 'Alpha Score',
   'scanner.sortVol': '24h Vol',
   'scanner.sortChange': '24h %',
-  'scanner.globalExpandHeader': 'Market-Wide Live Matches ({count})',
-  'scanner.noMatch':
-    'No markets matched "{query}". Try another ticker (e.g., PEPE, TAO, WIF, ONDO).',
-  'scanner.clickToAnalyze': 'Click to analyze',
+  'scanner.activePosLabel': 'Open:',
+  'scanner.quickLoadBtn': 'Load',
+  'scanner.noSignalMatch':
+    'No signals match active filters. Run "Deep Market Scan" above or switch filter back to "All".',
   'scanner.runningAi': 'Running...',
   'scanner.runAi': 'RUN AI',
   'scanner.chart.loading': 'Awaiting live OHLCV candle stream...',
@@ -1436,8 +1357,6 @@ const en: Record<keyof typeof vi, string> = {
   'agents.syncedLabel': 'Synchronized: {symbol} · {exchange} · {marketType}',
   'agents.defaultDesc':
     'Aggregates consensus, detects inter-agent conflicts, and enforces Risk Management gatekeeping.',
-  'agents.searchAria': 'Search any coin for AI multi-agent analysis',
-  'agents.searchBtn': 'Search ⌘K',
   'agents.selectPairAria': 'Select trading pair for Multi-Agent Pipeline',
   'agents.runningPipeline': 'Analyzing...',
   'agents.runPipeline': 'Run Pipeline',
@@ -1483,7 +1402,6 @@ const en: Record<keyof typeof vi, string> = {
   'quant.subtitle':
     'Sequential look-ahead-free simulation factoring real taker fees, slippage, and perpetual funding.',
   'quant.pairLabel': 'Trading Pair ({exchange})',
-  'quant.searchOther': 'Search Pair (⌘K)',
   'quant.strategyLabel': 'Quantitative Strategy',
   'quant.timeframeLabel': 'Timeframe',
   'quant.marketLabel': 'Market Type',

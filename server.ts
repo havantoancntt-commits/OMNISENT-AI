@@ -159,6 +159,7 @@ import type {
   FullMarketScanResponse,
   MarketTicker,
   MarketType,
+  OrderBookSnapshot,
   OrderRequest,
   OrderSide,
   PnlHistoryPoint,
@@ -970,6 +971,7 @@ async function runFullMarketAlphaScan(params: {
   strategyFocus?: ScannerStrategyFocus;
   direction?: OrderSide | 'ALL';
   assetUniverse?: ScannerAssetUniverse;
+  onlyApproved?: boolean;
   limit?: number;
 }): Promise<{
   response: FullMarketScanResponse;
@@ -1023,6 +1025,7 @@ async function runFullMarketAlphaScan(params: {
   const strategyFocus = params.strategyFocus ?? 'HIGH_PROFIT_ALPHA';
   const direction = params.direction ?? 'ALL';
   const assetUniverse: ScannerAssetUniverse = params.assetUniverse === 'ALL' ? 'ALL' : 'CRYPTO';
+  const onlyApproved = Boolean(params.onlyApproved);
   const requestedLimit = Math.min(40, Math.max(6, params.limit ?? (params.scanMode === 'DEEP' ? 18 : 20)));
 
   const breadth = computeMarketBreadth(directory);
@@ -1042,7 +1045,15 @@ async function runFullMarketAlphaScan(params: {
     return {
       response: {
         scanMode: 'FAST',
-        filters: { marketType, exchange, minVolumeUsd, strategyFocus, direction, assetUniverse },
+        filters: {
+          marketType,
+          exchange,
+          minVolumeUsd,
+          strategyFocus,
+          direction,
+          assetUniverse,
+          onlyApproved: false,
+        },
         breadth,
         stage1CandidatesCount: stage1.length,
         deepEvaluatedCount: 0,
@@ -1055,8 +1066,6 @@ async function runFullMarketAlphaScan(params: {
   }
 
   // Stage 2: Deep Multi-Timeframe (1H + 4H + L2 Book + Empirical 160-bar Backtest) in bounded batches of 6.
-  // When global account is still in ANALYSIS_ONLY, evaluate setup risk rules against PAPER mode so valid
-  // quantitative setups accurately report APPROVED vs REJECTED instead of blanket-rejecting the whole market.
   const riskConfig = getRiskConfig();
   const effectiveMode = getTradingMode();
   const screenerRiskMode: TradingMode =
@@ -1066,9 +1075,12 @@ async function runFullMarketAlphaScan(params: {
   const recentIdempKeys = getRecentIdempotencyKeys();
 
   const evaluatedResults: Array<{
+    cand: FullMarketOpportunity;
     opp: FullMarketOpportunity;
     ticker: MarketTicker;
     signal: TradingSignal;
+    candles1h: Candle[];
+    orderBook: OrderBookSnapshot;
   }> = [];
 
   const batchSize = 6;
@@ -1090,8 +1102,9 @@ async function runFullMarketAlphaScan(params: {
           ]);
           if (candles.length < 24) return null;
 
+          const existingLiveTicker = marketFeed.getTicker(cand.symbol, cand.marketType, cand.exchange);
           const baseTicker =
-            marketFeed.getTicker(cand.symbol, cand.marketType, cand.exchange) ??
+            existingLiveTicker ??
             directoryEntryToSyntheticTicker(
               dirMatch ?? {
                 symbol: cand.symbol,
@@ -1117,12 +1130,52 @@ async function runFullMarketAlphaScan(params: {
               cand.liquidityScore,
             );
 
-          const liveCandles = getLiveStitchedCandles(candles, baseTicker, '1h');
+          // Synchronize live L2 Order Book top-of-book & latest candle close for directory-discovered coins
+          const bestBid = orderBook.bids[0]?.price ?? 0;
+          const bestAsk = orderBook.asks[0]?.price ?? 0;
+          const validL2Book = bestBid > 0 && bestAsk >= bestBid;
+          const obMid = validL2Book ? (bestBid + bestAsk) / 2 : 0;
+          const latestCandleClose = candles[candles.length - 1]?.close ?? 0;
+
+          const syncedPrice =
+            existingLiveTicker && existingLiveTicker.lastPrice > 0
+              ? existingLiveTicker.lastPrice
+              : obMid > 0
+                ? obMid
+                : latestCandleClose > 0
+                  ? latestCandleClose
+                  : baseTicker.lastPrice;
+          const syncedBid =
+            existingLiveTicker && existingLiveTicker.bidPrice > 0
+              ? existingLiveTicker.bidPrice
+              : validL2Book
+                ? bestBid
+                : baseTicker.bidPrice;
+          const syncedAsk =
+            existingLiveTicker && existingLiveTicker.askPrice >= syncedBid
+              ? existingLiveTicker.askPrice
+              : validL2Book
+                ? bestAsk
+                : baseTicker.askPrice;
+          const syncedSpreadBps =
+            syncedPrice > 0 && syncedAsk >= syncedBid && syncedBid > 0
+              ? Number((((syncedAsk - syncedBid) / syncedPrice) * 10_000).toFixed(2))
+              : baseTicker.spreadBps;
+
+          const syncedBaseTicker: MarketTicker = {
+            ...baseTicker,
+            lastPrice: syncedPrice,
+            bidPrice: syncedBid,
+            askPrice: syncedAsk,
+            spreadBps: syncedSpreadBps,
+          };
+
+          const liveCandles = getLiveStitchedCandles(candles, syncedBaseTicker, '1h');
           const ind = computeAllIndicators(liveCandles);
           const liveTicker: MarketTicker = {
-            ...baseTicker,
+            ...syncedBaseTicker,
             rsi14: Number(ind.rsi14.toFixed(1)),
-            regime: detectMarketRegime(ind, baseTicker.lastPrice, cand.volatility24hPct),
+            regime: detectMarketRegime(ind, syncedBaseTicker.lastPrice, cand.volatility24hPct),
           };
 
           const signal = runMultiAgentDecisionPipeline({
@@ -1176,8 +1229,9 @@ async function runFullMarketAlphaScan(params: {
             stage1: cand,
             signal,
             backtest: backtestRes,
+            liveTicker,
           });
-          return { opp, ticker: liveTicker, signal };
+          return { cand, opp, ticker: liveTicker, signal, candles1h: liveCandles, orderBook };
         } catch {
           return null;
         }
@@ -1189,10 +1243,80 @@ async function runFullMarketAlphaScan(params: {
     }
   }
 
-  const ranked = rankDeepOpportunities(
-    evaluatedResults.map((r) => r.opp),
-    direction,
-  );
+  // Stage 2B: Multi-Timeframe Tactical 15m + 1H Verification when 1H+4H yields < 2 APPROVED setups
+  const approved1hCount = evaluatedResults.filter(
+    (r) => r.signal.state === 'APPROVED' && r.signal.direction !== 'NO_TRADE',
+  ).length;
+  if (approved1hCount < 2 && evaluatedResults.length > 0) {
+    const nonApprovedPool = [...evaluatedResults]
+      .filter((r) => !(r.signal.state === 'APPROVED' && r.signal.direction !== 'NO_TRADE'))
+      .sort((a, b) => b.opp.compositeAlphaScore - a.opp.compositeAlphaScore)
+      .slice(0, 6);
+
+    await Promise.all(
+      nonApprovedPool.map(async (item) => {
+        try {
+          const res15m = await marketFeed.getCandles(
+            item.ticker.symbol,
+            item.ticker.marketType,
+            '15m',
+            item.ticker.exchange,
+          );
+          if (res15m.candles.length < 30) return;
+          const live15m = getLiveStitchedCandles(res15m.candles, item.ticker, '15m');
+          const sig15m = runMultiAgentDecisionPipeline({
+            ticker: item.ticker,
+            candles: live15m,
+            htfCandles: item.candles1h,
+            orderBook: item.orderBook,
+            riskConfig,
+            riskContext: {
+              tradingMode: screenerRiskMode,
+              accountEquityUsd: portfolio.totalEquityUsd,
+              availableBalanceUsd: portfolio.availableBalanceUsd,
+              dailyPnlPct: portfolio.dailyPnlPct,
+              weeklyPnlPct: portfolio.weeklyPnlPct,
+              currentDrawdownPct: portfolio.currentDrawdownPct,
+              openPositions: positions,
+              recentIdempotencyKeys: recentIdempKeys,
+            },
+            agents,
+          });
+
+          if (sig15m.state === 'APPROVED' && sig15m.direction !== 'NO_TRADE') {
+            const tacticalSignal: TradingSignal = {
+              ...sig15m,
+              timeHorizon: '15m + 1H HTF',
+            };
+            const tacticalOpp = buildDeepVerifiedOpportunity({
+              stage1: item.cand,
+              signal: tacticalSignal,
+              backtest: null,
+              liveTicker: item.ticker,
+            });
+            item.signal = tacticalSignal;
+            item.opp = {
+              ...tacticalOpp,
+              backtestWinRatePct: item.opp.backtestWinRatePct,
+              backtestProfitFactor: item.opp.backtestProfitFactor,
+              backtestReturnPct: item.opp.backtestReturnPct,
+              backtestTradesCount: item.opp.backtestTradesCount,
+              reasoningSummary: `[15m+1H] ${sig15m.reasoningSummary}`,
+            };
+          }
+        } catch {
+          // non-fatal tactical fallback
+        }
+      }),
+    );
+  }
+
+  const allEvaluatedOpps = evaluatedResults.map((r) => r.opp);
+  const approvedCount = allEvaluatedOpps.filter(
+    (o) => o.signalState === 'APPROVED' && o.direction !== 'NO_TRADE',
+  ).length;
+  const ranked = rankDeepOpportunities(allEvaluatedOpps, direction, onlyApproved);
+
   const topOpp = ranked[0];
   const topRaw = topOpp
     ? evaluatedResults.find(
@@ -1203,23 +1327,32 @@ async function runFullMarketAlphaScan(params: {
       )
     : evaluatedResults[0];
 
-  const approvedCount = ranked.filter(
-    (o) => o.signalState === 'APPROVED' && o.direction !== 'NO_TRADE',
-  ).length;
-
   const evaluatedByKey = new Map(
     evaluatedResults.map((r) => [`${r.opp.symbol}|${r.opp.marketType}|${r.opp.exchange}`, r]),
   );
   const rankedRaw = ranked
     .map((o) => evaluatedByKey.get(`${o.symbol}|${o.marketType}|${o.exchange}`))
-    .filter((item): item is { opp: FullMarketOpportunity; ticker: MarketTicker; signal: TradingSignal } =>
-      Boolean(item),
-    );
+    .filter((item): item is {
+      cand: FullMarketOpportunity;
+      opp: FullMarketOpportunity;
+      ticker: MarketTicker;
+      signal: TradingSignal;
+      candles1h: Candle[];
+      orderBook: OrderBookSnapshot;
+    } => Boolean(item));
 
   return {
     response: {
       scanMode: 'DEEP',
-      filters: { marketType, exchange, minVolumeUsd, strategyFocus, direction, assetUniverse },
+      filters: {
+        marketType,
+        exchange,
+        minVolumeUsd,
+        strategyFocus,
+        direction,
+        assetUniverse,
+        onlyApproved,
+      },
       breadth,
       stage1CandidatesCount: stage1.length,
       deepEvaluatedCount: evaluatedResults.length,
@@ -1229,7 +1362,7 @@ async function runFullMarketAlphaScan(params: {
       opportunities: ranked,
     },
     bestRaw: topRaw ? { ticker: topRaw.ticker, signal: topRaw.signal } : undefined,
-    rankedRaw,
+    rankedRaw: rankedRaw.map((r) => ({ opp: r.opp, ticker: r.ticker, signal: r.signal })),
   };
 }
 
@@ -1245,6 +1378,7 @@ app.get('/api/market/scan', async (req, res) => {
     const direction = rawDir === 'LONG' || rawDir === 'SHORT' ? (rawDir as OrderSide) : 'ALL';
     const assetUniverse: ScannerAssetUniverse =
       String(req.query.assetUniverse || 'CRYPTO').toUpperCase() === 'ALL' ? 'ALL' : 'CRYPTO';
+    const onlyApproved = String(req.query.onlyApproved || '').toLowerCase() === 'true';
     const limit = Number(req.query.limit ?? 20);
 
     const { response } = await runFullMarketAlphaScan({
@@ -1255,6 +1389,7 @@ app.get('/api/market/scan', async (req, res) => {
       strategyFocus,
       direction,
       assetUniverse,
+      onlyApproved,
       limit,
     });
     res.json(response);
@@ -1276,6 +1411,7 @@ app.post('/api/market/scan', async (req, res) => {
     const direction = rawDir === 'LONG' || rawDir === 'SHORT' ? (rawDir as OrderSide) : 'ALL';
     const assetUniverse: ScannerAssetUniverse =
       String(req.body?.assetUniverse || 'CRYPTO').toUpperCase() === 'ALL' ? 'ALL' : 'CRYPTO';
+    const onlyApproved = Boolean(req.body?.onlyApproved);
     const limit = Number(req.body?.limit ?? (scanMode === 'DEEP' ? 18 : 24));
 
     const { response } = await runFullMarketAlphaScan({
@@ -1286,6 +1422,7 @@ app.post('/api/market/scan', async (req, res) => {
       strategyFocus,
       direction,
       assetUniverse,
+      onlyApproved,
       limit,
     });
 
@@ -1295,7 +1432,7 @@ app.post('/api/market/scan', async (req, res) => {
         severity: 'INFO',
         actor: 'MARKET_SCANNER',
         action: 'FULL_MARKET_DEEP_SCAN',
-        details: `Quét ${response.breadth.totalScannedPairs} cặp toàn thị trường -> kiểm định ${response.deepEvaluatedCount} cặp (1H+4H+Backtest), tìm thấy ${response.approvedCount} tín hiệu đạt chuẩn Risk Engine trong ${response.durationMs}ms.`,
+        details: `Quét ${response.breadth.totalScannedPairs} cặp toàn thị trường -> kiểm định ${response.deepEvaluatedCount} cặp (1H+4H+15m+Backtest), tìm thấy ${response.approvedCount} tín hiệu đạt chuẩn Risk Engine trong ${response.durationMs}ms.`,
       });
     }
 
@@ -2634,7 +2771,7 @@ app.post('/api/session/reset', (req, res) => {
 });
 
 app.post('/api/run/smart', async (req, res) => {
-  const runMode = String(req.body?.mode || 'ANALYZE_SINGLE') as
+  const runMode = String(req.body?.mode || 'SMART_SCAN_BEST') as
     | 'ANALYZE_SINGLE'
     | 'SMART_SCAN_BEST'
     | 'ANALYZE_AND_PAPER_EXECUTE';
@@ -2667,19 +2804,21 @@ app.post('/api/run/smart', async (req, res) => {
     opportunityScore: number;
   }> = [];
   let opportunities: SmartOpportunityCandidate[] = [];
+  let fullScanResponse: FullMarketScanResponse | null = null;
   let scanCandidatesCount = 1;
   let totalUniverseScanned = marketFeed.getDirectoryCount();
 
-  if (runMode === 'SMART_SCAN_BEST') {
+  if (runMode === 'SMART_SCAN_BEST' || runMode === 'ANALYZE_AND_PAPER_EXECUTE') {
     // True Two-Stage Full-Market Scan across ALL multi-exchange indexed coins
     const fullScan = await runFullMarketAlphaScan({
       scanMode: 'DEEP',
-      marketType: requestedMarket ?? 'ALL',
+      marketType: 'ALL',
       minVolumeUsd: 2_000_000,
       strategyFocus: 'HIGH_PROFIT_ALPHA',
       assetUniverse: 'CRYPTO',
-      limit: 18,
+      limit: 20,
     });
+    fullScanResponse = fullScan.response;
     scanCandidatesCount = fullScan.response.deepEvaluatedCount || fullScan.response.stage1CandidatesCount;
     totalUniverseScanned = fullScan.response.breadth.totalScannedPairs;
 
@@ -2693,7 +2832,7 @@ app.post('/api/run/smart', async (req, res) => {
         .catch(() => null);
     }
 
-    opportunities = fullScan.response.opportunities.slice(0, 10).map((opp) => ({
+    opportunities = fullScan.response.opportunities.slice(0, 12).map((opp) => ({
       rank: opp.rank,
       symbol: opp.symbol,
       exchange: opp.exchange,
@@ -2982,6 +3121,7 @@ app.post('/api/run/smart', async (req, res) => {
     scanCandidatesCount,
     totalUniverseScanned,
     opportunities,
+    fullScan: fullScanResponse,
     autoExecuted,
     executedOrderId,
     executionMessage,

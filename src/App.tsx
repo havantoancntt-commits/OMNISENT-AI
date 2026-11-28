@@ -10,7 +10,7 @@ import {
   LogOut,
   Menu,
   OctagonAlert,
-  Search,
+  Radar,
   ShieldCheck,
   Wallet,
   X,
@@ -34,6 +34,7 @@ import type {
   AutoExecutionEngineStatus,
   ClosePositionResponse,
   ExchangeInfo,
+  FullMarketScanResponse,
   MarketTicker,
   MarketType,
   OrderBookSnapshot,
@@ -56,7 +57,6 @@ import {
   serializePairSelection,
 } from './engine/pairSelection';
 import { AgentControlCenter } from './components/AgentControlCenter';
-import { CoinSearchModal } from './components/CoinSearchModal';
 import { CommandCenter } from './components/CommandCenter';
 import { ExchangeSecurityHub } from './components/ExchangeSecurityHub';
 import { MarketScanner } from './components/MarketScanner';
@@ -107,7 +107,7 @@ const NAV_ITEM_DEFS: Array<{
 }> = [
   { id: 'command', labelKey: 'app.nav.command', shortKey: 'app.nav.commandShort', icon: LayoutDashboard },
   { id: 'workspace3d', labelKey: 'app.nav.space3d', shortKey: 'app.nav.space3dShort', icon: Box },
-  { id: 'scanner', labelKey: 'app.nav.scanner', shortKey: 'app.nav.scannerShort', icon: Search },
+  { id: 'scanner', labelKey: 'app.nav.scanner', shortKey: 'app.nav.scannerShort', icon: Radar },
   { id: 'agents', labelKey: 'app.nav.agents', shortKey: 'app.nav.agentsShort', icon: Cpu },
   { id: 'quant', labelKey: 'app.nav.quant', icon: FlaskConical },
   { id: 'portfolio', labelKey: 'app.nav.portfolio', icon: Wallet },
@@ -209,11 +209,12 @@ export default function App() {
   const [liveFeedActive, setLiveFeedActive] = useState(false);
   const [serverUtc, setServerUtc] = useState(() => cachedHydration?.serverUtc ?? '');
   const [pipelineLoading, setPipelineLoading] = useState(false);
-  const [smartRunMode, setSmartRunMode] = useState<SmartRunMode>('ANALYZE_SINGLE');
+  const [smartRunMode, setSmartRunMode] = useState<SmartRunMode>('SMART_SCAN_BEST');
   const [includeGeminiOnRun, setIncludeGeminiOnRun] = useState(false);
   const [runStage, setRunStage] = useState(0);
   const [lastRunSummary, setLastRunSummary] = useState<SmartRunSummary | null>(null);
   const [smartOpportunities, setSmartOpportunities] = useState<SmartOpportunityCandidate[]>([]);
+  const [fullMarketScan, setFullMarketScan] = useState<FullMarketScanResponse | null>(null);
   const [emergencyConfirmOpen, setEmergencyConfirmOpen] = useState(false);
   const [unlockReasonInput, setUnlockReasonInput] = useState('');
   const [unlockErrorMsg, setUnlockErrorMsg] = useState<string | null>(null);
@@ -236,7 +237,6 @@ export default function App() {
     role: string | null;
     actor: string | null;
   } | null>(null);
-  const [searchModalOpen, setSearchModalOpen] = useState(false);
   const [autoExecutionStatus, setAutoExecutionStatus] = useState<AutoExecutionEngineStatus | null>(
     () =>
       cachedHydration?.autoExecutionStatus
@@ -1139,18 +1139,6 @@ export default function App() {
     };
   }, [selectedSymbol, selectedMarketType, selectedExchange]);
 
-  // Global Cmd/Ctrl + K shortcut to open Universal Coin Search Palette
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
-        e.preventDefault();
-        setSearchModalOpen((prev) => !prev);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
-
   const rawSelectedTicker = findMatchingTicker(tickers, {
     symbol: selectedSymbol,
     marketType: selectedMarketType,
@@ -1231,7 +1219,7 @@ export default function App() {
   };
 
   const handleSmartRun = async (
-    overrideMode?: SmartRunMode,
+    overrideMode?: SmartRunMode | 'ANALYZE_SINGLE',
     overrideSymbol?: string,
     overrideMarket?: MarketType,
     overrideExchange?: string,
@@ -1267,6 +1255,9 @@ export default function App() {
         }
         if (Array.isArray(data.opportunities)) {
           setSmartOpportunities(data.opportunities);
+        }
+        if (data.fullScan) {
+          setFullMarketScan(data.fullScan as FullMarketScanResponse);
         }
         if (data.signal) {
           setLastRunSummary({
@@ -1321,6 +1312,7 @@ export default function App() {
       if (res.ok) {
         setLastRunSummary(null);
         setSmartOpportunities([]);
+        setFullMarketScan(null);
         if (data.portfolio || Array.isArray(data.positions)) {
           reconcileMarketPortfolioPositions({
             incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
@@ -1721,10 +1713,6 @@ export default function App() {
           <div className="flex items-center gap-2 shrink-0">
             <SmartRunControl
               tickers={tickers}
-              selectedTicker={selectedTicker}
-              selectedSymbol={selectedSymbol}
-              selectedMarketType={selectedMarketType}
-              selectedExchange={selectedExchange}
               tradingMode={tradingMode}
               runMode={smartRunMode}
               includeGemini={includeGeminiOnRun}
@@ -1732,8 +1720,6 @@ export default function App() {
               runStage={runStage}
               lastSummary={lastRunSummary}
               onChangeRunMode={setSmartRunMode}
-              onChangeTargetSymbol={handleSelectSymbol}
-              onOpenGlobalSearch={() => setSearchModalOpen(true)}
               onToggleGemini={setIncludeGeminiOnRun}
               onExecuteRun={(mode) => handleSmartRun(mode)}
               onResetSession={handleResetSession}
@@ -1942,7 +1928,6 @@ export default function App() {
               onRunPipeline={handleRunPipeline}
               onSmartScan={() => handleSmartRun('SMART_SCAN_BEST')}
               smartOpportunities={smartOpportunities}
-              onOpenGlobalSearch={() => setSearchModalOpen(true)}
               onClosePosition={handleClosePosition}
               onUpdateSlTp={handleUpdatePositionSlTp}
               pipelineLoading={pipelineLoading}
@@ -1961,15 +1946,6 @@ export default function App() {
                   </p>
                 </div>
                 <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setSearchModalOpen(true)}
-                    aria-label={t('app.room3d.searchAria')}
-                    className="flex min-h-[42px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#0E1522] px-3 text-xs font-medium text-cyan-300 hover:border-cyan-500/50 whitespace-nowrap"
-                  >
-                    <Search className="h-3.5 w-3.5" />
-                    <span>{t('app.room3d.searchBtn')}</span>
-                  </button>
                   <select
                     value={
                       selectedTicker
@@ -2028,9 +2004,10 @@ export default function App() {
               riskConfig={riskConfig}
               tradingMode={tradingMode}
               latestSignal={selectedSignal}
+              externalScanResult={fullMarketScan}
+              onScanComplete={setFullMarketScan}
               onSelectSymbol={handleSelectSymbol}
               onSelectRemotePair={handleSelectRemotePair}
-              onOpenGlobalSearch={() => setSearchModalOpen(true)}
               onRunPipeline={handleRunPipeline}
               pipelineLoading={pipelineLoading}
               onOrderPlaced={async () => {
@@ -2053,7 +2030,6 @@ export default function App() {
               onSelectSymbol={handleSelectSymbol}
               onAgentAction={handleAgentAction}
               onRunPipeline={handleRunPipeline}
-              onOpenGlobalSearch={() => setSearchModalOpen(true)}
               onRefreshState={fetchAllState}
               pipelineLoading={pipelineLoading}
             />
@@ -2065,7 +2041,6 @@ export default function App() {
               selectedTicker={selectedTicker}
               onSelectSymbol={handleSelectSymbol}
               onSelectRemotePair={handleSelectRemotePair}
-              onOpenGlobalSearch={() => setSearchModalOpen(true)}
             />
           )}
 
@@ -2411,15 +2386,6 @@ export default function App() {
         </div>
       )}
 
-      {/* Global Command-K Coin Search Modal */}
-      <CoinSearchModal
-        open={searchModalOpen}
-        selectedSymbol={selectedTicker?.symbol ?? selectedSymbol}
-        selectedMarketType={selectedTicker?.marketType ?? selectedMarketType}
-        selectedExchange={selectedTicker?.exchange ?? selectedExchange}
-        onClose={() => setSearchModalOpen(false)}
-        onSelectPair={handleSelectRemotePair}
-      />
       <PWAInstallModal />
       <OfflineIndicator />
     </div>

@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { Award, CheckCircle2, FlaskConical, Layers, Play, Search, Sparkles } from 'lucide-react';
+import { Award, CheckCircle2, FlaskConical, Layers, Play, Sparkles } from 'lucide-react';
 import { getStrategyCatalog } from '../engine/adaptiveConfluence';
 import { formatAssetPrice } from '../engine/symbolSearch';
 import {
@@ -31,7 +31,6 @@ interface QuantLabProps {
     exchange: string,
     options?: { runAi?: boolean },
   ) => Promise<void>;
-  onOpenGlobalSearch?: () => void;
 }
 
 export const QuantLab: React.FC<QuantLabProps> = ({
@@ -39,7 +38,6 @@ export const QuantLab: React.FC<QuantLabProps> = ({
   selectedTicker = null,
   onSelectSymbol,
   onSelectRemotePair,
-  onOpenGlobalSearch,
 }) => {
   const { locale, t } = useI18n();
   const uniquePairTickers = dedupeTickersByPair(tickers);
@@ -286,16 +284,6 @@ export const QuantLab: React.FC<QuantLabProps> = ({
               <label className="block text-xs text-slate-400" htmlFor="ql-symbol">
                 {t('quant.pairLabel', { exchange: exchange || activeTicker?.exchange || 'Exchange' })}
               </label>
-              {onOpenGlobalSearch && (
-                <button
-                  type="button"
-                  onClick={onOpenGlobalSearch}
-                  className="flex items-center gap-1 text-[11px] font-semibold text-cyan-300 hover:text-cyan-200 whitespace-nowrap"
-                >
-                  <Search className="h-3 w-3" />
-                  <span>{t('quant.searchOther')}</span>
-                </button>
-              )}
             </div>
             <select
               id="ql-symbol"

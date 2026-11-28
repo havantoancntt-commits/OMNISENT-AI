@@ -731,6 +731,12 @@ export interface MarketBreadthStats {
   highLiquidityCount: number;
 }
 
+export type SignalQualityTier =
+  | 'INSTITUTIONAL_A_PLUS'
+  | 'VALIDATED_A'
+  | 'WATCHLIST_B'
+  | 'REJECTED';
+
 export interface FullMarketOpportunity {
   rank: number;
   symbol: string;
@@ -756,6 +762,10 @@ export interface FullMarketOpportunity {
   deepVerified: boolean;
   direction: OrderSide | 'NO_TRADE';
   signalState: SignalState | 'PRE_SCREEN';
+  qualityTier?: SignalQualityTier;
+  timeHorizon?: string;
+  stopHuntRiskScore?: number | null;
+  winProbabilityPct?: number | null;
   confluenceScore: number;
   htfAlignment: HtfAlignment;
   expectedValueR: number;
@@ -781,6 +791,7 @@ export interface FullMarketScanResponse {
     strategyFocus: ScannerStrategyFocus;
     direction: OrderSide | 'ALL';
     assetUniverse?: ScannerAssetUniverse;
+    onlyApproved?: boolean;
   };
   breadth: MarketBreadthStats;
   stage1CandidatesCount: number;

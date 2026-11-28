@@ -3,7 +3,6 @@ import {
   ArrowUpRight,
   Cpu,
   Radar,
-  Search,
   ShieldCheck,
   TrendingDown,
   TrendingUp,
@@ -63,7 +62,6 @@ interface CommandCenterProps {
   onRunPipeline: (symbol: string, marketType: MarketTicker['marketType'], exchange?: string) => void;
   onSmartScan?: () => void;
   smartOpportunities?: SmartOpportunityCandidate[];
-  onOpenGlobalSearch?: () => void;
   onClosePosition: (id: string) => Promise<ClosePositionResponse | void> | void;
   onUpdateSlTp: (id: string, stopLoss: number, takeProfit: number) => Promise<{ ok: boolean; error?: string }>;
   pipelineLoading: boolean;
@@ -86,7 +84,6 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
   onRunPipeline,
   onSmartScan,
   smartOpportunities = [],
-  onOpenGlobalSearch,
   onClosePosition,
   onUpdateSlTp,
   pipelineLoading,
@@ -236,7 +233,7 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
           />
         </div>
 
-        {/* Right Column: Benchmark Markets & Quick Multi-Agent Signal */}
+        {/* Right Column: Full-Market Signal Pulse & Quick Multi-Agent Signal */}
         <div className="flex flex-col gap-4 lg:col-span-4">
           <div className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
             <div className="flex items-center justify-between gap-2">
@@ -244,21 +241,22 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
                 {t('cmd.market.title')}
               </h2>
               <div className="flex items-center gap-2">
-                {onOpenGlobalSearch && (
+                {onSmartScan && (
                   <button
                     type="button"
-                    onClick={onOpenGlobalSearch}
-                    aria-label={t('cmd.market.searchAria')}
-                    className="flex min-h-[34px] items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/20 whitespace-nowrap"
+                    disabled={pipelineLoading || tickers.length === 0 || isEmergency}
+                    onClick={onSmartScan}
+                    aria-label={t('cmd.market.scanAria')}
+                    className="flex min-h-[34px] items-center gap-1 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 text-xs font-semibold text-cyan-300 hover:bg-cyan-500/20 disabled:opacity-50 whitespace-nowrap"
                   >
-                    <Search className="h-3.5 w-3.5" />
-                    <span>{t('cmd.market.searchBtn')}</span>
+                    <Radar className="h-3.5 w-3.5" />
+                    <span>{t('cmd.market.scanBtn')}</span>
                   </button>
                 )}
                 <button
                   type="button"
                   onClick={() => onNavigate('scanner')}
-                  className="flex min-h-[34px] items-center gap-1 text-xs font-medium text-cyan-400 hover:text-cyan-300"
+                  className="flex min-h-[34px] items-center gap-1 text-xs font-medium text-cyan-400 hover:text-cyan-300 whitespace-nowrap"
                 >
                   <span>{t('cmd.market.scannerBtn')}</span>
                   <ArrowUpRight className="h-3.5 w-3.5" />
@@ -267,67 +265,138 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
             </div>
 
             <div className="mt-3 divide-y divide-slate-800/70">
-              {pulseTickers.map((item) => {
-                const up = item.change24hPct >= 0;
-                const isActive = isSameTickerSelection(item, selectedTicker);
-                const pairKey = `${item.symbol}|${item.marketType}|${item.exchange}`;
-                const tDir = tickDirs[pairKey] ?? 'FLAT';
-                return (
-                  <button
-                    key={`${item.symbol}-${item.marketType}-${item.exchange}`}
-                    type="button"
-                    onClick={() => {
-                      onSelectSymbol(item.symbol, item.marketType, item.exchange);
-                      onNavigate('scanner');
-                    }}
-                    className={`flex min-h-[52px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors ${
-                      isActive ? 'bg-cyan-500/12' : 'hover:bg-slate-800/30'
-                    }`}
-                  >
-                    <div>
-                      <div className="flex items-center gap-2">
-                        <span
-                          className={`font-display text-sm font-semibold ${
-                            isActive ? 'text-cyan-300' : 'text-slate-100'
+              {smartOpportunities.length > 0 ? (
+                smartOpportunities.slice(0, 5).map((opp) => {
+                  const up = opp.change24hPct >= 0;
+                  const isActive =
+                    selectedTicker &&
+                    selectedTicker.symbol === opp.symbol &&
+                    selectedTicker.marketType === opp.marketType &&
+                    selectedTicker.exchange === opp.exchange;
+                  return (
+                    <button
+                      key={`${opp.symbol}-${opp.marketType}-${opp.exchange}`}
+                      type="button"
+                      onClick={() => {
+                        onSelectSymbol(opp.symbol, opp.marketType, opp.exchange);
+                        onNavigate('scanner');
+                      }}
+                      className={`flex min-h-[52px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors ${
+                        isActive ? 'bg-cyan-500/12' : 'hover:bg-slate-800/30'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`font-display text-sm font-semibold ${
+                              isActive ? 'text-cyan-300' : 'text-slate-100'
+                            }`}
+                          >
+                            {opp.symbol}
+                          </span>
+                          <span
+                            className={`font-mono text-[11px] font-semibold ${
+                              opp.state === 'APPROVED' && opp.direction !== 'NO_TRADE'
+                                ? opp.direction === 'LONG'
+                                  ? 'text-emerald-400'
+                                  : 'text-rose-400'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            {opp.direction}
+                          </span>
+                          <span className="truncate text-[11px] text-slate-400">
+                            {opp.exchange} · {opp.marketType}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 font-mono text-[11px] tabular-nums text-slate-400">
+                          {opp.state} · Conf {opp.confluenceScore}/100 · EV{' '}
+                          <span className={opp.expectedValueR > 0 ? 'text-emerald-400' : 'text-slate-400'}>
+                            {opp.expectedValueR >= 0 ? '+' : ''}
+                            {opp.expectedValueR.toFixed(2)}R
+                          </span>
+                        </p>
+                      </div>
+                      <div className="shrink-0 pl-2 text-right">
+                        <p className="font-mono text-sm font-semibold tabular-nums text-slate-100">
+                          {formatAssetPrice(opp.lastPrice)}
+                        </p>
+                        <p
+                          className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
+                            up ? 'text-emerald-400' : 'text-rose-400'
                           }`}
                         >
-                          {item.symbol}
-                        </span>
-                        <span className="text-[11px] text-slate-400">
-                          {item.exchange} · {item.marketType}
-                        </span>
+                          {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                          {up ? '+' : ''}
+                          {opp.change24hPct.toFixed(2)}%
+                        </p>
                       </div>
-                      <p className="mt-0.5 text-[11px] text-slate-500">
-                        {item.regime} · RSI{' '}
-                        <span className="font-mono tabular-nums">{item.rsi14 ?? '--'}</span>
-                        {item.sourceLabel.includes('WS') ? ' · WS' : ''}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p
-                        className={`font-mono text-sm font-semibold tabular-nums transition-colors duration-200 ${
-                          tDir === 'UP'
-                            ? 'text-emerald-300'
-                            : tDir === 'DOWN'
-                              ? 'text-rose-300'
-                              : 'text-slate-100'
-                        }`}
-                      >
-                        {formatAssetPrice(item.lastPrice)}
-                      </p>
-                      <p
-                        className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
-                          up ? 'text-emerald-400' : 'text-rose-400'
-                        }`}
-                      >
-                        {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
-                        {up ? '+' : ''}
-                        {item.change24hPct.toFixed(2)}%
-                      </p>
-                    </div>
-                  </button>
-                );
-              })}
+                    </button>
+                  );
+                })
+              ) : (
+                pulseTickers.map((item) => {
+                  const up = item.change24hPct >= 0;
+                  const isActive = isSameTickerSelection(item, selectedTicker);
+                  const pairKey = `${item.symbol}|${item.marketType}|${item.exchange}`;
+                  const tDir = tickDirs[pairKey] ?? 'FLAT';
+                  return (
+                    <button
+                      key={`${item.symbol}-${item.marketType}-${item.exchange}`}
+                      type="button"
+                      onClick={() => {
+                        onSelectSymbol(item.symbol, item.marketType, item.exchange);
+                        onNavigate('scanner');
+                      }}
+                      className={`flex min-h-[52px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors ${
+                        isActive ? 'bg-cyan-500/12' : 'hover:bg-slate-800/30'
+                      }`}
+                    >
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <span
+                            className={`font-display text-sm font-semibold ${
+                              isActive ? 'text-cyan-300' : 'text-slate-100'
+                            }`}
+                          >
+                            {item.symbol}
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            {item.exchange} · {item.marketType}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 text-[11px] text-slate-500">
+                          {item.regime} · RSI{' '}
+                          <span className="font-mono tabular-nums">{item.rsi14 ?? '--'}</span>
+                          {item.sourceLabel.includes('WS') ? ' · WS' : ''}
+                        </p>
+                      </div>
+                      <div className="text-right">
+                        <p
+                          className={`font-mono text-sm font-semibold tabular-nums transition-colors duration-200 ${
+                            tDir === 'UP'
+                              ? 'text-emerald-300'
+                              : tDir === 'DOWN'
+                                ? 'text-rose-300'
+                                : 'text-slate-100'
+                          }`}
+                        >
+                          {formatAssetPrice(item.lastPrice)}
+                        </p>
+                        <p
+                          className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
+                            up ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
+                          {up ? '+' : ''}
+                          {item.change24hPct.toFixed(2)}%
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })
+              )}
             </div>
           </div>
 

@@ -2,19 +2,16 @@ import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   AlertTriangle,
   CheckCircle2,
-  Loader2,
-  Search,
+  Radar,
   ShieldAlert,
   Sparkles,
   TrendingDown,
   TrendingUp,
-  X,
 } from 'lucide-react';
 import {
   formatAssetPrice,
   formatCompactUsd,
   getSmartPriceDecimals,
-  type MarketDirectoryEntry,
 } from '../engine/symbolSearch';
 import { isSameTickerSelection } from '../engine/pairSelection';
 import {
@@ -27,6 +24,7 @@ import type {
   Candle,
   ClosePositionResponse,
   FullMarketOpportunity,
+  FullMarketScanResponse,
   MarketTicker,
   MarketType,
   OrderBookSnapshot,
@@ -54,6 +52,8 @@ interface MarketScannerProps {
   riskConfig: RiskConfig;
   tradingMode: TradingMode;
   latestSignal?: TradingSignal | null;
+  externalScanResult?: FullMarketScanResponse | null;
+  onScanComplete?: (scan: FullMarketScanResponse) => void;
   onSelectSymbol: (symbol: string, marketType: MarketType, exchange?: string) => void;
   onSelectRemotePair?: (
     symbol: string,
@@ -61,7 +61,6 @@ interface MarketScannerProps {
     exchange: string,
     options?: { runAi?: boolean },
   ) => Promise<void>;
-  onOpenGlobalSearch?: () => void;
   onRunPipeline?: (symbol: string, marketType: MarketType, exchange?: string) => void;
   pipelineLoading?: boolean;
   onOrderPlaced: () => void;
@@ -77,9 +76,10 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
   riskConfig,
   tradingMode,
   latestSignal = null,
+  externalScanResult = null,
+  onScanComplete,
   onSelectSymbol,
   onSelectRemotePair,
-  onOpenGlobalSearch,
   onRunPipeline,
   pipelineLoading = false,
   onOrderPlaced,
@@ -87,20 +87,25 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
   onUpdateSlTp,
 }) => {
   const { t } = useI18n();
-  const [search, setSearch] = useState('');
+  const [signalFilter, setSignalFilter] = useState<'ALL' | 'APPROVED' | 'LONG' | 'SHORT'>('ALL');
   const [marketFilter, setMarketFilter] = useState<'ALL' | 'SPOT' | 'PERPETUAL'>('ALL');
   const [exchangeFilter, setExchangeFilter] = useState<string>('ALL');
-  const [sortBy, setSortBy] = useState<'DEFAULT' | 'VOLUME' | 'CHANGE' | 'RSI'>('DEFAULT');
-  const [remoteResults, setRemoteResults] = useState<MarketDirectoryEntry[]>([]);
-  const [totalIndexed, setTotalIndexed] = useState<number>(0);
-  const [remoteSearching, setRemoteSearching] = useState(false);
-  const [activatingPairKey, setActivatingPairKey] = useState<string | null>(null);
+  const [sortBy, setSortBy] = useState<'ALPHA' | 'VOLUME' | 'CHANGE'>('ALPHA');
+  const [syncedScan, setSyncedScan] = useState<FullMarketScanResponse | null>(
+    () => externalScanResult,
+  );
   const [interval, setIntervalState] = useState<string>('1h');
 
   const [candles, setCandles] = useState<Candle[]>([]);
   const [indicators, setIndicators] = useState<TechnicalIndicators | null>(null);
   const [quantIntel, setQuantIntel] = useState<QuantIntelligenceSnapshot | null>(null);
   const [candleSource, setCandleSource] = useState<string>('');
+
+  useEffect(() => {
+    if (externalScanResult) {
+      setSyncedScan(externalScanResult);
+    }
+  }, [externalScanResult]);
 
   // Order Ticket state
   const [side, setSide] = useState<OrderSide>('LONG');
@@ -330,42 +335,6 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
     }
   };
 
-  // Query full global multi-exchange MarketDirectory whenever user types in Scanner search
-  useEffect(() => {
-    const q = search.trim();
-    if (!q) {
-      setRemoteResults([]);
-      setRemoteSearching(false);
-      return;
-    }
-    let cancelled = false;
-    setRemoteSearching(true);
-    const timer = window.setTimeout(async () => {
-      try {
-        const params = new URLSearchParams({
-          q,
-          marketType: marketFilter,
-          exchange: exchangeFilter,
-          limit: '24',
-        });
-        const res = await apiFetch(`/api/market/search?${params.toString()}`);
-        if (!res.ok) return;
-        const data = await res.json();
-        if (!cancelled) {
-          setRemoteResults(Array.isArray(data.results) ? data.results : []);
-          if (Number(data.totalIndexed) > 0) setTotalIndexed(Number(data.totalIndexed));
-        }
-      } catch {
-        // non-fatal
-      } finally {
-        if (!cancelled) setRemoteSearching(false);
-      }
-    }, 150);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [search, marketFilter, exchangeFilter]);
 
   // Live Risk Engine Pre-Flight Evaluation (only runs when user explicitly provides SL/TP)
   useEffect(() => {
@@ -452,49 +421,41 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
     }
   };
 
-  const filteredBase = tickers.filter((t) => {
-    const matchSearch =
-      !search.trim() ||
-      t.symbol.toLowerCase().includes(search.trim().toLowerCase()) ||
-      t.baseAsset.toLowerCase().includes(search.trim().toLowerCase()) ||
-      t.exchange.toLowerCase().includes(search.trim().toLowerCase());
-    const matchMarket = marketFilter === 'ALL' || t.marketType === marketFilter;
-    const matchExchange = exchangeFilter === 'ALL' || t.exchange === exchangeFilter;
-    return matchSearch && matchMarket && matchExchange;
-  });
-
-  const filtered = [...filteredBase].sort((a, b) => {
-    if (sortBy === 'VOLUME') return b.volume24hUsd - a.volume24hUsd;
-    if (sortBy === 'CHANGE') return b.change24hPct - a.change24hPct;
-    if (sortBy === 'RSI') return (b.rsi14 ?? 0) - (a.rsi14 ?? 0);
-    return 0;
-  });
-
-  const localKeys = new Set(
-    tickers.map((t) => `${t.symbol.toUpperCase()}|${t.marketType}|${t.exchange.toUpperCase()}`),
-  );
-  const extraRemoteResults = search.trim()
-    ? remoteResults.filter(
-        (r) =>
-          !localKeys.has(
-            `${r.symbol.toUpperCase()}|${r.marketType}|${r.exchange.toUpperCase()}`,
-          ),
-      )
-    : [];
-
-  const handleActivateRemote = async (entry: MarketDirectoryEntry) => {
-    const key = `${entry.symbol}|${entry.marketType}|${entry.exchangeId}`;
-    setActivatingPairKey(key);
-    try {
-      if (onSelectRemotePair) {
-        await onSelectRemotePair(entry.symbol, entry.marketType, entry.exchange);
-      } else {
-        onSelectSymbol(entry.symbol, entry.marketType, entry.exchange);
+  const scannedOpportunities = useMemo(() => {
+    const raw = syncedScan?.opportunities ?? [];
+    const filteredOpps = raw.filter((opp) => {
+      if (signalFilter === 'APPROVED') {
+        if (!(opp.signalState === 'APPROVED' && opp.direction !== 'NO_TRADE')) return false;
+      } else if (signalFilter === 'LONG' || signalFilter === 'SHORT') {
+        if (opp.direction !== signalFilter) return false;
       }
-    } finally {
-      setActivatingPairKey(null);
-    }
-  };
+      if (marketFilter !== 'ALL' && opp.marketType !== marketFilter) return false;
+      if (exchangeFilter !== 'ALL' && opp.exchange !== exchangeFilter) return false;
+      return true;
+    });
+
+    return [...filteredOpps].sort((a, b) => {
+      if (sortBy === 'VOLUME') return b.volume24hUsd - a.volume24hUsd;
+      if (sortBy === 'CHANGE') return b.change24hPct - a.change24hPct;
+      if (b.compositeAlphaScore !== a.compositeAlphaScore) {
+        return b.compositeAlphaScore - a.compositeAlphaScore;
+      }
+      return a.rank - b.rank;
+    });
+  }, [syncedScan?.opportunities, signalFilter, marketFilter, exchangeFilter, sortBy]);
+
+  const fallbackBenchmarkTickers = useMemo(() => {
+    return tickers
+      .filter((tk) => {
+        if (marketFilter !== 'ALL' && tk.marketType !== marketFilter) return false;
+        if (exchangeFilter !== 'ALL' && tk.exchange !== exchangeFilter) return false;
+        return tk.lastPrice > 0;
+      })
+      .sort((a, b) => {
+        if (sortBy === 'CHANGE') return b.change24hPct - a.change24hPct;
+        return b.volume24hUsd - a.volume24hUsd;
+      });
+  }, [tickers, marketFilter, exchangeFilter, sortBy]);
 
   const handleInspectOpportunity = async (
     opp: FullMarketOpportunity,
@@ -567,228 +528,270 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
   };
 
   const allExchanges = ['Binance', 'Bybit', 'OKX', 'Kraken', 'Coinbase Advanced'];
+  const totalScannedPairs = syncedScan?.breadth?.totalScannedPairs ?? 0;
 
   return (
     <div className="space-y-6">
       <FullMarketRadar
         activeTicker={active}
+        externalScanResult={syncedScan}
+        onScanComplete={(scan) => {
+          setSyncedScan(scan);
+          onScanComplete?.(scan);
+        }}
         onInspectOpportunity={handleInspectOpportunity}
       />
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Left: Universal Coin & Market Scanner */}
+        {/* Left: Synced Full-Market Signal Stream */}
         <section className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4 lg:col-span-4">
-        <div className="flex items-center justify-between gap-2">
-          <div>
-            <h2 className="font-display text-base font-semibold text-slate-100">
-              {t('scanner.title')}
-            </h2>
-            <p className="text-[11px] text-slate-400">
-              {t('scanner.watchlistCount', { count: filtered.length })}
-              {totalIndexed > 0
-                ? t('scanner.indexedSuffix', { total: totalIndexed.toLocaleString('en-US') })
-                : ''}
-            </p>
+          <div className="flex items-center justify-between gap-2">
+            <div>
+              <div className="flex items-center gap-1.5">
+                <Radar className="h-4 w-4 text-cyan-400 shrink-0" />
+                <h2 className="font-display text-base font-semibold text-slate-100">
+                  {t('scanner.title')}
+                </h2>
+              </div>
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                {t('scanner.signalStreamCount', { count: scannedOpportunities.length })}
+                {totalScannedPairs > 0
+                  ? t('scanner.indexedSuffix', { total: totalScannedPairs.toLocaleString('en-US') })
+                  : ''}
+              </p>
+            </div>
+            <span className="font-mono text-[10px] font-semibold uppercase text-cyan-300">
+              {syncedScan?.scanMode === 'DEEP' ? '1H+4H+15m' : 'STAGE-1'}
+            </span>
           </div>
-          {onOpenGlobalSearch && (
-            <button
-              type="button"
-              onClick={onOpenGlobalSearch}
-              aria-label={t('scanner.quickSearchAria')}
-              className="flex min-h-[34px] items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-2.5 text-[11px] font-semibold text-cyan-300 hover:bg-cyan-500/20 whitespace-nowrap"
-            >
-              <Search className="h-3 w-3" />
-              <span>{t('scanner.quickSearchBtn')}</span>
-            </button>
-          )}
-        </div>
 
-        <div className="mt-3 space-y-2.5">
-          <div className="relative">
-            <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-500" />
-            <input
-              type="text"
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder={t('scanner.searchPlaceholder')}
-              aria-label={t('scanner.searchAria')}
-              className="min-h-[44px] w-full rounded-lg border border-slate-800 bg-[#070B12] pr-9 pl-9 text-sm text-slate-100 placeholder:text-slate-500 focus:border-cyan-500 focus:outline-none"
-            />
-            {search && (
-              <button
-                type="button"
-                onClick={() => setSearch('')}
-                aria-label={t('scanner.clearSearchAria')}
-                className="absolute top-1/2 right-2 -translate-y-1/2 rounded p-1 text-slate-400 hover:text-slate-100"
+          <div className="mt-3 space-y-2">
+            {/* Signal Approval & Direction Filter */}
+            <div className="grid grid-cols-4 gap-1 rounded-lg border border-slate-800 bg-[#070B12] p-0.5">
+              {(['ALL', 'APPROVED', 'LONG', 'SHORT'] as const).map((sig) => (
+                <button
+                  key={sig}
+                  type="button"
+                  onClick={() => setSignalFilter(sig)}
+                  className={`min-h-[30px] rounded-md px-1.5 text-[11px] font-semibold whitespace-nowrap transition-colors ${
+                    signalFilter === sig
+                      ? sig === 'APPROVED'
+                        ? 'bg-emerald-500/20 text-emerald-300'
+                        : sig === 'SHORT'
+                          ? 'bg-rose-500/20 text-rose-300'
+                          : 'bg-cyan-500/20 text-cyan-300'
+                      : 'text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  {sig === 'ALL'
+                    ? t('scanner.filterAll')
+                    : sig === 'APPROVED'
+                      ? t('scanner.filterApproved')
+                      : sig}
+                </button>
+              ))}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-1.5">
+              {(['ALL', 'SPOT', 'PERPETUAL'] as const).map((m) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => setMarketFilter(m)}
+                  className={`min-h-[34px] rounded-lg px-2.5 py-1 text-xs font-medium whitespace-nowrap ${
+                    marketFilter === m
+                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
+                      : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
+                  }`}
+                >
+                  {m === 'ALL' ? t('scanner.filterAll') : m}
+                </button>
+              ))}
+
+              <select
+                value={exchangeFilter}
+                onChange={(e) => setExchangeFilter(e.target.value)}
+                aria-label={t('scanner.filterExchangeAria')}
+                className="min-h-[34px] rounded-lg border border-slate-800 bg-[#070B12] px-2 text-xs text-slate-200 focus:border-cyan-500 focus:outline-none"
               >
-                <X className="h-4 w-4" />
-              </button>
+                <option value="ALL">{t('scanner.allExchanges')}</option>
+                {allExchanges.map((ex) => (
+                  <option key={ex} value={ex}>
+                    {ex}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
+                aria-label={t('scanner.sortAria')}
+                className="min-h-[34px] rounded-lg border border-slate-800 bg-[#070B12] px-2 text-xs text-slate-200 focus:border-cyan-500 focus:outline-none"
+              >
+                <option value="ALPHA">{t('scanner.sortAlpha')}</option>
+                <option value="VOLUME">{t('scanner.sortVol')}</option>
+                <option value="CHANGE">{t('scanner.sortChange')}</option>
+              </select>
+            </div>
+
+            {positions.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 border-t border-slate-800/70 pt-2">
+                <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                  {t('scanner.activePosLabel')}
+                </span>
+                {positions.map((pos) => (
+                  <button
+                    key={pos.id}
+                    type="button"
+                    onClick={() => onSelectSymbol(pos.symbol, pos.marketType, pos.exchange)}
+                    className={`rounded border px-2 py-0.5 font-mono text-[10px] font-semibold transition-colors ${
+                      active && isSameTickerSelection(active, pos)
+                        ? 'border-cyan-500/60 bg-cyan-500/20 text-cyan-200'
+                        : 'border-slate-700 bg-slate-900 text-slate-300 hover:border-cyan-500/40'
+                    }`}
+                  >
+                    {pos.side} {pos.symbol}
+                  </button>
+                ))}
+              </div>
             )}
           </div>
 
-          <div className="flex flex-wrap items-center gap-1.5">
-            {(['ALL', 'SPOT', 'PERPETUAL'] as const).map((m) => (
-              <button
-                key={m}
-                type="button"
-                onClick={() => setMarketFilter(m)}
-                className={`min-h-[36px] rounded-lg px-2.5 py-1 text-xs font-medium whitespace-nowrap ${
-                  marketFilter === m
-                    ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40'
-                    : 'bg-slate-900 text-slate-400 border border-slate-800 hover:text-slate-200'
-                }`}
-              >
-                {m === 'ALL' ? t('scanner.filterAll') : m}
-              </button>
-            ))}
-
-            <select
-              value={exchangeFilter}
-              onChange={(e) => setExchangeFilter(e.target.value)}
-              aria-label={t('scanner.filterExchangeAria')}
-              className="min-h-[36px] rounded-lg border border-slate-800 bg-[#070B12] px-2 text-xs text-slate-200 focus:border-cyan-500 focus:outline-none"
-            >
-              <option value="ALL">{t('scanner.allExchanges')}</option>
-              {allExchanges.map((ex) => (
-                <option key={ex} value={ex}>
-                  {ex}
-                </option>
-              ))}
-            </select>
-
-            <select
-              value={sortBy}
-              onChange={(e) => setSortBy(e.target.value as typeof sortBy)}
-              aria-label={t('scanner.sortAria')}
-              className="min-h-[36px] rounded-lg border border-slate-800 bg-[#070B12] px-2 text-xs text-slate-200 focus:border-cyan-500 focus:outline-none"
-            >
-              <option value="DEFAULT">{t('scanner.sortDefault')}</option>
-              <option value="VOLUME">{t('scanner.sortVol')}</option>
-              <option value="CHANGE">{t('scanner.sortChange')}</option>
-              <option value="RSI">RSI(14)</option>
-            </select>
-          </div>
-        </div>
-
-        <div className="mt-3 max-h-[470px] space-y-2 overflow-y-auto pr-1">
-          {filtered.length > 0 && (
-            <div className="divide-y divide-slate-800/60">
-              {filtered.map((t) => {
-                const isSelected =
-                  active?.symbol === t.symbol &&
-                  active?.marketType === t.marketType &&
-                  active?.exchange === t.exchange;
-                const up = t.change24hPct >= 0;
-                return (
-                  <button
-                    key={`${t.symbol}-${t.marketType}-${t.exchange}`}
-                    type="button"
-                    onClick={() => onSelectSymbol(t.symbol, t.marketType, t.exchange)}
-                    className={`flex min-h-[56px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors ${
-                      isSelected ? 'bg-cyan-500/10' : 'hover:bg-slate-800/30'
-                    }`}
-                  >
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-1.5">
-                        <span className="font-display text-sm font-semibold text-slate-100">
-                          {t.symbol}
-                        </span>
-                        <span className="text-[11px] text-slate-400">{t.marketType}</span>
-                      </div>
-                      <p className="mt-0.5 truncate text-[11px] text-slate-500">
-                        {t.exchange} · {t.regime} · Vol {formatCompactUsd(t.volume24hUsd)}
-                      </p>
-                    </div>
-                    <div className="shrink-0 pl-2 text-right">
-                      <p className="font-mono text-sm font-semibold tabular-nums text-slate-100">
-                        {formatAssetPrice(t.lastPrice)}
-                      </p>
-                      <p
-                        className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
-                          up ? 'text-emerald-400' : 'text-rose-400'
-                        }`}
-                      >
-                        {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
-                        {up ? '+' : ''}
-                        {t.change24hPct.toFixed(2)}%
-                      </p>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-
-          {/* Global Multi-Exchange Live Discovery Results for searched coins outside watchlist */}
-          {search.trim() && (
-            <div className="border-t border-slate-800 pt-2.5">
-              <div className="mb-1.5 flex items-center justify-between px-1 text-[11px]">
-                <span className="font-semibold text-cyan-300">
-                  {t('scanner.globalExpandHeader', { count: extraRemoteResults.length })}
-                </span>
-                {remoteSearching && <Loader2 className="h-3.5 w-3.5 animate-spin text-cyan-400" />}
-              </div>
-
-              {extraRemoteResults.length === 0 && !remoteSearching ? (
-                filtered.length === 0 && (
-                  <p className="px-2 py-4 text-center text-xs text-slate-400">
-                    {t('scanner.noMatch', { query: search })}
-                  </p>
-                )
-              ) : (
-                <div className="divide-y divide-slate-800/60">
-                  {extraRemoteResults.map((entry) => {
-                    const key = `${entry.symbol}|${entry.marketType}|${entry.exchangeId}`;
-                    const loadingRow = activatingPairKey === key;
-                    const up = entry.change24hPct >= 0;
-                    return (
+          <div className="mt-3 max-h-[470px] space-y-2 overflow-y-auto pr-1">
+            {scannedOpportunities.length > 0 ? (
+              <div className="divide-y divide-slate-800/60">
+                {scannedOpportunities.map((opp) => {
+                  const isSelected =
+                    active?.symbol === opp.symbol &&
+                    active?.marketType === opp.marketType &&
+                    active?.exchange === opp.exchange;
+                  const up = opp.change24hPct >= 0;
+                  const isApproved = opp.signalState === 'APPROVED' && opp.direction !== 'NO_TRADE';
+                  return (
+                    <div
+                      key={`${opp.symbol}-${opp.marketType}-${opp.exchange}-${opp.rank}`}
+                      className={`flex min-h-[60px] items-center justify-between gap-2 rounded-lg px-2 py-2 transition-colors ${
+                        isSelected ? 'bg-cyan-500/12' : 'hover:bg-slate-800/30'
+                      }`}
+                    >
                       <button
-                        key={key}
                         type="button"
-                        disabled={Boolean(activatingPairKey)}
-                        onClick={() => handleActivateRemote(entry)}
-                        className="flex min-h-[56px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors hover:bg-cyan-500/10 disabled:opacity-60"
+                        onClick={() => handleInspectOpportunity(opp, false)}
+                        className="min-w-0 flex-1 text-left"
                       >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-1.5">
-                            <span className="font-display text-sm font-semibold text-cyan-200">
-                              {entry.symbol}
-                            </span>
-                            <span className="text-[11px] text-slate-400">{entry.marketType}</span>
-                          </div>
-                          <p className="mt-0.5 truncate text-[11px] text-slate-400">
-                            {entry.exchange} · Vol {formatCompactUsd(entry.volume24hUsd)} · {t('scanner.clickToAnalyze')}
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-mono text-[11px] text-slate-500">#{opp.rank}</span>
+                          <span className="font-display text-sm font-semibold text-slate-100">
+                            {opp.symbol}
+                          </span>
+                          <span
+                            className={`font-mono text-[11px] font-semibold ${
+                              isApproved
+                                ? opp.direction === 'LONG'
+                                  ? 'text-emerald-400'
+                                  : 'text-rose-400'
+                                : 'text-cyan-300'
+                            }`}
+                          >
+                            {opp.deepVerified ? opp.direction : `Est.${opp.direction}`}
+                          </span>
+                        </div>
+                        <p className="mt-0.5 truncate font-mono text-[11px] text-slate-400">
+                          {opp.exchange} · {opp.marketType} · Conf {opp.confluenceScore}
+                          {opp.deepVerified
+                            ? ` · ${opp.expectedValueR >= 0 ? '+' : ''}${opp.expectedValueR.toFixed(2)}R`
+                            : ` · ${formatCompactUsd(opp.volume24hUsd)}`}
+                        </p>
+                      </button>
+
+                      <div className="flex shrink-0 items-center gap-2">
+                        <div className="text-right">
+                          <p className="font-mono text-xs font-semibold tabular-nums text-slate-100">
+                            {formatAssetPrice(opp.lastPrice)}
+                          </p>
+                          <p
+                            className={`flex items-center justify-end gap-0.5 font-mono text-[11px] tabular-nums ${
+                              up ? 'text-emerald-400' : 'text-rose-400'
+                            }`}
+                          >
+                            {up ? (
+                              <TrendingUp className="h-3 w-3" />
+                            ) : (
+                              <TrendingDown className="h-3 w-3" />
+                            )}
+                            {up ? '+' : ''}
+                            {opp.change24hPct.toFixed(2)}%
                           </p>
                         </div>
-                        <div className="shrink-0 pl-2 text-right">
-                          {loadingRow ? (
-                            <Loader2 className="ml-auto h-4 w-4 animate-spin text-cyan-400" />
-                          ) : (
-                            <>
-                              <p className="font-mono text-sm font-semibold tabular-nums text-slate-100">
-                                {formatAssetPrice(entry.lastPrice)}
-                              </p>
-                              <p
-                                className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
-                                  up ? 'text-emerald-400' : 'text-rose-400'
-                                }`}
-                              >
-                                {up ? <TrendingUp className="h-3 w-3" /> : <TrendingDown className="h-3 w-3" />}
-                                {up ? '+' : ''}
-                                {entry.change24hPct.toFixed(2)}%
-                              </p>
-                            </>
-                          )}
+                        <button
+                          type="button"
+                          onClick={() => handleInspectOpportunity(opp, true)}
+                          className="min-h-[30px] rounded border border-cyan-500/40 bg-cyan-500/15 px-2 text-[10px] font-semibold text-cyan-300 hover:bg-cyan-500/25 whitespace-nowrap"
+                        >
+                          {t('scanner.quickLoadBtn')}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            ) : syncedScan ? (
+              <p className="rounded-lg border border-dashed border-slate-800 bg-[#070B12] px-3 py-6 text-center text-xs text-slate-400">
+                {t('scanner.noSignalMatch')}
+              </p>
+            ) : (
+              <div className="divide-y divide-slate-800/60">
+                {fallbackBenchmarkTickers.map((tkr) => {
+                  const isSelected =
+                    active?.symbol === tkr.symbol &&
+                    active?.marketType === tkr.marketType &&
+                    active?.exchange === tkr.exchange;
+                  const up = tkr.change24hPct >= 0;
+                  return (
+                    <button
+                      key={`${tkr.symbol}-${tkr.marketType}-${tkr.exchange}`}
+                      type="button"
+                      onClick={() => onSelectSymbol(tkr.symbol, tkr.marketType, tkr.exchange)}
+                      className={`flex min-h-[56px] w-full items-center justify-between rounded-lg px-2 py-2.5 text-left transition-colors ${
+                        isSelected ? 'bg-cyan-500/10' : 'hover:bg-slate-800/30'
+                      }`}
+                    >
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="font-display text-sm font-semibold text-slate-100">
+                            {tkr.symbol}
+                          </span>
+                          <span className="text-[11px] text-slate-400">{tkr.marketType}</span>
                         </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      </section>
+                        <p className="mt-0.5 truncate text-[11px] text-slate-500">
+                          {tkr.exchange} · {tkr.regime} · Vol {formatCompactUsd(tkr.volume24hUsd)}
+                        </p>
+                      </div>
+                      <div className="shrink-0 pl-2 text-right">
+                        <p className="font-mono text-sm font-semibold tabular-nums text-slate-100">
+                          {formatAssetPrice(tkr.lastPrice)}
+                        </p>
+                        <p
+                          className={`flex items-center justify-end gap-0.5 font-mono text-xs tabular-nums ${
+                            up ? 'text-emerald-400' : 'text-rose-400'
+                          }`}
+                        >
+                          {up ? (
+                            <TrendingUp className="h-3 w-3" />
+                          ) : (
+                            <TrendingDown className="h-3 w-3" />
+                          )}
+                          {up ? '+' : ''}
+                          {tkr.change24hPct.toFixed(2)}%
+                        </p>
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
 
       {/* Center + Right: Chart, Indicators, Order Book & Risk-Gated Order Ticket */}
       <div className="space-y-6 lg:col-span-8">

@@ -1,5 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  CheckCircle2,
   ChevronDown,
   ChevronUp,
   Loader2,
@@ -63,11 +64,31 @@ function formatHtfShort(
 
 interface FullMarketRadarProps {
   activeTicker: MarketTicker | null;
+  externalScanResult?: FullMarketScanResponse | null;
+  onScanComplete?: (scan: FullMarketScanResponse) => void;
   onInspectOpportunity: (opp: FullMarketOpportunity, loadTicket: boolean) => Promise<void>;
+}
+
+function formatQualityTierTag(tier?: FullMarketOpportunity['qualityTier']): {
+  label: string;
+  cls: string;
+} | null {
+  switch (tier) {
+    case 'INSTITUTIONAL_A_PLUS':
+      return { label: 'A+', cls: 'text-emerald-300' };
+    case 'VALIDATED_A':
+      return { label: 'A', cls: 'text-cyan-300' };
+    case 'WATCHLIST_B':
+      return { label: 'B', cls: 'text-amber-300' };
+    default:
+      return null;
+  }
 }
 
 export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
   activeTicker,
+  externalScanResult = null,
+  onScanComplete,
   onInspectOpportunity,
 }) => {
   const { t } = useI18n();
@@ -78,17 +99,33 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
   const [exchange, setExchange] = useState<string>('ALL');
   const [minVolumeUsd, setMinVolumeUsd] = useState<number>(1_000_000);
   const [direction, setDirection] = useState<OrderSide | 'ALL'>('ALL');
+  const [onlyApproved, setOnlyApproved] = useState<boolean>(false);
 
-  const [scanResult, setScanResult] = useState<FullMarketScanResponse | null>(null);
+  const [scanResult, setScanResult] = useState<FullMarketScanResponse | null>(
+    () => externalScanResult,
+  );
   const [loadingFast, setLoadingFast] = useState(false);
   const [loadingDeep, setLoadingDeep] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [activatingKey, setActivatingKey] = useState<string | null>(null);
+  const scanSeqRef = useRef(0);
+  const deepInFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (externalScanResult) {
+      setScanResult(externalScanResult);
+    }
+  }, [externalScanResult]);
 
   const runScan = async (mode: 'FAST' | 'DEEP') => {
     setErrorMsg(null);
-    if (mode === 'DEEP') setLoadingDeep(true);
-    else setLoadingFast(true);
+    const reqId = ++scanSeqRef.current;
+    if (mode === 'DEEP') {
+      deepInFlightRef.current = true;
+      setLoadingDeep(true);
+    } else {
+      setLoadingFast(true);
+    }
 
     try {
       const res = await apiFetch('/api/market/scan', {
@@ -102,26 +139,38 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
           strategyFocus,
           direction,
           assetUniverse,
-          limit: mode === 'DEEP' ? 18 : 20,
+          onlyApproved: mode === 'DEEP' ? onlyApproved : false,
+          limit: mode === 'DEEP' ? 20 : 24,
         }),
       });
       const data = await res.json();
       if (!res.ok) {
-        setErrorMsg(data.error || t('radar.err.scanFailed'));
-      } else {
-        setScanResult(data as FullMarketScanResponse);
+        if (reqId === scanSeqRef.current) {
+          setErrorMsg(data.error || t('radar.err.scanFailed'));
+        }
+      } else if (reqId === scanSeqRef.current || mode === 'DEEP') {
+        const typed = data as FullMarketScanResponse;
+        setScanResult(typed);
+        onScanComplete?.(typed);
       }
     } catch {
-      setErrorMsg(t('radar.err.network'));
+      if (reqId === scanSeqRef.current) {
+        setErrorMsg(t('radar.err.network'));
+      }
     } finally {
-      setLoadingFast(false);
-      setLoadingDeep(false);
+      if (mode === 'DEEP') {
+        deepInFlightRef.current = false;
+        setLoadingDeep(false);
+      } else {
+        setLoadingFast(false);
+      }
     }
   };
 
   // Auto-load instantaneous Stage-1 Full Market Breadth & Fast Screener when filters change
   useEffect(() => {
     let cancelled = false;
+    const reqId = ++scanSeqRef.current;
     const loadFast = async () => {
       setLoadingFast(true);
       try {
@@ -132,14 +181,17 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
           strategyFocus,
           direction,
           assetUniverse,
-          limit: '20',
+          limit: '24',
         });
         const res = await apiFetch(`/api/market/scan?${params.toString()}`);
         if (!res.ok) return;
         const data = (await res.json()) as FullMarketScanResponse;
-        if (!cancelled) {
+        if (!cancelled && reqId === scanSeqRef.current && !deepInFlightRef.current) {
           setScanResult((prev) => {
-            if (prev?.scanMode === 'DEEP' && prev.filters?.assetUniverse === assetUniverse) return prev;
+            if (prev?.scanMode === 'DEEP' && prev.filters?.assetUniverse === assetUniverse) {
+              return prev;
+            }
+            onScanComplete?.(data);
             return data;
           });
         }
@@ -166,7 +218,10 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
   };
 
   const breadth = scanResult?.breadth;
-  const opportunities = scanResult?.opportunities ?? [];
+  const rawOpportunities = scanResult?.opportunities ?? [];
+  const opportunities = onlyApproved
+    ? rawOpportunities.filter((o) => o.signalState === 'APPROVED' && o.direction !== 'NO_TRADE')
+    : rawOpportunities;
 
   return (
     <section
@@ -411,6 +466,21 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
               <option value={25_000_000}>Vol ≥ $25M</option>
               <option value={100_000_000}>Vol ≥ $100M</option>
             </select>
+
+            <button
+              type="button"
+              onClick={() => setOnlyApproved((v) => !v)}
+              aria-pressed={onlyApproved}
+              data-testid="radar-only-approved-btn"
+              className={`flex min-h-[34px] items-center gap-1 rounded-lg border px-2.5 text-[11px] font-medium whitespace-nowrap transition-colors ${
+                onlyApproved
+                  ? 'border-emerald-500/50 bg-emerald-500/15 text-emerald-300'
+                  : 'border-slate-800 bg-[#070B12] text-slate-400 hover:text-slate-200'
+              }`}
+            >
+              <CheckCircle2 className="h-3.5 w-3.5" />
+              <span>{t('radar.filter.onlyApproved')}</span>
+            </button>
           </div>
 
           {errorMsg && (
@@ -505,22 +575,35 @@ export const FullMarketRadar: React.FC<FullMarketRadarProps> = ({
                         </td>
 
                         <td className="py-2.5 pr-3 font-sans">
-                          <div
-                            className={`font-mono font-semibold ${
-                              opp.deepVerified
-                                ? opp.signalState === 'APPROVED' && opp.direction !== 'NO_TRADE'
-                                  ? opp.direction === 'LONG'
-                                    ? 'text-emerald-400'
-                                    : 'text-rose-400'
-                                  : 'text-slate-300'
-                                : 'text-cyan-300'
-                            }`}
-                          >
-                            {opp.deepVerified
-                              ? `${opp.direction} · ${opp.signalState}`
-                              : `Est. ${opp.direction}`}
+                          <div className="flex items-center gap-1.5">
+                            <span
+                              className={`font-mono font-semibold ${
+                                opp.deepVerified
+                                  ? opp.signalState === 'APPROVED' && opp.direction !== 'NO_TRADE'
+                                    ? opp.direction === 'LONG'
+                                      ? 'text-emerald-400'
+                                      : 'text-rose-400'
+                                    : 'text-slate-300'
+                                  : 'text-cyan-300'
+                              }`}
+                            >
+                              {opp.deepVerified
+                                ? `${opp.direction} · ${opp.signalState}`
+                                : `Est. ${opp.direction}`}
+                            </span>
+                            {(() => {
+                              const tierTag = formatQualityTierTag(opp.qualityTier);
+                              return tierTag ? (
+                                <span className={`font-mono text-[10px] font-bold ${tierTag.cls}`}>
+                                  [{tierTag.label}]
+                                </span>
+                              ) : null;
+                            })()}
                           </div>
-                          <div className={`text-[11px] ${htf.cls}`}>{htf.label}</div>
+                          <div className={`text-[11px] ${htf.cls}`}>
+                            {htf.label}
+                            {opp.timeHorizon ? ` · ${opp.timeHorizon}` : ''}
+                          </div>
                         </td>
 
                         <td className="py-2.5 pr-3 text-right">

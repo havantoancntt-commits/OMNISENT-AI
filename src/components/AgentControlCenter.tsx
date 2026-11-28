@@ -7,7 +7,6 @@ import {
   Play,
   Power,
   RefreshCw,
-  Search,
   Send,
   ShieldCheck,
   Sparkles,
@@ -52,7 +51,6 @@ interface AgentControlCenterProps {
   onSelectSymbol: (symbol: string, marketType: MarketType, exchange?: string) => void;
   onAgentAction: (agentId: string, action: 'START' | 'STOP' | 'RESTART' | 'ENABLE' | 'DISABLE') => void;
   onRunPipeline: (symbol: string, marketType: MarketType, exchange?: string) => void;
-  onOpenGlobalSearch?: () => void;
   onRefreshState?: () => Promise<void> | void;
   pipelineLoading: boolean;
 }
@@ -91,7 +89,6 @@ export const AgentControlCenter: React.FC<AgentControlCenterProps> = ({
   onSelectSymbol,
   onAgentAction,
   onRunPipeline,
-  onOpenGlobalSearch,
   onRefreshState,
   pipelineLoading,
 }) => {
@@ -295,17 +292,6 @@ export const AgentControlCenter: React.FC<AgentControlCenterProps> = ({
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {onOpenGlobalSearch && (
-                <button
-                  type="button"
-                  onClick={onOpenGlobalSearch}
-                  aria-label={t('agents.searchAria')}
-                  className="flex min-h-[42px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#070B12] px-3 text-xs font-medium text-cyan-300 hover:border-cyan-500/50 whitespace-nowrap"
-                >
-                  <Search className="h-3.5 w-3.5" />
-                  <span>{t('agents.searchBtn')}</span>
-                </button>
-              )}
               <select
                 value={activeSelectValue}
                 onChange={(e) => {

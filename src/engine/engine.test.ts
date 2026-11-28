@@ -4238,6 +4238,197 @@ test('PWA telemetry snapshot preserves optional ledgerEpoch while keeping backwa
   assert.equal(legacyParsed.ledgerEpoch, null);
 });
 
+test('Full-Market Screener rejects crossed books and wild mid-price skew, computes qualityTier, and filters onlyApproved', async () => {
+  const {
+    buildDeepVerifiedOpportunity,
+    isValidMarketDirectoryQuote,
+    preScreenMarketDirectory,
+    rankDeepOpportunities,
+  } = await import('./marketScreener.ts');
+
+  const crossedQuote = {
+    symbol: 'TRAP/USDT',
+    baseAsset: 'TRAP',
+    quoteAsset: 'USDT',
+    exchange: 'Binance' as const,
+    exchangeId: 'binance' as const,
+    marketType: 'PERPETUAL' as const,
+    nativeSymbol: 'TRAPUSDT',
+    lastPrice: 10.0,
+    bidPrice: 10.25,
+    askPrice: 10.0,
+    change24hPct: 6.5,
+    volume24hUsd: 900_000_000,
+    maxLeverage: 20,
+  };
+  assert.equal(isValidMarketDirectoryQuote(crossedQuote), false);
+
+  const skewedQuote = {
+    ...crossedQuote,
+    symbol: 'SKEW/USDT',
+    baseAsset: 'SKEW',
+    bidPrice: 9.0,
+    askPrice: 9.01,
+    lastPrice: 10.0, // >10% away from book mid
+  };
+  assert.equal(isValidMarketDirectoryQuote(skewedQuote), false);
+
+  const healthyQuote = {
+    symbol: 'AVAX/USDT',
+    baseAsset: 'AVAX',
+    quoteAsset: 'USDT',
+    exchange: 'Binance' as const,
+    exchangeId: 'binance' as const,
+    marketType: 'PERPETUAL' as const,
+    nativeSymbol: 'AVAXUSDT',
+    lastPrice: 36.2,
+    bidPrice: 36.19,
+    askPrice: 36.21,
+    change24hPct: 5.4,
+    volume24hUsd: 320_000_000,
+    maxLeverage: 25,
+    high24h: 36.6,
+    low24h: 33.8,
+  };
+  assert.equal(isValidMarketDirectoryQuote(healthyQuote), true);
+
+  const screened = preScreenMarketDirectory([crossedQuote, skewedQuote, healthyQuote], {
+    minVolumeUsd: 1_000_000,
+    limit: 10,
+  });
+  assert.equal(screened.length, 1);
+  assert.equal(screened[0].symbol, 'AVAX/USDT');
+
+  const baseStage1 = screened[0];
+  const liveTicker = makeValidTicker({
+    symbol: 'AVAX/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    lastPrice: 36.42,
+    bidPrice: 36.41,
+    askPrice: 36.43,
+  });
+
+  const nowIso = new Date().toISOString();
+  const expIso = new Date(Date.now() + 3600_000).toISOString();
+  const baseRiskCheck = {
+    approved: true,
+    decision: 'APPROVE' as const,
+    reasons: [] as string[],
+    warnings: [] as string[],
+    recommendedQuantity: 10,
+    notionalValueUsd: 364.2,
+    requiredMarginUsd: 121.4,
+    estimatedRiskUsd: 500,
+    estimatedRiskPct: 0.5,
+    riskRewardRatio: 2.25,
+    estimatedFeesUsd: 0.36,
+    estimatedSlippageUsd: 0.12,
+    liquidationPriceEst: 24.5,
+    checkedAtUtc: nowIso,
+  };
+
+  const approvedSignal = {
+    id: 'SIG-APLUS',
+    symbol: 'AVAX/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL' as const,
+    direction: 'LONG' as const,
+    state: 'APPROVED' as const,
+    entryRange: [36.4, 36.44] as [number, number],
+    stopLoss: 35.1,
+    takeProfitLevels: [38.2, 39.4],
+    positionSizeQty: 10,
+    riskUsd: 500,
+    rewardUsd: 1500,
+    leverage: 3,
+    riskReward: 2.25,
+    timeHorizon: '1H + 4H',
+    marketRegime: 'BULL' as const,
+    technicalScore: 84,
+    quantScore: 81,
+    liquidityScore: 95,
+    fundamentalScore: 78,
+    sentimentScore: 76,
+    dataQualityScore: 98,
+    riskScore: 90,
+    confidenceScore: 82,
+    calibratedProbabilityNote: 'Calibrated',
+    htfAlignment: 'ALIGNED_BULL' as const,
+    expectedValueR: 0.48,
+    recommendedRiskPct: 0.5,
+    strategyName: 'Adaptive Alpha v4',
+    reasoningSummary: 'Breakout aligned',
+    conflictsDetected: [],
+    agentVotes: [],
+    dataSource: 'LIVE_EXCHANGE' as const,
+    timestampUtc: nowIso,
+    expiresAtUtc: expIso,
+    riskCheck: baseRiskCheck,
+  };
+
+  const approvedAPlus = buildDeepVerifiedOpportunity({
+    stage1: baseStage1,
+    liveTicker,
+    backtest: null,
+    signal: approvedSignal,
+  });
+  assert.equal(approvedAPlus.qualityTier, 'INSTITUTIONAL_A_PLUS');
+  assert.equal(approvedAPlus.entryPrice, 36.42);
+  assert.equal(approvedAPlus.lastPrice, 36.42);
+
+  const rejectedSetup = buildDeepVerifiedOpportunity({
+    stage1: baseStage1,
+    backtest: null,
+    signal: {
+      ...approvedSignal,
+      id: 'SIG-REJ',
+      direction: 'NO_TRADE',
+      state: 'REJECTED',
+      entryRange: [36.2, 36.2],
+      stopLoss: 35.0,
+      takeProfitLevels: [38.0],
+      positionSizeQty: 0,
+      riskUsd: 0,
+      rewardUsd: 0,
+      leverage: 2,
+      riskReward: 1.5,
+      timeHorizon: '1H',
+      marketRegime: 'SIDEWAYS',
+      technicalScore: 50,
+      quantScore: 50,
+      liquidityScore: 90,
+      fundamentalScore: 60,
+      sentimentScore: 60,
+      dataQualityScore: 95,
+      riskScore: 40,
+      confidenceScore: 45,
+      calibratedProbabilityNote: 'Rejected',
+      htfAlignment: 'NEUTRAL',
+      expectedValueR: -0.1,
+      reasoningSummary: 'Insufficient confluence',
+      riskCheck: {
+        ...baseRiskCheck,
+        approved: false,
+        decision: 'REJECT',
+        reasons: ['Insufficient edge'],
+        recommendedQuantity: 0,
+        notionalValueUsd: 0,
+        requiredMarginUsd: 0,
+        estimatedRiskUsd: 0,
+        estimatedRiskPct: 0,
+        riskRewardRatio: 1.5,
+      },
+    },
+  });
+  assert.equal(rejectedSetup.qualityTier, 'REJECTED');
+
+  const onlyApp = rankDeepOpportunities([rejectedSetup, approvedAPlus], 'ALL', true);
+  assert.equal(onlyApp.length, 1);
+  assert.equal(onlyApp[0].qualityTier, 'INSTITUTIONAL_A_PLUS');
+});
+
+
 
 
 
