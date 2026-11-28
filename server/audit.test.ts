@@ -255,3 +255,227 @@ test('openDatabaseWithRecovery quarantines corrupted SQLite files and recovers a
     recovered.close();
   }
 });
+
+test('SQLite ledgerEpoch rotates on session reset, rejected orders do not poison idempotency keys, and close returns authoritative state beyond 20 orders', async () => {
+  dbModule.resetTradingSession('PAPER');
+  const epochBefore = dbModule.getLedgerEpoch();
+  const revBefore = dbModule.getStateRevision();
+  assert.ok(typeof epochBefore === 'string' && epochBefore.length >= 16);
+  assert.ok(revBefore >= 1);
+
+  // 1. openPositionAtomically enforces maxOpenPositions concurrency invariant inside SQLite transaction
+  const riskCfg = { ...dbModule.getRiskConfig(), maxOpenPositions: 1 };
+  dbModule.saveRiskConfig(riskCfg);
+
+  dbModule.openPositionAtomically({
+    order: {
+      id: 'ORD-CONC-1',
+      idempotencyKey: 'CONC-KEY-1',
+      symbol: 'BTC/USDT',
+      exchange: 'Binance',
+      marketType: 'PERPETUAL',
+      side: 'LONG',
+      orderType: 'MARKET',
+      quantity: 0.05,
+      price: 90_000,
+      stopLoss: 88_000,
+      takeProfit: 94_000,
+      leverage: 2,
+      feesUsd: 2.25,
+      slippageUsd: 1,
+      status: 'FILLED',
+      lifecycleState: 'FILLED',
+      mode: 'PAPER',
+      strategyName: 'AutoAlpha Test',
+      riskDecision: 'APPROVE',
+      createdAtUtc: new Date().toISOString(),
+    },
+    position: {
+      id: 'POS-CONC-1',
+      symbol: 'BTC/USDT',
+      exchange: 'Binance',
+      marketType: 'PERPETUAL',
+      side: 'LONG',
+      quantity: 0.05,
+      entryPrice: 90_000,
+      markPrice: 90_000,
+      stopLoss: 88_000,
+      initialStopLoss: 88_000,
+      takeProfit: 94_000,
+      leverage: 2,
+      marginUsd: 2_250,
+      unrealizedPnlUsd: 0,
+      unrealizedPnlPct: 0,
+      liquidationPrice: 45_450,
+      fundingPaidUsd: 0,
+      strategyName: 'AutoAlpha Test',
+      mode: 'PAPER',
+      openedAtUtc: new Date().toISOString(),
+    },
+    feeUsd: 2.25,
+    auditActor: 'AUTO_EXECUTION_ENGINE',
+    auditAction: 'AUTO_EXEC_ORDER_FILLED',
+    auditDetails: 'Slot 1 filled',
+  });
+
+  // 2nd concurrent autonomous open must be rejected atomically by SQLite transaction at cap=1
+  assert.throws(() =>
+    dbModule.openPositionAtomically({
+      order: {
+        id: 'ORD-CONC-2',
+        idempotencyKey: 'CONC-KEY-2',
+        symbol: 'ETH/USDT',
+        exchange: 'Binance',
+        marketType: 'PERPETUAL',
+        side: 'LONG',
+        orderType: 'MARKET',
+        quantity: 0.5,
+        price: 3_000,
+        stopLoss: 2_900,
+        takeProfit: 3_300,
+        leverage: 2,
+        feesUsd: 0.75,
+        slippageUsd: 0.3,
+        status: 'FILLED',
+        lifecycleState: 'FILLED',
+        mode: 'PAPER',
+        strategyName: 'AutoAlpha Test',
+        riskDecision: 'APPROVE',
+        createdAtUtc: new Date().toISOString(),
+      },
+      position: {
+        id: 'POS-CONC-2',
+        symbol: 'ETH/USDT',
+        exchange: 'Binance',
+        marketType: 'PERPETUAL',
+        side: 'LONG',
+        quantity: 0.5,
+        entryPrice: 3_000,
+        markPrice: 3_000,
+        stopLoss: 2_900,
+        initialStopLoss: 2_900,
+        takeProfit: 3_300,
+        leverage: 2,
+        marginUsd: 750,
+        unrealizedPnlUsd: 0,
+        unrealizedPnlPct: 0,
+        liquidationPrice: 1_515,
+        fundingPaidUsd: 0,
+        strategyName: 'AutoAlpha Test',
+        mode: 'PAPER',
+        openedAtUtc: new Date().toISOString(),
+      },
+      feeUsd: 0.75,
+      auditActor: 'AUTO_EXECUTION_ENGINE',
+      auditAction: 'AUTO_EXEC_ORDER_FILLED',
+      auditDetails: 'Should exceed slot cap',
+    }),
+  );
+
+  // 2. Rejected orders must NOT poison getRecentIdempotencyKeys
+  dbModule.insertOrder({
+    id: 'ORD-REJ-POISON',
+    idempotencyKey: 'KEY-NOT-POISONED',
+    symbol: 'SOL/USDT',
+    exchange: 'Binance',
+    marketType: 'PERPETUAL',
+    side: 'LONG',
+    orderType: 'MARKET',
+    quantity: 1,
+    price: 150,
+    stopLoss: 145,
+    takeProfit: 165,
+    leverage: 2,
+    feesUsd: 0,
+    slippageUsd: 0,
+    status: 'REJECTED',
+    lifecycleState: 'RISK_REJECTED',
+    mode: 'PAPER',
+    strategyName: 'Test',
+    riskDecision: 'REJECT',
+    createdAtUtc: new Date().toISOString(),
+  });
+  const activeKeys = dbModule.getRecentIdempotencyKeys(50);
+  assert.equal(activeKeys.includes('CONC-KEY-1'), true);
+  assert.equal(activeKeys.includes('KEY-NOT-POISONED'), false);
+
+  // 3. Close POS-CONC-1, push 25 filler orders, and confirm POST /close returns 409 alreadyClosed with authoritative portfolio & ledgerEpoch
+  const closed = dbModule.closePositionAtomically({
+    positionId: 'POS-CONC-1',
+    resolveClosePrice: () => 91_000,
+    closeReason: 'STOP_LOSS',
+    idempotencyPrefix: 'CLOSE',
+    actor: 'EXIT_STRATEGY',
+    auditAction: 'AUTO_STOP_LOSS',
+  });
+  assert.equal(closed.closed, true);
+
+  for (let i = 0; i < 25; i++) {
+    dbModule.insertOrder({
+      id: `ORD-FILLER-${i}`,
+      idempotencyKey: `FILLER-${i}`,
+      symbol: 'XRP/USDT',
+      exchange: 'Binance',
+      marketType: 'PERPETUAL',
+      side: 'LONG',
+      orderType: 'MARKET',
+      quantity: 10,
+      price: 1.5,
+      stopLoss: 1.4,
+      takeProfit: 1.8,
+      leverage: 2,
+      feesUsd: 0,
+      slippageUsd: 0,
+      status: 'CANCELLED',
+      lifecycleState: 'CANCELLED',
+      mode: 'PAPER',
+      strategyName: 'Filler',
+      riskDecision: 'APPROVE',
+      createdAtUtc: new Date(Date.now() + i + 10).toISOString(),
+    });
+  }
+
+  const closeAgainRes = await fetch(`${baseUrl}/api/positions/POS-CONC-1/close`, {
+    method: 'POST',
+  });
+  assert.equal(closeAgainRes.status, 409);
+  const closeAgainBody = (await closeAgainRes.json()) as {
+    alreadyClosed: boolean;
+    positions: unknown[];
+    portfolio: { totalEquityUsd: number };
+    ledgerEpoch: string;
+    stateRevision: number;
+  };
+  assert.equal(closeAgainBody.alreadyClosed, true);
+  assert.equal(closeAgainBody.positions.length, 0);
+  assert.equal(closeAgainBody.ledgerEpoch, epochBefore);
+
+  // Unknown ghost ID returns 404 with alreadyClosed: true & authoritative empty positions
+  const ghostCloseRes = await fetch(`${baseUrl}/api/positions/POS-NON-EXISTENT-999/close`, {
+    method: 'POST',
+  });
+  assert.equal(ghostCloseRes.status, 404);
+  const ghostCloseBody = (await ghostCloseRes.json()) as {
+    alreadyClosed: boolean;
+    positions: unknown[];
+    ledgerEpoch: string;
+  };
+  assert.equal(ghostCloseBody.alreadyClosed, true);
+  assert.equal(ghostCloseBody.positions.length, 0);
+
+  // 4. Resetting trading session rotates ledgerEpoch and sync bootstrap exposes it
+  const resetRes = await fetch(`${baseUrl}/api/session/reset`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ mode: 'PAPER' }),
+  });
+  assert.equal(resetRes.status, 200);
+  const resetJson = (await resetRes.json()) as { ledgerEpoch: string; stateRevision: number };
+  assert.notEqual(resetJson.ledgerEpoch, epochBefore);
+
+  const bootRes = await fetch(`${baseUrl}/api/sync/bootstrap`);
+  assert.equal(bootRes.status, 200);
+  const bootJson = (await bootRes.json()) as { ledgerEpoch: string; stateRevision: number };
+  assert.equal(bootJson.ledgerEpoch, resetJson.ledgerEpoch);
+});
+

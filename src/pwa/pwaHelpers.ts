@@ -226,6 +226,7 @@ export interface PWATelemetrySnapshotPayload {
   v: 1;
   savedAtMs: number;
   stateRevision: number | null;
+  ledgerEpoch?: string | null;
   tradingMode: string;
   serverUtc: string;
   tickers: unknown[];
@@ -305,6 +306,7 @@ function sanitizeAutoExecutionSnapshot(raw: unknown): Record<string, unknown> | 
 export function serializeTelemetrySnapshot(input: {
   nowMs?: number;
   stateRevision?: number | null;
+  ledgerEpoch?: string | null;
   tradingMode: string;
   serverUtc: string;
   tickers: unknown[];
@@ -317,6 +319,7 @@ export function serializeTelemetrySnapshot(input: {
     v: 1,
     savedAtMs: input.nowMs ?? Date.now(),
     stateRevision: typeof input.stateRevision === 'number' ? input.stateRevision : null,
+    ledgerEpoch: typeof input.ledgerEpoch === 'string' ? input.ledgerEpoch : null,
     tradingMode: input.tradingMode,
     serverUtc: input.serverUtc,
     tickers: Array.isArray(input.tickers) ? input.tickers.slice(0, 60) : [],
@@ -367,6 +370,7 @@ export function parseTelemetrySnapshot(
       v: 1,
       savedAtMs: parsed.savedAtMs,
       stateRevision: typeof parsed.stateRevision === 'number' ? parsed.stateRevision : null,
+      ledgerEpoch: typeof parsed.ledgerEpoch === 'string' ? parsed.ledgerEpoch : null,
       tradingMode: parsed.tradingMode,
       serverUtc: typeof parsed.serverUtc === 'string' ? parsed.serverUtc : '',
       tickers: parsed.tickers,

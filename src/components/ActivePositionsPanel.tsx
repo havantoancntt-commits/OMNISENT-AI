@@ -37,6 +37,7 @@ interface ActivePositionsPanelProps {
   ) => Promise<{ ok: boolean; error?: string }>;
   onInspectSymbol?: (symbol: string, marketType: MarketType, exchange?: string) => void;
   onGoToScanner?: () => void;
+  collapseWhenEmptyWithoutNotices?: boolean;
 }
 
 function formatPrice(value: number, decimals: number): string {
@@ -60,6 +61,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
   onUpdateSlTp,
   onInspectSymbol,
   onGoToScanner,
+  collapseWhenEmptyWithoutNotices = false,
 }) => {
   const { t } = useI18n();
   const [nowMs, setNowMs] = useState(() => Date.now());
@@ -310,6 +312,15 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
         };
       })()
     : null;
+
+  if (
+    collapseWhenEmptyWithoutNotices &&
+    positions.length === 0 &&
+    !settlementNotice &&
+    !raceNotice
+  ) {
+    return null;
+  }
 
   return (
     <section
@@ -808,8 +819,8 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           aria-modal="true"
           aria-labelledby="close-pos-modal-title"
           data-testid="close-position-modal"
-          onClick={() => {
-            if (!busyId) {
+          onMouseDown={(e) => {
+            if (e.target === e.currentTarget && !busyId) {
               lastConfirmMetaRef.current = null;
               setConfirmTargetId(null);
               setCloseError(null);
@@ -817,10 +828,7 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
           }}
           className="fixed inset-0 z-50 flex items-end justify-center bg-black/75 p-0 backdrop-blur-[2px] sm:items-center sm:p-4"
         >
-          <div
-            onClick={(e) => e.stopPropagation()}
-            className="max-h-[88dvh] w-full max-w-lg overflow-y-auto rounded-t-2xl border border-slate-700/90 bg-[#0E1522] p-4 pb-6 shadow-2xl sm:rounded-2xl sm:p-5"
-          >
+          <div className="max-h-[88dvh] w-full max-w-lg overflow-y-auto rounded-t-2xl border border-slate-700/90 bg-[#0E1522] p-4 pb-6 shadow-2xl sm:rounded-2xl sm:p-5">
             {/* Modal Header */}
             <div className="flex items-start justify-between gap-3 border-b border-slate-800 pb-3">
               <div className="min-w-0">
@@ -1032,13 +1040,13 @@ export const ActivePositionsPanel: React.FC<ActivePositionsPanelProps> = ({
                 disabled={busyId === modalMeta.position.id}
                 data-testid="close-modal-confirm-btn"
                 onClick={() => handleConfirmClose(modalMeta.position)}
-                className={`flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg px-4 text-xs font-semibold text-white disabled:opacity-50 ${
+                className={`flex min-h-[44px] items-center justify-center gap-1.5 rounded-lg px-4 text-xs font-semibold text-white whitespace-nowrap tabular-nums disabled:opacity-50 ${
                   modalMeta.estNetPnlUsd >= 0
                     ? 'bg-emerald-600 hover:bg-emerald-500'
                     : 'bg-rose-600 hover:bg-rose-500'
                 }`}
               >
-                <XCircle className="h-4 w-4" />
+                <XCircle className="h-4 w-4 shrink-0" />
                 <span>
                   {busyId === modalMeta.position.id
                     ? t('pos.closeModal.confirmingBtn')

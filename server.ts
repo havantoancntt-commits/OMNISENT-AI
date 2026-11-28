@@ -29,7 +29,9 @@ import {
   getExchanges,
   getExchangeEncryptedCredentials,
   getLatestPnlSnapshot,
+  getLedgerEpoch,
   getOpenPositions,
+  getOrderByIdempotencyKeys,
   getOrders,
   getOrderStateEvents,
   getPnlHistory,
@@ -106,6 +108,7 @@ import {
   resolveTradingModeAfterAutoConfig,
   syncAutoConfigWithRiskConfig,
   syncAutoConfigWithTradingMode,
+  validateLiveRequotedAutoOrder,
 } from './src/engine/autoExecutionEngine.ts';
 import {
   computePortfolioCorrelationGuard,
@@ -280,6 +283,44 @@ function getLiveStitchedCandles(
     return candles;
   }
   return mergeLiveTickIntoCandles(candles, ticker.lastPrice, ticker.timestampUtc, interval);
+}
+
+async function refreshFreshTickerForExecution(
+  symbol: string,
+  marketType?: MarketType,
+  exchange?: string,
+): Promise<MarketTicker | undefined> {
+  const cached = marketFeed.getTicker(symbol, marketType, exchange);
+  const nowMs = Date.now();
+  const needsRefresh =
+    !cached ||
+    cached.lastPrice <= 0 ||
+    cached.dataStatus !== 'LIVE_EXCHANGE' ||
+    !Number.isFinite(cached.timestampUtc) ||
+    cached.timestampUtc <= 0 ||
+    nowMs - cached.timestampUtc > 2500;
+
+  if (!needsRefresh) {
+    return cached;
+  }
+
+  try {
+    const refreshed = await Promise.race([
+      (async () => {
+        const q = await marketFeed.refreshPairQuote(symbol, marketType, exchange);
+        if (q && q.lastPrice > 0) return q;
+        return await marketFeed.activatePair(symbol, marketType, exchange);
+      })(),
+      new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 2500)),
+    ]);
+    if (refreshed && refreshed.lastPrice > 0) {
+      return refreshed;
+    }
+  } catch {
+    // fallback to latest cached ticker if still present
+  }
+
+  return marketFeed.getTicker(symbol, marketType, exchange) ?? cached;
 }
 
 // Helper to recompute portfolio equity, mark-to-market positions, and record real PnL snapshots
@@ -668,6 +709,7 @@ app.get('/api/sync/bootstrap', (_req, res) => {
   });
   res.json({
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
     tradingMode: getTradingMode(),
     liveFeedActive: marketFeed.isLiveFeedActive(),
     liveExecutionEnabled: isLiveExecutionEnabled(),
@@ -1311,7 +1353,7 @@ app.post('/api/agents/:id/action', (req, res) => {
   });
   autoExecRuntime.broadcastAutoStatus?.();
 
-  res.json({ agent: target, stateRevision: getStateRevision() });
+  res.json({ agent: target, stateRevision: getStateRevision(), ledgerEpoch: getLedgerEpoch() });
 });
 
 app.post('/api/pipeline/run', async (req, res) => {
@@ -1392,7 +1434,7 @@ app.post('/api/pipeline/run', async (req, res) => {
   });
   autoExecRuntime.broadcastAutoStatus?.();
 
-  res.json({ signal, stateRevision: getStateRevision() });
+  res.json({ signal, stateRevision: getStateRevision(), ledgerEpoch: getLedgerEpoch() });
 });
 
 app.post('/api/ai/synthesize', async (req, res) => {
@@ -1726,7 +1768,8 @@ function executeRiskVerifiedPaperOrder(params: {
 
   const finalPosition: Position = {
     ...fill.position,
-    markPrice: markPrice > 0 ? markPrice : fill.executedPrice,
+    markPrice:
+      Number.isFinite(markPrice) && markPrice > 0 ? markPrice : fill.executedPrice,
   };
 
   openPositionAtomically({
@@ -1830,6 +1873,19 @@ async function runAutonomousExecutionCycle(
 
   autoExecRuntime.cycleInProgress = true;
   const t0 = Date.now();
+  const cycleEpoch = getLedgerEpoch();
+  const isCycleCancelled = (): boolean => {
+    if (getLedgerEpoch() !== cycleEpoch) return true;
+    const liveMode = getTradingMode();
+    if (liveMode === 'EMERGENCY_STOP') return true;
+    if (trigger === 'SCHEDULER') {
+      const liveCfg = getAutoExecutionConfig();
+      if (!liveCfg.enabled || (liveMode !== 'FULL_AUTO' && liveMode !== 'SEMI_AUTO')) {
+        return true;
+      }
+    }
+    return false;
+  };
 
   try {
     const effectiveEvalMode: TradingMode =
@@ -1978,21 +2034,91 @@ async function runAutonomousExecutionCycle(
 
       saveSignal(item.signal);
 
+      if (isCycleCancelled()) {
+        return 'SKIPPED';
+      }
+
       if (config.executionMode === 'FULL_AUTO' && effectiveEvalMode === 'FULL_AUTO') {
-        if (tradingMode === 'ANALYSIS_ONLY') {
+        if (getTradingMode() === 'ANALYSIS_ONLY') {
           autoExecRuntime.lastSummary = `Tìm thấy ${item.ticker.symbol} đạt chuẩn — đang ở ANALYSIS_ONLY nên giữ nguyên tắc không khớp lệnh.`;
           return 'SKIPPED';
         }
 
-        await marketFeed
-          .activatePair(item.ticker.symbol, item.ticker.marketType, item.ticker.exchange)
-          .catch(() => null);
+        const liveTicker = await refreshFreshTickerForExecution(
+          item.ticker.symbol,
+          item.ticker.marketType,
+          item.ticker.exchange,
+        );
+        if (isCycleCancelled()) {
+          return 'SKIPPED';
+        }
+        const minRrFloor =
+          evalResult.executionTier === 'CORE_9_GATE'
+            ? Math.max(config.minRiskReward, riskConfig.minRiskReward)
+            : riskConfig.minRiskReward;
+        const requote = validateLiveRequotedAutoOrder({
+          orderRequest: evalResult.orderRequest,
+          liveTicker,
+          referenceEntryPrice: item.ticker.lastPrice,
+          minRiskReward: minRrFloor,
+          maxDriftPct: 1.2,
+          maxSpreadBps: 25,
+          maxQuoteAgeMs: 15_000,
+          nowMs: Date.now(),
+        });
+        if (!requote.ok) {
+          recordAutoActivity({
+            symbol: item.ticker.symbol,
+            exchange: item.ticker.exchange,
+            side: evalResult.orderRequest.side,
+            action: 'SKIPPED',
+            reason: requote.reason || 'Giá live biến động vượt ngưỡng an toàn trước khi khớp.',
+            alphaScore: item.opp.compositeAlphaScore,
+            expectedValueR: item.opp.expectedValueR,
+            tier: evalResult.executionTier,
+          });
+          return 'SKIPPED';
+        }
+
+        const freshState = syncPortfolioAndPositions();
+        const freshRiskContext = {
+          tradingMode: effectiveEvalMode,
+          accountEquityUsd: freshState.portfolio.totalEquityUsd,
+          availableBalanceUsd: freshState.portfolio.availableBalanceUsd,
+          dailyPnlPct: freshState.portfolio.dailyPnlPct,
+          weeklyPnlPct: freshState.portfolio.weeklyPnlPct,
+          currentDrawdownPct: freshState.portfolio.currentDrawdownPct,
+          openPositions: freshState.positions,
+          recentIdempotencyKeys: getRecentIdempotencyKeys(200),
+        };
+        const freshRiskCheck = evaluateOrderRisk(
+          requote.updatedOrderRequest,
+          riskConfig,
+          freshRiskContext,
+        );
+        if (!freshRiskCheck.approved) {
+          recordAutoActivity({
+            symbol: item.ticker.symbol,
+            exchange: item.ticker.exchange,
+            side: requote.updatedOrderRequest.side,
+            action: 'SKIPPED',
+            reason: freshRiskCheck.reasons[0] || 'Risk Engine từ chối sau khi cập nhật giá live.',
+            alphaScore: item.opp.compositeAlphaScore,
+            expectedValueR: item.opp.expectedValueR,
+            tier: evalResult.executionTier,
+          });
+          return 'SKIPPED';
+        }
 
         const jobLock = acquireAutoJobLock({
-          idempotencyKey: evalResult.orderRequest.idempotencyKey,
+          idempotencyKey: requote.updatedOrderRequest.idempotencyKey,
           lockOwner: 'AUTO_EXECUTION_ENGINE',
           leaseMs: 20_000,
-          payload: { symbol: item.ticker.symbol, side: evalResult.orderRequest.side },
+          payload: {
+            symbol: requote.updatedOrderRequest.symbol,
+            marketType: requote.updatedOrderRequest.marketType,
+            side: requote.updatedOrderRequest.side,
+          },
         });
         if (!jobLock.acquired) {
           return 'SKIPPED';
@@ -2001,25 +2127,11 @@ async function runAutonomousExecutionCycle(
         let filled;
         try {
           filled = executeRiskVerifiedPaperOrder({
-            orderReq: {
-              ...evalResult.orderRequest,
-              tickerTimestampUtc: item.ticker.timestampUtc,
-              requireFreshTimestamp: true,
-              nowMs: Date.now(),
-            },
+            orderReq: requote.updatedOrderRequest,
             riskConfig,
-            riskContext: {
-              tradingMode: effectiveEvalMode,
-              accountEquityUsd: latestPortfolio.totalEquityUsd,
-              availableBalanceUsd: latestPortfolio.availableBalanceUsd,
-              dailyPnlPct: latestPortfolio.dailyPnlPct,
-              weeklyPnlPct: latestPortfolio.weeklyPnlPct,
-              currentDrawdownPct: latestPortfolio.currentDrawdownPct,
-              openPositions: currentOpen,
-              recentIdempotencyKeys: getRecentIdempotencyKeys(200),
-            },
-            riskCheck: evalResult.riskCheck,
-            markPrice: item.ticker.lastPrice,
+            riskContext: freshRiskContext,
+            riskCheck: freshRiskCheck,
+            markPrice: liveTicker!.lastPrice,
             actor: 'AUTO_EXECUTION_ENGINE',
             auditAction:
               evalResult.executionTier === 'CORE_9_GATE'
@@ -2028,7 +2140,18 @@ async function runAutonomousExecutionCycle(
           });
           completeAutoJob(jobLock.jobId);
         } catch (execErr) {
-          failAutoJob(jobLock.jobId, execErr instanceof Error ? execErr.message : 'Execution failed');
+          const reason = execErr instanceof Error ? execErr.message : 'Execution failed';
+          failAutoJob(jobLock.jobId, reason);
+          recordAutoActivity({
+            symbol: item.ticker.symbol,
+            exchange: item.ticker.exchange,
+            side: requote.updatedOrderRequest.side,
+            action: 'SKIPPED',
+            reason,
+            alphaScore: item.opp.compositeAlphaScore,
+            expectedValueR: item.opp.expectedValueR,
+            tier: evalResult.executionTier,
+          });
           return 'SKIPPED';
         }
 
@@ -2040,14 +2163,14 @@ async function runAutonomousExecutionCycle(
         executedCount += 1;
 
         const tierLabel = evalResult.executionTier === 'CORE_9_GATE' ? '9-Gate Core' : 'Tactical Continuity';
-        const msg = `Auto FULL_AUTO [${tierLabel}] khớp ${evalResult.orderRequest.side} ${evalResult.riskCheck.recommendedQuantity} ${item.ticker.symbol} @ $${filled.execPrice} (Alpha ${item.opp.compositeAlphaScore.toFixed(1)}, EV +${item.opp.expectedValueR.toFixed(2)}R, Risk ${evalResult.effectiveRiskPct}%).`;
+        const msg = `Auto FULL_AUTO [${tierLabel}] khớp ${requote.updatedOrderRequest.side} ${filled.position.quantity} ${item.ticker.symbol} @ $${filled.execPrice} (Alpha ${item.opp.compositeAlphaScore.toFixed(1)}, EV +${item.opp.expectedValueR.toFixed(2)}R, Risk ${evalResult.effectiveRiskPct}%).`;
         autoExecRuntime.lastSummary = msg;
         persistAutoRuntimeState();
 
         recordAutoActivity({
           symbol: item.ticker.symbol,
           exchange: item.ticker.exchange,
-          side: evalResult.orderRequest.side,
+          side: requote.updatedOrderRequest.side,
           action: 'EXECUTED',
           reason: msg,
           alphaScore: item.opp.compositeAlphaScore,
@@ -2064,6 +2187,9 @@ async function runAutonomousExecutionCycle(
       }
 
       // SEMI_AUTO mode: stage verified proposal for trader 1-click confirmation
+      if (isCycleCancelled()) {
+        return 'SKIPPED';
+      }
       const existingPending = getAutoProposals('PENDING', 20).find(
         (p) =>
           p.symbol === item.ticker.symbol &&
@@ -2179,9 +2305,11 @@ async function runAutonomousExecutionCycle(
     autoExecRuntime.lastSummary = `Chu kỳ Auto-Execution tạm hoãn: ${err instanceof Error ? err.message : 'Lỗi kết nối sàn'}`;
   } finally {
     autoExecRuntime.cycleInProgress = false;
-    autoExecRuntime.lastCycleAtMs = Date.now();
-    autoExecRuntime.lastScanDurationMs = Math.max(1, Date.now() - t0);
-    persistAutoRuntimeState();
+    if (getLedgerEpoch() === cycleEpoch) {
+      autoExecRuntime.lastCycleAtMs = Date.now();
+      autoExecRuntime.lastScanDurationMs = Math.max(1, Date.now() - t0);
+      persistAutoRuntimeState();
+    }
     autoExecRuntime.broadcastAutoStatus?.();
   }
 
@@ -2189,7 +2317,7 @@ async function runAutonomousExecutionCycle(
 }
 
 app.get('/api/auto-trade/status', (_req, res) => {
-  res.json({ ...buildAutoExecutionStatus(), stateRevision: getStateRevision() });
+  res.json({ ...buildAutoExecutionStatus(), stateRevision: getStateRevision(), ledgerEpoch: getLedgerEpoch() });
 });
 
 app.post('/api/auto-trade/config', (req, res) => {
@@ -2238,11 +2366,14 @@ app.post('/api/auto-trade/config', (req, res) => {
   autoExecRuntime.broadcastAutoStatus?.();
   if (nextCfg.enabled) {
     scheduleAutonomousReplenishment(600);
+  } else {
+    clearAutonomousReplenishmentTimer();
   }
   res.json({
     ...buildAutoExecutionStatus(),
     tradingMode: getTradingMode(),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -2257,6 +2388,7 @@ app.post('/api/auto-trade/cycle', async (_req, res) => {
     signals: getSignals(20),
     orders: getOrders(50),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -2278,9 +2410,11 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     setTradingMode(cfgSnapshot.enabled ? 'SEMI_AUTO' : 'PAPER');
   }
 
-  const ticker =
-    marketFeed.getTicker(proposal.symbol, proposal.marketType, proposal.exchange) ??
-    (await marketFeed.activatePair(proposal.symbol, proposal.marketType, proposal.exchange));
+  const ticker = await refreshFreshTickerForExecution(
+    proposal.symbol,
+    proposal.marketType,
+    proposal.exchange,
+  );
   if (!ticker || ticker.lastPrice <= 0) {
     res.status(503).json({ error: 'Không lấy được giá LIVE_EXCHANGE hiện tại cho đề xuất này.' });
     return;
@@ -2293,13 +2427,17 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
       p.marketType === proposal.marketType,
   );
   if (existingPair) {
-    res.status(400).json({
+    res.status(409).json({
       error: `Đã có vị thế ${existingPair.side} đang mở cho ${proposal.symbol} (${proposal.marketType}) — hủy trùng lặp.`,
+      portfolio,
+      positions,
+      stateRevision: getStateRevision(),
+      ledgerEpoch: getLedgerEpoch(),
     });
     return;
   }
   const riskConfig = getRiskConfig();
-  const orderReq: OrderRequest = {
+  const baseOrderReq: OrderRequest = {
     symbol: proposal.symbol,
     exchange: proposal.exchange,
     marketType: proposal.marketType,
@@ -2319,6 +2457,28 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     nowMs: Date.now(),
   };
 
+  const requote = validateLiveRequotedAutoOrder({
+    orderRequest: baseOrderReq,
+    liveTicker: ticker,
+    referenceEntryPrice: proposal.entryPrice,
+    minRiskReward: riskConfig.minRiskReward,
+    maxDriftPct: 1.5,
+    maxSpreadBps: 25,
+    maxQuoteAgeMs: 15_000,
+    nowMs: Date.now(),
+  });
+  if (!requote.ok) {
+    res.status(400).json({
+      error: requote.reason || 'Giá live đã thay đổi vượt ngưỡng an toàn cho đề xuất này.',
+      portfolio,
+      positions,
+      stateRevision: getStateRevision(),
+      ledgerEpoch: getLedgerEpoch(),
+    });
+    return;
+  }
+
+  const orderReq = requote.updatedOrderRequest;
   const riskContext = {
     tradingMode: getTradingMode(),
     accountEquityUsd: portfolio.totalEquityUsd,
@@ -2337,15 +2497,28 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     return;
   }
 
-  const filled = executeRiskVerifiedPaperOrder({
-    orderReq,
-    riskConfig,
-    riskContext,
-    riskCheck,
-    markPrice: ticker.lastPrice,
-    actor: 'SEMI_AUTO_APPROVAL',
-    auditAction: 'SEMI_AUTO_PROPOSAL_EXECUTED',
-  });
+  let filled;
+  try {
+    filled = executeRiskVerifiedPaperOrder({
+      orderReq,
+      riskConfig,
+      riskContext,
+      riskCheck,
+      markPrice: ticker.lastPrice,
+      actor: 'SEMI_AUTO_APPROVAL',
+      auditAction: 'SEMI_AUTO_PROPOSAL_EXECUTED',
+    });
+  } catch (err) {
+    const latest = syncPortfolioAndPositions();
+    res.status(409).json({
+      error: err instanceof Error ? err.message : 'Không thể khớp đề xuất do thay đổi trạng thái vị thế.',
+      portfolio: latest.portfolio,
+      positions: latest.positions,
+      stateRevision: getStateRevision(),
+      ledgerEpoch: getLedgerEpoch(),
+    });
+    return;
+  }
 
   const cfg = getAutoExecutionConfig();
   const nowMs = Date.now();
@@ -2360,7 +2533,7 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     executedOrderId: filled.orderId,
   });
 
-  const msg = `Đã duyệt SEMI_AUTO & khớp ${proposal.side} ${riskCheck.recommendedQuantity} ${proposal.symbol} @ $${filled.execPrice}.`;
+  const msg = `Đã duyệt SEMI_AUTO & khớp ${proposal.side} ${filled.position.quantity} ${proposal.symbol} @ $${filled.execPrice}.`;
   autoExecRuntime.lastSummary = msg;
   persistAutoRuntimeState();
   recordAutoActivity({
@@ -2386,6 +2559,7 @@ app.post('/api/auto-trade/proposals/:id/approve', async (req, res) => {
     pnlPoint: synced.latestPnlPoint,
     orders: getOrders(50),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -2412,7 +2586,7 @@ app.post('/api/auto-trade/proposals/:id/reject', (req, res) => {
     action: 'SEMI_AUTO_PROPOSAL_REJECTED',
     details: `Từ chối đề xuất SEMI_AUTO ${proposal.symbol} ${proposal.side}.`,
   });
-  res.json({ status: buildAutoExecutionStatus(), stateRevision: getStateRevision() });
+  res.json({ status: buildAutoExecutionStatus(), stateRevision: getStateRevision(), ledgerEpoch: getLedgerEpoch() });
 });
 
 app.post('/api/session/reset', (req, res) => {
@@ -2425,6 +2599,7 @@ app.post('/api/session/reset', (req, res) => {
       ? requestedMode
       : 'PAPER';
 
+  clearAutonomousReplenishmentTimer();
   resetTradingSession(targetMode);
   autoExecRuntime.recentExecutionTimestampsMs = [];
   autoExecRuntime.symbolCooldowns = {};
@@ -2446,6 +2621,7 @@ app.post('/api/session/reset', (req, res) => {
   res.json({
     ok: true,
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
     tradingMode: getTradingMode(),
     portfolio,
     positions,
@@ -2676,62 +2852,88 @@ app.post('/api/run/smart', async (req, res) => {
       signal.riskCheck.approved &&
       signal.direction !== 'NO_TRADE'
     ) {
+      const liveTicker = await refreshFreshTickerForExecution(
+        chosenTicker.symbol,
+        chosenTicker.marketType,
+        chosenTicker.exchange,
+      );
       const idempotencyKey = `SMARTRUN-${signal.id}`;
-      const orderReq: OrderRequest = {
+      const baseOrderReq: OrderRequest = {
         symbol: chosenTicker.symbol,
         exchange: chosenTicker.exchange,
         marketType: chosenTicker.marketType,
         side: signal.direction,
         orderType: 'MARKET',
-        entryPrice: chosenTicker.lastPrice,
+        entryPrice: liveTicker?.lastPrice ?? chosenTicker.lastPrice,
         stopLoss: signal.stopLoss,
         takeProfit: signal.takeProfitLevels[1] ?? signal.takeProfitLevels[0],
         leverage: signal.leverage,
         riskPctOverride: signal.recommendedRiskPct,
         strategyName: `Smart Run · ${signal.strategyName}`,
         idempotencyKey,
-        dataStatus: chosenTicker.dataStatus,
-        tradingStatus: chosenTicker.tradingStatus,
-        tickerTimestampUtc: chosenTicker.timestampUtc,
+        dataStatus: liveTicker?.dataStatus ?? chosenTicker.dataStatus,
+        tradingStatus: liveTicker?.tradingStatus ?? chosenTicker.tradingStatus,
+        tickerTimestampUtc: liveTicker?.timestampUtc ?? chosenTicker.timestampUtc,
         requireFreshTimestamp: true,
         nowMs: Date.now(),
       };
-      const freshPortfolioState = syncPortfolioAndPositions();
-      const smartRiskCtx = {
-        tradingMode: effectiveMode,
-        accountEquityUsd: freshPortfolioState.portfolio.totalEquityUsd,
-        availableBalanceUsd: freshPortfolioState.portfolio.availableBalanceUsd,
-        dailyPnlPct: freshPortfolioState.portfolio.dailyPnlPct,
-        weeklyPnlPct: freshPortfolioState.portfolio.weeklyPnlPct,
-        currentDrawdownPct: freshPortfolioState.portfolio.currentDrawdownPct,
-        openPositions: freshPortfolioState.positions,
-        recentIdempotencyKeys: getRecentIdempotencyKeys(200),
-      };
-      const riskCheck = evaluateOrderRisk(orderReq, riskConfig, smartRiskCtx);
+      const requote = validateLiveRequotedAutoOrder({
+        orderRequest: baseOrderReq,
+        liveTicker: liveTicker ?? chosenTicker,
+        referenceEntryPrice: chosenTicker.lastPrice,
+        minRiskReward: riskConfig.minRiskReward,
+        maxDriftPct: 1.5,
+        maxSpreadBps: 25,
+        maxQuoteAgeMs: 15_000,
+        nowMs: Date.now(),
+      });
 
-      if (riskCheck.approved) {
-        const filled = executeRiskVerifiedPaperOrder({
-          orderReq,
-          riskConfig,
-          riskContext: smartRiskCtx,
-          riskCheck,
-          markPrice: chosenTicker.lastPrice,
-          actor: 'SMART_RUN',
-          auditAction: 'SMART_RUN_PAPER_ORDER_FILLED',
-        });
-
-        const smartExecNow = Date.now();
-        const autoCfg = getAutoExecutionConfig();
-        autoExecRuntime.recentExecutionTimestampsMs.push(smartExecNow);
-        autoExecRuntime.symbolCooldowns[chosenTicker.symbol] =
-          smartExecNow + autoCfg.cooldownMinutesPerSymbol * 60_000;
-        persistAutoRuntimeState();
-
-        autoExecuted = true;
-        executedOrderId = filled.orderId;
-        executionMessage = `Đã khớp lệnh PAPER ${orderReq.side} ${riskCheck.recommendedQuantity} ${orderReq.symbol} @ $${filled.execPrice} qua Risk Engine.`;
+      if (!requote.ok) {
+        executionMessage = requote.reason || 'Giá live biến động vượt ngưỡng an toàn — giữ vốn.';
       } else {
-        executionMessage = riskCheck.reasons[0] || 'Risk Engine từ chối mở lệnh.';
+        const orderReq = requote.updatedOrderRequest;
+        const freshPortfolioState = syncPortfolioAndPositions();
+        const smartRiskCtx = {
+          tradingMode: effectiveMode,
+          accountEquityUsd: freshPortfolioState.portfolio.totalEquityUsd,
+          availableBalanceUsd: freshPortfolioState.portfolio.availableBalanceUsd,
+          dailyPnlPct: freshPortfolioState.portfolio.dailyPnlPct,
+          weeklyPnlPct: freshPortfolioState.portfolio.weeklyPnlPct,
+          currentDrawdownPct: freshPortfolioState.portfolio.currentDrawdownPct,
+          openPositions: freshPortfolioState.positions,
+          recentIdempotencyKeys: getRecentIdempotencyKeys(200),
+        };
+        const riskCheck = evaluateOrderRisk(orderReq, riskConfig, smartRiskCtx);
+
+        if (riskCheck.approved) {
+          try {
+            const filled = executeRiskVerifiedPaperOrder({
+              orderReq,
+              riskConfig,
+              riskContext: smartRiskCtx,
+              riskCheck,
+              markPrice: (liveTicker ?? chosenTicker).lastPrice,
+              actor: 'SMART_RUN',
+              auditAction: 'SMART_RUN_PAPER_ORDER_FILLED',
+            });
+
+            const smartExecNow = Date.now();
+            const autoCfg = getAutoExecutionConfig();
+            autoExecRuntime.recentExecutionTimestampsMs.push(smartExecNow);
+            autoExecRuntime.symbolCooldowns[chosenTicker.symbol] =
+              smartExecNow + autoCfg.cooldownMinutesPerSymbol * 60_000;
+            persistAutoRuntimeState();
+
+            autoExecuted = true;
+            executedOrderId = filled.orderId;
+            executionMessage = `Đã khớp lệnh PAPER ${orderReq.side} ${filled.position.quantity} ${orderReq.symbol} @ $${filled.execPrice} qua Risk Engine.`;
+          } catch (execErr) {
+            executionMessage =
+              execErr instanceof Error ? execErr.message : 'Không thể khớp lệnh Smart Run.';
+          }
+        } else {
+          executionMessage = riskCheck.reasons[0] || 'Risk Engine từ chối mở lệnh.';
+        }
       }
     } else {
       executionMessage = `Tín hiệu ở trạng thái ${signal.state} (${signal.direction}) — Risk Engine giữ vốn, không vào lệnh.`;
@@ -2789,6 +2991,7 @@ app.post('/api/run/smart', async (req, res) => {
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -2826,6 +3029,7 @@ app.get('/api/portfolio', async (_req, res) => {
 
   res.json({
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
     portfolio,
     positions,
     pnlHistory: getPnlHistory(360),
@@ -2838,9 +3042,7 @@ app.get('/api/portfolio', async (_req, res) => {
 app.post('/api/orders/preview', async (req, res) => {
   const body = req.body as Partial<OrderRequest>;
   const sym = String(body.symbol || 'BTC/USDT');
-  const ticker =
-    marketFeed.getTicker(sym, body.marketType, body.exchange) ??
-    (await marketFeed.activatePair(sym, body.marketType, body.exchange));
+  const ticker = await refreshFreshTickerForExecution(sym, body.marketType, body.exchange);
   if (!ticker) {
     res.status(404).json({ error: 'Không tìm thấy cặp giao dịch.' });
     return;
@@ -2930,9 +3132,7 @@ app.post('/api/execution/reconcile', (req, res) => {
 app.post('/api/orders', async (req, res) => {
   const body = req.body as Partial<OrderRequest>;
   const sym = String(body.symbol || '');
-  const ticker =
-    marketFeed.getTicker(sym, body.marketType, body.exchange) ??
-    (await marketFeed.activatePair(sym, body.marketType, body.exchange));
+  const ticker = await refreshFreshTickerForExecution(sym, body.marketType, body.exchange);
   if (!ticker) {
     res.status(404).json({ error: 'Không tìm thấy cặp giao dịch hợp lệ.' });
     return;
@@ -3059,16 +3259,29 @@ app.post('/api/orders', async (req, res) => {
     return;
   }
 
-  // Execute in Paper Ledger via unified risk-verified executor
-  const filled = executeRiskVerifiedPaperOrder({
-    orderReq,
-    riskConfig,
-    riskContext,
-    riskCheck,
-    markPrice: ticker.lastPrice,
-    actor,
-    auditAction: 'PAPER_ORDER_FILLED',
-  });
+  let filled;
+  try {
+    // Execute in Paper Ledger via unified risk-verified executor
+    filled = executeRiskVerifiedPaperOrder({
+      orderReq,
+      riskConfig,
+      riskContext,
+      riskCheck,
+      markPrice: ticker.lastPrice,
+      actor,
+      auditAction: 'PAPER_ORDER_FILLED',
+    });
+  } catch (err) {
+    const latest = syncPortfolioAndPositions();
+    res.status(409).json({
+      error: err instanceof Error ? err.message : 'Không thể khớp lệnh do xung đột trạng thái hoặc giới hạn rủi ro.',
+      portfolio: latest.portfolio,
+      positions: latest.positions,
+      stateRevision: getStateRevision(),
+      ledgerEpoch: getLedgerEpoch(),
+    });
+    return;
+  }
 
   const synced = syncPortfolioAndPositions({ eventTag: 'ORDER_FILLED', forceRecord: true });
   autoExecRuntime.broadcastAutoStatus?.();
@@ -3083,6 +3296,7 @@ app.post('/api/orders', async (req, res) => {
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -3130,6 +3344,7 @@ app.patch('/api/positions/:id', (req, res) => {
     portfolio: synced.portfolio,
     positions: synced.positions,
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -3173,20 +3388,32 @@ app.post('/api/positions/:id/close', async (req, res) => {
   });
 
   if (!closeResult.closed) {
-    const recentCloseOrder = getOrders(20).find(
-      (o) =>
-        o.idempotencyKey === `CLOSE-${id}` ||
-        o.idempotencyKey === `CLOSE-MANUAL-${id}`,
-    );
+    const recentCloseOrder = getOrderByIdempotencyKeys([
+      `CLOSE-${id}`,
+      `CLOSE-MANUAL-${id}`,
+    ]);
+    const syncedAuthoritative = syncPortfolioAndPositions();
     if (recentCloseOrder) {
       res.status(409).json({
         ok: false,
         alreadyClosed: true,
         error: `Vị thế ${recentCloseOrder.symbol} vừa được hệ thống tự động tất toán ở mức $${recentCloseOrder.price}.`,
+        portfolio: syncedAuthoritative.portfolio,
+        positions: syncedAuthoritative.positions,
+        stateRevision: getStateRevision(),
+        ledgerEpoch: getLedgerEpoch(),
       });
       return;
     }
-    res.status(404).json({ ok: false, error: 'Không tìm thấy vị thế đang mở hoặc vị thế vừa được đóng.' });
+    res.status(404).json({
+      ok: false,
+      alreadyClosed: true,
+      error: 'Không tìm thấy vị thế đang mở hoặc vị thế vừa được đóng.',
+      portfolio: syncedAuthoritative.portfolio,
+      positions: syncedAuthoritative.positions,
+      stateRevision: getStateRevision(),
+      ledgerEpoch: getLedgerEpoch(),
+    });
     return;
   }
 
@@ -3231,6 +3458,7 @@ app.post('/api/positions/:id/close', async (req, res) => {
     positions: synced.positions,
     pnlPoint: synced.latestPnlPoint,
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -3304,6 +3532,7 @@ app.post('/api/risk/config', (req, res) => {
     riskConfig: next,
     autoExecutionStatus: buildAutoExecutionStatus(),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -3386,6 +3615,7 @@ app.post('/api/mode', (req, res) => {
     emergencyStop: getEmergencyStopState(),
     autoExecutionStatus: buildAutoExecutionStatus(),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -3394,6 +3624,7 @@ app.post('/api/emergency-stop', (req, res) => {
   const reason =
     String(req.body?.reason || '').trim() ||
     'Người dùng kích hoạt EMERGENCY STOP — khóa toàn bộ lệnh mới.';
+  clearAutonomousReplenishmentTimer();
   const emergencyStop = activateEmergencyStopState(reason, actor);
   const currentAuto = getAutoExecutionConfig();
   saveAutoExecutionConfig({ ...currentAuto, enabled: false });
@@ -3413,6 +3644,7 @@ app.post('/api/emergency-stop', (req, res) => {
     portfolio: getPortfolioSummary(),
     autoExecutionStatus: buildAutoExecutionStatus(),
     stateRevision: getStateRevision(),
+    ledgerEpoch: getLedgerEpoch(),
   });
 });
 
@@ -4002,7 +4234,7 @@ app.post('/api/exchanges/:id/disconnect', (req, res) => {
     action: 'VAULT_KEY_REVOKED',
     details: `Thu hồi và xóa API Key cho sàn ${id}.`,
   });
-  res.json({ exchanges: buildMergedExchanges(), stateRevision: getStateRevision() });
+  res.json({ exchanges: buildMergedExchanges(), stateRevision: getStateRevision(), ledgerEpoch: getLedgerEpoch() });
 });
 
 app.get('/api/audit-logs', (_req, res) => {
@@ -4066,6 +4298,7 @@ async function startServer() {
         liveFeedActive: marketFeed.isLiveFeedActive(),
         autoExecutionStatus: buildAutoExecutionStatus(),
         stateRevision: getStateRevision(),
+        ledgerEpoch: getLedgerEpoch(),
         serverUtc: new Date().toISOString(),
       });
       for (const client of wss.clients) {
@@ -4098,6 +4331,7 @@ async function startServer() {
             liveFeedActive: marketFeed.isLiveFeedActive(),
             autoExecutionStatus: buildAutoExecutionStatus(),
             stateRevision: getStateRevision(),
+            ledgerEpoch: getLedgerEpoch(),
             serverUtc: new Date().toISOString(),
           }),
         );
@@ -4127,6 +4361,7 @@ async function startServer() {
         pnlPoint: latestPnlPoint,
         liveFeedActive: marketFeed.isLiveFeedActive(),
         stateRevision: getStateRevision(),
+        ledgerEpoch: getLedgerEpoch(),
         serverUtc: new Date().toISOString(),
       });
       for (const client of wss.clients) {

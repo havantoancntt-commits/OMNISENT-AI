@@ -1,3 +1,4 @@
+import { inferContractFilter, roundDecimal, roundToTick } from './precision.ts';
 import { computePearsonReturnCorrelation } from './quantIntelligence.ts';
 import { evaluateOrderRisk } from './riskEngine.ts';
 import type {
@@ -382,7 +383,7 @@ export function evaluateAutoExecutionCandidate(
   const side = signal.direction === 'SHORT' ? 'SHORT' : 'LONG';
   const tpTarget = signal.takeProfitLevels[1] ?? signal.takeProfitLevels[0] ?? ticker.lastPrice;
   const bucketMinute = Math.floor(nowMs / 60_000);
-  const idempotencyKey = `AUTO-${ticker.symbol.replace(/[^A-Z0-9]/gi, '')}-${side}-${bucketMinute}`;
+  const idempotencyKey = `AUTO-${ticker.symbol.replace(/[^A-Z0-9]/gi, '')}-${ticker.marketType}-${side}-${bucketMinute}`;
   const executionTier: AutoGateEvaluationResult['executionTier'] = allowTacticalFallback
     ? 'TACTICAL_CONTINUITY'
     : 'CORE_9_GATE';
@@ -436,5 +437,206 @@ export function evaluateAutoExecutionCandidate(
     idempotencyKey,
     orderRequest,
     riskCheck,
+  };
+}
+
+export interface LiveRequoteValidationInput {
+  orderRequest: OrderRequest;
+  liveTicker: MarketTicker | null | undefined;
+  referenceEntryPrice: number;
+  minRiskReward: number;
+  maxDriftPct?: number;
+  maxSpreadBps?: number;
+  maxQuoteAgeMs?: number;
+  nowMs?: number;
+}
+
+export interface LiveRequoteValidationResult {
+  ok: boolean;
+  reason?: string;
+  driftPct: number;
+  liveRiskReward: number;
+  updatedOrderRequest: OrderRequest;
+}
+
+/**
+ * Verifies a freshly fetched live exchange quote right before opening an autonomous or Smart Run position.
+ * Prevents stale prices, post-signal SL/TP breaches, widened spreads, and collapsed live R:R ratios.
+ */
+export function validateLiveRequotedAutoOrder(
+  input: LiveRequoteValidationInput,
+): LiveRequoteValidationResult {
+  const {
+    orderRequest,
+    liveTicker,
+    referenceEntryPrice,
+    minRiskReward,
+    maxDriftPct = 1.2,
+    maxSpreadBps = 25,
+    maxQuoteAgeMs = 15_000,
+    nowMs = Date.now(),
+  } = input;
+
+  if (!liveTicker || liveTicker.dataStatus !== 'LIVE_EXCHANGE' || !Number.isFinite(liveTicker.lastPrice) || liveTicker.lastPrice <= 0) {
+    return {
+      ok: false,
+      reason: `Không lấy được giá LIVE_EXCHANGE hợp lệ cho ${orderRequest.symbol} ngay trước khi khớp.`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  if (liveTicker.tradingStatus && liveTicker.tradingStatus !== 'TRADING') {
+    return {
+      ok: false,
+      reason: `Cặp ${liveTicker.symbol} đang tạm ngưng giao dịch (${liveTicker.tradingStatus}).`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  if (
+    typeof liveTicker.timestampUtc !== 'number' ||
+    !Number.isFinite(liveTicker.timestampUtc) ||
+    liveTicker.timestampUtc <= 0
+  ) {
+    return {
+      ok: false,
+      reason: `Thiếu dấu thời gian quote trực tiếp cho ${liveTicker.symbol}.`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  const quoteAgeMs = nowMs - liveTicker.timestampUtc;
+  if (quoteAgeMs > maxQuoteAgeMs) {
+    return {
+      ok: false,
+      reason: `Giá ${liveTicker.symbol} vừa bị trễ (${Math.round(quoteAgeMs / 1000)}s > ${Math.round(maxQuoteAgeMs / 1000)}s) — hủy mở lệnh để tránh khớp giá cũ.`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  if (
+    liveTicker.bidPrice > 0 &&
+    liveTicker.askPrice > 0 &&
+    liveTicker.askPrice < liveTicker.bidPrice
+  ) {
+    return {
+      ok: false,
+      reason: `Sổ lệnh ${liveTicker.symbol} bị đảo chéo Bid/Ask — chặn vào lệnh.`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  if (Number.isFinite(liveTicker.spreadBps) && liveTicker.spreadBps > maxSpreadBps) {
+    return {
+      ok: false,
+      reason: `Spread trực tiếp ${liveTicker.symbol} giãn ${liveTicker.spreadBps.toFixed(1)} bps (> ${maxSpreadBps} bps) — hủy mở lệnh để bảo toàn kỳ vọng.`,
+      driftPct: 0,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  const livePrice = liveTicker.lastPrice;
+  const driftPct =
+    referenceEntryPrice > 0
+      ? roundDecimal((Math.abs(livePrice - referenceEntryPrice) / referenceEntryPrice) * 100, 3)
+      : 0;
+
+  if (driftPct > maxDriftPct) {
+    return {
+      ok: false,
+      reason: `Giá ${liveTicker.symbol} vừa dịch chuyển ${driftPct.toFixed(2)}% so với giá quét tín hiệu (vượt trần ${maxDriftPct}%) — hủy mở lệnh đuổi giá.`,
+      driftPct,
+      liveRiskReward: 0,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  const filter = inferContractFilter(livePrice, orderRequest.marketType);
+  const roundedSl = roundToTick(orderRequest.stopLoss, filter.tickSize) || orderRequest.stopLoss;
+  const roundedTp = roundToTick(orderRequest.takeProfit, filter.tickSize) || orderRequest.takeProfit;
+
+  if (orderRequest.side === 'LONG') {
+    if (livePrice <= roundedSl) {
+      return {
+        ok: false,
+        reason: `Giá trực tiếp ${liveTicker.symbol} ($${livePrice}) đã chạm/thủng Stop Loss ($${roundedSl}) trước khi khớp.`,
+        driftPct,
+        liveRiskReward: 0,
+        updatedOrderRequest: orderRequest,
+      };
+    }
+    if (livePrice >= roundedTp) {
+      return {
+        ok: false,
+        reason: `Giá trực tiếp ${liveTicker.symbol} ($${livePrice}) đã chạy vượt qua Take Profit ($${roundedTp}) — lỡ điểm vào.`,
+        driftPct,
+        liveRiskReward: 0,
+        updatedOrderRequest: orderRequest,
+      };
+    }
+  } else {
+    if (livePrice >= roundedSl) {
+      return {
+        ok: false,
+        reason: `Giá trực tiếp ${liveTicker.symbol} ($${livePrice}) đã vượt lên trên Stop Loss SHORT ($${roundedSl}) trước khi khớp.`,
+        driftPct,
+        liveRiskReward: 0,
+        updatedOrderRequest: orderRequest,
+      };
+    }
+    if (livePrice <= roundedTp) {
+      return {
+        ok: false,
+        reason: `Giá trực tiếp ${liveTicker.symbol} ($${livePrice}) đã giảm vượt Take Profit SHORT ($${roundedTp}) — lỡ điểm vào.`,
+        driftPct,
+        liveRiskReward: 0,
+        updatedOrderRequest: orderRequest,
+      };
+    }
+  }
+
+  const riskDist = Math.abs(livePrice - roundedSl);
+  const rewardDist = Math.abs(roundedTp - livePrice);
+  const liveRiskReward = riskDist > 0 ? roundDecimal(rewardDist / riskDist, 2) : 0;
+  if (liveRiskReward < minRiskReward) {
+    return {
+      ok: false,
+      reason: `Tại giá trực tiếp $${livePrice}, R:R chỉ còn ${liveRiskReward.toFixed(2)}x (< ${minRiskReward.toFixed(2)}x) — hủy vào lệnh.`,
+      driftPct,
+      liveRiskReward,
+      updatedOrderRequest: orderRequest,
+    };
+  }
+
+  const updatedOrderRequest: OrderRequest = {
+    ...orderRequest,
+    exchange: liveTicker.exchange,
+    entryPrice: livePrice,
+    stopLoss: roundedSl,
+    takeProfit: roundedTp,
+    leverage: orderRequest.marketType === 'SPOT' ? 1 : orderRequest.leverage,
+    dataStatus: liveTicker.dataStatus,
+    tradingStatus: liveTicker.tradingStatus,
+    tickerTimestampUtc: liveTicker.timestampUtc,
+    requireFreshTimestamp: true,
+    nowMs,
+  };
+
+  return {
+    ok: true,
+    driftPct,
+    liveRiskReward,
+    updatedOrderRequest,
   };
 }

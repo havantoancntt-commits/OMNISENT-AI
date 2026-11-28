@@ -247,6 +247,7 @@ export default function App() {
   const wsSyncTimerRef = useRef<number | null>(null);
   const lastSnapshotPersistMsRef = useRef<number>(0);
   const lastKnownRevisionRef = useRef<number | null>(cachedHydration?.stateRevision ?? null);
+  const lastKnownEpochRef = useRef<string | null>(cachedHydration?.ledgerEpoch ?? null);
   const wsSupportedRef = useRef<boolean>(true);
   const tickersRef = useRef<MarketTicker[]>(tickers);
   const portfolioRef = useRef<PortfolioSummary>(portfolio);
@@ -285,6 +286,7 @@ export default function App() {
   const persistTelemetrySnapshotThrottled = useCallback(
     (meta: {
       stateRevision?: number | null;
+      ledgerEpoch?: string | null;
       tradingMode: string;
       serverUtc: string;
       tickers: MarketTicker[];
@@ -302,6 +304,7 @@ export default function App() {
           serializeTelemetrySnapshot({
             nowMs: now,
             stateRevision: meta.stateRevision ?? null,
+            ledgerEpoch: meta.ledgerEpoch ?? lastKnownEpochRef.current,
             tradingMode: meta.tradingMode,
             serverUtc: meta.serverUtc,
             tickers: meta.tickers,
@@ -326,11 +329,14 @@ export default function App() {
       incomingPortfolio?: PortfolioSummary;
       incomingPositions?: Position[];
       incomingRevision?: number | null;
+      incomingEpoch?: string | null;
+      forceAuthoritative?: boolean;
     }): {
       tickers: MarketTicker[];
       portfolio: PortfolioSummary;
       positions: Position[];
       acceptedStructuralState: boolean;
+      epochChanged: boolean;
     } => {
       const mergedTickers = params.incomingTickers
         ? mergeTickerFeedSnapshots(tickersRef.current, params.incomingTickers)
@@ -345,12 +351,29 @@ export default function App() {
         typeof params.incomingRevision === 'number' && Number.isFinite(params.incomingRevision)
           ? params.incomingRevision
           : null;
+      const incomingEpoch =
+        typeof params.incomingEpoch === 'string' && params.incomingEpoch.length > 0
+          ? params.incomingEpoch
+          : null;
+      const epochChanged =
+        incomingEpoch !== null &&
+        lastKnownEpochRef.current !== null &&
+        incomingEpoch !== lastKnownEpochRef.current;
+
+      if (incomingEpoch !== null) {
+        lastKnownEpochRef.current = incomingEpoch;
+      }
+
+      const forceAuth = Boolean(params.forceAuthoritative || epochChanged);
       const isStaleRevision =
+        !forceAuth &&
         incomingRev !== null &&
         lastKnownRevisionRef.current !== null &&
         incomingRev < lastKnownRevisionRef.current;
 
-      if (incomingRev !== null && !isStaleRevision) {
+      if (forceAuth && incomingRev !== null) {
+        lastKnownRevisionRef.current = incomingRev;
+      } else if (incomingRev !== null && !isStaleRevision) {
         lastKnownRevisionRef.current = incomingRev;
       }
 
@@ -376,6 +399,7 @@ export default function App() {
         portfolio: repriced.portfolio,
         positions: repriced.positions,
         acceptedStructuralState: !isStaleRevision,
+        epochChanged,
       };
     },
     [],
@@ -400,6 +424,7 @@ export default function App() {
       let incomingPortfolio: PortfolioSummary | undefined;
       let incomingPositions: Position[] | undefined;
       let incomingRevision: number | null = null;
+      let incomingEpoch: string | null = null;
       let latestMode: TradingMode | null = null;
 
       if (mktRes.ok) {
@@ -415,6 +440,9 @@ export default function App() {
         const pt = await portRes.json();
         if (typeof pt.stateRevision === 'number') {
           incomingRevision = pt.stateRevision;
+        }
+        if (typeof pt.ledgerEpoch === 'string') {
+          incomingEpoch = pt.ledgerEpoch;
         }
         if (pt.portfolio) {
           incomingPortfolio = pt.portfolio as PortfolioSummary;
@@ -434,6 +462,8 @@ export default function App() {
         incomingPortfolio,
         incomingPositions,
         incomingRevision,
+        incomingEpoch,
+        forceAuthoritative: portRes.ok,
       });
       if (latestMode && reconciled.acceptedStructuralState) {
         setTradingMode(latestMode);
@@ -476,11 +506,13 @@ export default function App() {
       if (reconciled.tickers.length > 0 && reconciled.portfolio) {
         persistTelemetrySnapshotThrottled({
           stateRevision: lastKnownRevisionRef.current,
+          ledgerEpoch: lastKnownEpochRef.current,
           tradingMode: latestMode ?? reconciled.portfolio.mode,
           serverUtc: latestUtc,
           tickers: reconciled.tickers,
           portfolio: reconciled.portfolio,
           positions: reconciled.positions,
+          force: portRes.ok,
         });
       }
     } catch {
@@ -507,12 +539,15 @@ export default function App() {
       const prevRevision = lastKnownRevisionRef.current;
       const incomingRevision =
         typeof data.stateRevision === 'number' ? data.stateRevision : null;
+      const incomingEpoch =
+        typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null;
 
       const reconciled = reconcileMarketPortfolioPositions({
         incomingTickers: Array.isArray(data.tickers) ? (data.tickers as MarketTicker[]) : undefined,
         incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
         incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
         incomingRevision,
+        incomingEpoch,
       });
 
       if (typeof data.liveFeedActive === 'boolean') {
@@ -539,9 +574,10 @@ export default function App() {
       });
 
       if (
-        incomingRevision !== null &&
-        prevRevision !== null &&
-        incomingRevision > prevRevision
+        reconciled.epochChanged ||
+        (incomingRevision !== null &&
+          prevRevision !== null &&
+          incomingRevision > prevRevision)
       ) {
         void fetchAllState();
       }
@@ -549,11 +585,13 @@ export default function App() {
       if (reconciled.tickers.length > 0 && reconciled.portfolio) {
         persistTelemetrySnapshotThrottled({
           stateRevision: lastKnownRevisionRef.current,
+          ledgerEpoch: lastKnownEpochRef.current,
           tradingMode: String(data.tradingMode ?? reconciled.portfolio.mode ?? 'PAPER'),
           serverUtc: String(data.serverUtc ?? ''),
           tickers: reconciled.tickers,
           portfolio: reconciled.portfolio,
           positions: reconciled.positions,
+          force: reconciled.epochChanged,
         });
       }
       return {
@@ -827,11 +865,14 @@ export default function App() {
             if (msg.type === 'PRICE_TICK_UPDATE') {
               const incomingRev =
                 typeof msg.stateRevision === 'number' ? msg.stateRevision : null;
+              const incomingEpoch =
+                typeof msg.ledgerEpoch === 'string' ? msg.ledgerEpoch : null;
               const reconciled = reconcileMarketPortfolioPositions({
                 incomingTickers: Array.isArray(msg.tickers) ? (msg.tickers as MarketTicker[]) : undefined,
                 incomingPortfolio: msg.portfolio as PortfolioSummary | undefined,
                 incomingPositions: Array.isArray(msg.positions) ? (msg.positions as Position[]) : undefined,
                 incomingRevision: incomingRev,
+                incomingEpoch,
               });
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
@@ -845,11 +886,13 @@ export default function App() {
               if (reconciled.tickers.length > 0 && reconciled.portfolio) {
                 persistTelemetrySnapshotThrottled({
                   stateRevision: lastKnownRevisionRef.current,
+                  ledgerEpoch: lastKnownEpochRef.current,
                   tradingMode: reconciled.portfolio.mode ?? 'PAPER',
                   serverUtc: msg.serverUtc ?? '',
                   tickers: reconciled.tickers,
                   portfolio: reconciled.portfolio,
                   positions: reconciled.positions,
+                  force: reconciled.epochChanged,
                 });
               }
 
@@ -867,7 +910,11 @@ export default function App() {
                 prevPosCount = nextPosCount;
                 prevEventTs = eventTs;
                 prevStateRevision = nextRevision;
+                if (reconciled.epochChanged) {
+                  scheduleFullRefresh();
+                }
               } else if (
+                reconciled.epochChanged ||
                 nextPosCount !== prevPosCount ||
                 isTradeEvent ||
                 (nextRevision !== null && prevStateRevision !== null && nextRevision !== prevStateRevision)
@@ -882,11 +929,14 @@ export default function App() {
             if (msg.type === 'TELEMETRY_UPDATE') {
               const incomingRev =
                 typeof msg.stateRevision === 'number' ? msg.stateRevision : null;
+              const incomingEpoch =
+                typeof msg.ledgerEpoch === 'string' ? msg.ledgerEpoch : null;
               const reconciled = reconcileMarketPortfolioPositions({
                 incomingTickers: Array.isArray(msg.tickers) ? (msg.tickers as MarketTicker[]) : undefined,
                 incomingPortfolio: msg.portfolio as PortfolioSummary | undefined,
                 incomingPositions: Array.isArray(msg.positions) ? (msg.positions as Position[]) : undefined,
                 incomingRevision: incomingRev,
+                incomingEpoch,
               });
               if (msg.pnlPoint) {
                 setPnlHistory((prev) => appendPnlPoint(prev, msg.pnlPoint as PnlHistoryPoint));
@@ -908,11 +958,13 @@ export default function App() {
               if (reconciled.tickers.length > 0 && reconciled.portfolio) {
                 persistTelemetrySnapshotThrottled({
                   stateRevision: lastKnownRevisionRef.current,
+                  ledgerEpoch: lastKnownEpochRef.current,
                   tradingMode: String(msg.tradingMode ?? reconciled.portfolio.mode ?? 'PAPER'),
                   serverUtc: msg.serverUtc ?? '',
                   tickers: reconciled.tickers,
                   portfolio: reconciled.portfolio,
                   positions: reconciled.positions,
+                  force: reconciled.epochChanged,
                 });
               }
 
@@ -938,7 +990,11 @@ export default function App() {
                 prevTradingMode = nextMode;
                 prevEventTs = eventTs;
                 prevStateRevision = nextRevision;
+                if (reconciled.epochChanged) {
+                  scheduleFullRefresh();
+                }
               } else if (
+                reconciled.epochChanged ||
                 nextPosCount !== prevPosCount ||
                 nextAutoCount !== prevAutoTradesCount ||
                 (nextMode && nextMode !== prevTradingMode) ||
@@ -1225,6 +1281,15 @@ export default function App() {
             timestampUtc: new Date().toISOString(),
           });
         }
+        if (data.portfolio || Array.isArray(data.positions)) {
+          reconcileMarketPortfolioPositions({
+            incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+            incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+            incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+            incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+            forceAuthoritative: true,
+          });
+        }
         await fetchAllState();
         broadcastSyncEvent('DATA_MUTATED');
       } else {
@@ -1256,6 +1321,15 @@ export default function App() {
       if (res.ok) {
         setLastRunSummary(null);
         setSmartOpportunities([]);
+        if (data.portfolio || Array.isArray(data.positions)) {
+          reconcileMarketPortfolioPositions({
+            incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+            incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+            incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+            incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+            forceAuthoritative: true,
+          });
+        }
         await fetchAllState();
         broadcastSyncEvent('DATA_MUTATED');
       } else {
@@ -1296,7 +1370,16 @@ export default function App() {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         const errMsg = data.error || t('app.error.actionFailed');
-        const alreadyClosed = Boolean(data.alreadyClosed);
+        const alreadyClosed = Boolean(data.alreadyClosed || res.status === 404 || res.status === 409);
+        if (data.portfolio || Array.isArray(data.positions)) {
+          reconcileMarketPortfolioPositions({
+            incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+            incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+            incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+            incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+            forceAuthoritative: true,
+          });
+        }
         if (alreadyClosed) {
           await fetchAllState();
           broadcastSyncEvent('DATA_MUTATED');
@@ -1309,6 +1392,8 @@ export default function App() {
         incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
         incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
         incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+        incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+        forceAuthoritative: true,
       });
       if (data.pnlPoint) {
         setPnlHistory((prev) => appendPnlPoint(prev, data.pnlPoint as PnlHistoryPoint));
@@ -1503,6 +1588,9 @@ export default function App() {
         return { ok: false, error: data.error || t('auto.err.updateFailed') };
       }
       setAutoExecutionStatus(data as AutoExecutionEngineStatus);
+      if (data.tradingMode) {
+        setTradingMode(data.tradingMode as TradingMode);
+      }
       await fetchAllState();
       broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
@@ -1519,6 +1607,15 @@ export default function App() {
         return { ok: false, error: data.error || t('auto.err.actionFailed') };
       }
       if (data.status) setAutoExecutionStatus(data.status as AutoExecutionEngineStatus);
+      if (data.portfolio || Array.isArray(data.positions)) {
+        reconcileMarketPortfolioPositions({
+          incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+          incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+          incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+          incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+          forceAuthoritative: true,
+        });
+      }
       await fetchAllState();
       broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };
@@ -1536,9 +1633,27 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) {
+        if (data.portfolio || Array.isArray(data.positions)) {
+          reconcileMarketPortfolioPositions({
+            incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+            incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+            incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+            incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+            forceAuthoritative: true,
+          });
+        }
         return { ok: false, error: data.error || t('auto.err.actionFailed') };
       }
       if (data.status) setAutoExecutionStatus(data.status as AutoExecutionEngineStatus);
+      if (data.portfolio || Array.isArray(data.positions)) {
+        reconcileMarketPortfolioPositions({
+          incomingPortfolio: data.portfolio as PortfolioSummary | undefined,
+          incomingPositions: Array.isArray(data.positions) ? (data.positions as Position[]) : undefined,
+          incomingRevision: typeof data.stateRevision === 'number' ? data.stateRevision : null,
+          incomingEpoch: typeof data.ledgerEpoch === 'string' ? data.ledgerEpoch : null,
+          forceAuthoritative: true,
+        });
+      }
       await fetchAllState();
       broadcastSyncEvent('DATA_MUTATED');
       return { ok: true };

@@ -70,6 +70,7 @@ import {
   resolveTradingModeAfterAutoConfig,
   syncAutoConfigWithRiskConfig,
   syncAutoConfigWithTradingMode,
+  validateLiveRequotedAutoOrder,
 } from './autoExecutionEngine.ts';
 import {
   computePositionTelemetry,
@@ -4103,6 +4104,138 @@ test('repricePortfolioAndPositions computes distinct dailyPnlPct and weeklyPnlPc
   // Weekly baseline 95_000 -> +8.42%
   assert.equal(repriced.portfolio.weeklyPnlPct, 8.42);
   assert.notEqual(repriced.portfolio.dailyPnlPct, repriced.portfolio.weeklyPnlPct);
+});
+
+test('validateLiveRequotedAutoOrder enforces freshness, price drift, spread, SL/TP breach, live R:R, and SPOT leverage normalization', () => {
+  const now = Date.now();
+  const baseOrder = {
+    symbol: 'BTC/USDT',
+    exchange: 'Binance',
+    marketType: 'SPOT' as const,
+    side: 'LONG' as const,
+    orderType: 'MARKET' as const,
+    entryPrice: 60_000,
+    stopLoss: 58_800,
+    takeProfit: 63_000,
+    leverage: 3, // should be normalized to 1x on SPOT
+    idempotencyKey: 'AUTO-BTCUSDT-SPOT-LONG-1',
+    dataStatus: 'LIVE_EXCHANGE' as const,
+    tradingStatus: 'TRADING' as const,
+    tickerTimestampUtc: now,
+  };
+
+  // 1. Valid fresh live ticker passes and normalizes SPOT leverage to 1
+  const validRes = validateLiveRequotedAutoOrder({
+    orderRequest: baseOrder,
+    liveTicker: makeValidTicker({
+      symbol: 'BTC/USDT',
+      marketType: 'SPOT',
+      lastPrice: 60_120,
+      bidPrice: 60_115,
+      askPrice: 60_125,
+      spreadBps: 1.6,
+      timestampUtc: now - 500,
+    }),
+    referenceEntryPrice: 60_000,
+    minRiskReward: 1.5,
+    nowMs: now,
+  });
+  assert.equal(validRes.ok, true);
+  assert.equal(validRes.updatedOrderRequest.leverage, 1);
+  assert.equal(validRes.updatedOrderRequest.entryPrice, 60_120);
+  assert.ok(validRes.liveRiskReward >= 2.0);
+
+  // 2. Stale quote is rejected
+  const staleRes = validateLiveRequotedAutoOrder({
+    orderRequest: baseOrder,
+    liveTicker: makeValidTicker({
+      symbol: 'BTC/USDT',
+      lastPrice: 60_050,
+      timestampUtc: now - 30_000,
+    }),
+    referenceEntryPrice: 60_000,
+    minRiskReward: 1.5,
+    maxQuoteAgeMs: 15_000,
+    nowMs: now,
+  });
+  assert.equal(staleRes.ok, false);
+
+  // 3. Excessive drift from scanned entry is rejected
+  const driftRes = validateLiveRequotedAutoOrder({
+    orderRequest: baseOrder,
+    liveTicker: makeValidTicker({
+      symbol: 'BTC/USDT',
+      lastPrice: 61_500, // +2.5% drift
+      timestampUtc: now,
+    }),
+    referenceEntryPrice: 60_000,
+    minRiskReward: 1.5,
+    maxDriftPct: 1.2,
+    nowMs: now,
+  });
+  assert.equal(driftRes.ok, false);
+
+  // 4. Breached Stop Loss at live price is rejected
+  const slBreachRes = validateLiveRequotedAutoOrder({
+    orderRequest: { ...baseOrder, marketType: 'PERPETUAL' },
+    liveTicker: makeValidTicker({
+      symbol: 'BTC/USDT',
+      lastPrice: 58_750,
+      timestampUtc: now,
+    }),
+    referenceEntryPrice: 58_750,
+    minRiskReward: 1.5,
+    nowMs: now,
+  });
+  assert.equal(slBreachRes.ok, false);
+
+  // 5. Collapsed live R:R below minRiskReward is rejected
+  const rrCollapsedRes = validateLiveRequotedAutoOrder({
+    orderRequest: { ...baseOrder, marketType: 'PERPETUAL', stopLoss: 59_000, takeProfit: 61_500 },
+    liveTicker: makeValidTicker({
+      symbol: 'BTC/USDT',
+      lastPrice: 60_650, // risk=1650, reward=850 -> R:R = 0.52 < 1.5
+      timestampUtc: now,
+    }),
+    referenceEntryPrice: 60_000,
+    minRiskReward: 1.5,
+    maxDriftPct: 3,
+    nowMs: now,
+  });
+  assert.equal(rrCollapsedRes.ok, false);
+});
+
+test('PWA telemetry snapshot preserves optional ledgerEpoch while keeping backwards compatibility', () => {
+  const ticker = makeValidTicker({ symbol: 'BTC/USDT', lastPrice: 95_000 });
+  const rawWithEpoch = serializeTelemetrySnapshot({
+    nowMs: 1_700_000_000_000,
+    stateRevision: 42,
+    ledgerEpoch: 'EPOCH-TEST-123',
+    tradingMode: 'PAPER',
+    serverUtc: '2026-11-28T00:00:00.000Z',
+    tickers: [ticker],
+    portfolio: { totalEquityUsd: 100_000 },
+    positions: [],
+  });
+  const parsed = parseTelemetrySnapshot(rawWithEpoch, 1_700_000_005_000);
+  assert.ok(parsed);
+  assert.equal(parsed.ledgerEpoch, 'EPOCH-TEST-123');
+  assert.equal(parsed.stateRevision, 42);
+
+  // Legacy payload without ledgerEpoch still parses cleanly
+  const legacyRaw = JSON.stringify({
+    v: 1,
+    savedAtMs: 1_700_000_000_000,
+    stateRevision: 7,
+    tradingMode: 'PAPER',
+    serverUtc: '2026-11-28T00:00:00.000Z',
+    tickers: [ticker],
+    portfolio: { totalEquityUsd: 100_000 },
+    positions: [],
+  });
+  const legacyParsed = parseTelemetrySnapshot(legacyRaw, 1_700_000_005_000);
+  assert.ok(legacyParsed);
+  assert.equal(legacyParsed.ledgerEpoch, null);
 });
 
 

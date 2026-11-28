@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -108,11 +109,86 @@ export function checkpointDatabase(mode: 'PASSIVE' | 'TRUNCATE' = 'PASSIVE'): vo
 }
 
 let stateRevision = 1;
-export function getStateRevision(): number {
+let ledgerEpoch = '';
+
+function readPersistedStateRevision(): number {
+  try {
+    const row = db
+      .prepare('SELECT value FROM app_state WHERE key = ?')
+      .get('state_revision') as { value: string } | undefined;
+    const parsed = row ? Number(row.value) : NaN;
+    if (Number.isFinite(parsed) && parsed >= 1) {
+      return Math.trunc(parsed);
+    }
+  } catch {
+    // ignore before table init
+  }
   return stateRevision;
 }
+
+function persistStateRevision(rev: number): void {
+  try {
+    db.prepare('INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'state_revision',
+      String(rev),
+      new Date().toISOString(),
+    );
+  } catch {
+    // ignore before table init
+  }
+}
+
+export function getLedgerEpoch(): string {
+  if (ledgerEpoch) return ledgerEpoch;
+  try {
+    const row = db
+      .prepare('SELECT value FROM app_state WHERE key = ?')
+      .get('ledger_epoch') as { value: string } | undefined;
+    if (row?.value) {
+      ledgerEpoch = row.value;
+      return ledgerEpoch;
+    }
+    const created = crypto.randomUUID();
+    db.prepare('INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'ledger_epoch',
+      created,
+      new Date().toISOString(),
+    );
+    ledgerEpoch = created;
+    return created;
+  } catch {
+    if (!ledgerEpoch) ledgerEpoch = crypto.randomUUID();
+    return ledgerEpoch;
+  }
+}
+
+export function rotateLedgerEpoch(): string {
+  const nextEpoch = crypto.randomUUID();
+  ledgerEpoch = nextEpoch;
+  try {
+    db.prepare('INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'ledger_epoch',
+      nextEpoch,
+      new Date().toISOString(),
+    );
+  } catch {
+    // ignore before table init
+  }
+  return nextEpoch;
+}
+
+export function getStateRevision(): number {
+  const persisted = readPersistedStateRevision();
+  if (persisted > stateRevision) {
+    stateRevision = persisted;
+  }
+  return stateRevision;
+}
+
 export function bumpStateRevision(): number {
-  stateRevision += 1;
+  const current = Math.max(stateRevision, readPersistedStateRevision());
+  stateRevision = current + 1;
+  persistStateRevision(stateRevision);
   return stateRevision;
 }
 
@@ -378,6 +454,36 @@ export function initDatabase(): void {
       JSON.stringify(DEFAULT_AUTO_EXECUTION_CONFIG),
       nowIso,
     );
+  }
+
+  const existingRevision = db
+    .prepare('SELECT value FROM app_state WHERE key = ?')
+    .get('state_revision') as { value: string } | undefined;
+  if (!existingRevision) {
+    stateRevision = 1;
+    db.prepare('INSERT INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'state_revision',
+      '1',
+      nowIso,
+    );
+  } else {
+    const parsedRev = Number(existingRevision.value);
+    stateRevision = Number.isFinite(parsedRev) && parsedRev >= 1 ? Math.trunc(parsedRev) : 1;
+  }
+
+  const existingEpoch = db
+    .prepare('SELECT value FROM app_state WHERE key = ?')
+    .get('ledger_epoch') as { value: string } | undefined;
+  if (!existingEpoch?.value) {
+    const initialEpoch = crypto.randomUUID();
+    ledgerEpoch = initialEpoch;
+    db.prepare('INSERT OR REPLACE INTO app_state (key, value, updated_at) VALUES (?, ?, ?)').run(
+      'ledger_epoch',
+      initialEpoch,
+      nowIso,
+    );
+  } else {
+    ledgerEpoch = existingEpoch.value;
   }
 
   const existingPortfolio = db
@@ -795,6 +901,7 @@ export function resetTradingSession(initialMode: TradingMode = 'PAPER'): void {
       insertAg.run(ag.id, JSON.stringify(ag));
     }
 
+    rotateLedgerEpoch();
     appendAuditLog({
       category: 'SYSTEM',
       severity: 'INFO',
@@ -956,6 +1063,40 @@ export function openPositionAtomically(params: {
   auditDetails: string;
 }): void {
   runInTransaction(() => {
+    const riskConfig = getRiskConfig();
+    const openNow = getOpenPositions();
+    if (openNow.length >= riskConfig.maxOpenPositions) {
+      throw new Error(
+        `Số vị thế đang mở (${openNow.length}) đã đạt giới hạn tối đa (${riskConfig.maxOpenPositions}).`,
+      );
+    }
+    const symUpper = params.position.symbol.toUpperCase();
+    const opposing = openNow.find(
+      (p) =>
+        p.symbol.toUpperCase() === symUpper &&
+        p.marketType === params.position.marketType &&
+        p.side !== params.position.side,
+    );
+    if (opposing) {
+      throw new Error(
+        `Xung đột vị thế đối nghịch (${params.position.symbol} ${params.position.marketType}): đang mở ${opposing.side}.`,
+      );
+    }
+    const isAutoEntry =
+      params.auditAction.startsWith('AUTO_') ||
+      params.auditAction === 'SEMI_AUTO_PROPOSAL_EXECUTED';
+    if (
+      isAutoEntry &&
+      openNow.some(
+        (p) =>
+          p.symbol.toUpperCase() === symUpper && p.marketType === params.position.marketType,
+      )
+    ) {
+      throw new Error(
+        `Đã có vị thế mở cho ${params.position.symbol} (${params.position.marketType}) — chặn trùng lặp tự động.`,
+      );
+    }
+
     insertOrder(params.order);
     upsertPosition(params.position);
     const portfolio = getPortfolioSummary();
@@ -1172,9 +1313,68 @@ export function getOrders(limit = 50): OrderRecord[] {
 
 export function getRecentIdempotencyKeys(limit = 100): string[] {
   const rows = db
-    .prepare('SELECT idempotency_key FROM orders ORDER BY created_at_utc DESC LIMIT ?')
+    .prepare(
+      "SELECT idempotency_key FROM orders WHERE status != 'REJECTED' ORDER BY created_at_utc DESC LIMIT ?",
+    )
     .all(limit) as Array<{ idempotency_key: string }>;
   return rows.map((r) => r.idempotency_key);
+}
+
+export function getOrderByIdempotencyKeys(keys: string[]): OrderRecord | null {
+  const cleanKeys = keys.map((k) => String(k || '').trim()).filter(Boolean);
+  if (cleanKeys.length === 0) return null;
+  const placeholders = cleanKeys.map(() => '?').join(', ');
+  const r = db
+    .prepare(
+      `SELECT * FROM orders WHERE idempotency_key IN (${placeholders}) ORDER BY created_at_utc DESC LIMIT 1`,
+    )
+    .get(...cleanKeys) as
+    | {
+        id: string;
+        idempotency_key: string;
+        symbol: string;
+        exchange: string;
+        market_type: string;
+        side: string;
+        order_type: string;
+        quantity: number;
+        price: number;
+        stop_loss: number;
+        take_profit: number;
+        leverage: number;
+        fees_usd: number;
+        slippage_usd: number;
+        status: string;
+        lifecycle_state?: string | null;
+        mode: string;
+        strategy_name: string;
+        risk_decision: string;
+        created_at_utc: string;
+      }
+    | undefined;
+  if (!r) return null;
+  return {
+    id: r.id,
+    idempotencyKey: r.idempotency_key,
+    symbol: r.symbol,
+    exchange: r.exchange,
+    marketType: r.market_type as OrderRecord['marketType'],
+    side: r.side as OrderRecord['side'],
+    orderType: r.order_type as OrderRecord['orderType'],
+    quantity: r.quantity,
+    price: r.price,
+    stopLoss: r.stop_loss,
+    takeProfit: r.take_profit,
+    leverage: r.leverage,
+    feesUsd: r.fees_usd,
+    slippageUsd: r.slippage_usd,
+    status: r.status as OrderRecord['status'],
+    lifecycleState: r.lifecycle_state ?? undefined,
+    mode: r.mode as OrderRecord['mode'],
+    strategyName: r.strategy_name,
+    riskDecision: r.risk_decision as OrderRecord['riskDecision'],
+    createdAtUtc: r.created_at_utc,
+  };
 }
 
 export function saveSignal(signal: TradingSignal): void {

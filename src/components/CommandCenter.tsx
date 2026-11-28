@@ -137,12 +137,12 @@ export const CommandCenter: React.FC<CommandCenterProps> = ({
       {/* Global KPI Strip */}
       <section aria-label={t('cmd.ariaOverview')}>
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
-          <div className="rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
-            <div className="flex items-center justify-between gap-2">
-              <p className="text-xs text-slate-400">
+          <div className="min-w-0 rounded-xl border border-slate-800/90 bg-[#0E1522] p-4">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <p className="min-w-0 text-xs text-slate-400">
                 {t('cmd.kpi.totalEquity', { mode: portfolio.mode })}
               </p>
-              <span className="rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-cyan-300 whitespace-nowrap">
+              <span className="shrink-0 rounded border border-cyan-500/30 bg-cyan-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-cyan-300 whitespace-nowrap">
                 {t('cmd.kpi.paperBadge')}
               </span>
             </div>

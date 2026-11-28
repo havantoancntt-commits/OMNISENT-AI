@@ -213,6 +213,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
     takeProfit: number;
     leverage: number;
   } | null>(null);
+  const submitLockRef = useRef(false);
 
   // Clear order inputs cleanly when switching symbol/marketType/exchange, unless applying an explicit scanned preset
   useEffect(() => {
@@ -403,7 +404,8 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
 
   const handleSubmitOrder = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!active) return;
+    if (!active || submitLockRef.current) return;
+    submitLockRef.current = true;
     setSubmitting(true);
     setOrderFeedback(null);
     try {
@@ -445,6 +447,7 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
     } catch {
       setOrderFeedback({ ok: false, text: t('scanner.ticket.networkErr') });
     } finally {
+      submitLockRef.current = false;
       setSubmitting(false);
     }
   };
@@ -1314,13 +1317,14 @@ export const MarketScanner: React.FC<MarketScannerProps> = ({
               </div>
             </div>
 
-            {positions.length > 0 && onClosePosition && (
+            {onClosePosition && (
               <ActivePositionsPanel
                 positions={positions}
                 title={t('scanner.positionsTitle', { count: positions.length })}
                 onClosePosition={onClosePosition}
                 onUpdateSlTp={onUpdateSlTp}
                 onInspectSymbol={onSelectSymbol}
+                collapseWhenEmptyWithoutNotices
               />
             )}
           </>
