@@ -1,0 +1,44 @@
+name: OMNISENT AI CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify TypeScript type safety
+        run: npm run lint
+
+      - name: Verify environment template completeness
+        run: |
+          test -f .env.example
+          grep -q "VAULT_ENCRYPTION_KEY" .env.example
+          grep -q "OMNISENT_ADMIN_TOKEN" .env.example
+          grep -q "OMNISENT_LIVE_EXECUTION_ENABLED" .env.example
+
+      - name: Run deterministic unit, audit & security test suites
+        run: npx tsx --test src/engine/engine.test.ts server/audit.test.ts server/security.test.ts
+
+      - name: Build production client and PWA service worker
+        run: npm run build
